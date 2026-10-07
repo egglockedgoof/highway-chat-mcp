@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: highway-chat-mcp
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: FIREBASE_API_KEY
+        sync: false
+      - key: MCP_SECRET
+        sync: false
