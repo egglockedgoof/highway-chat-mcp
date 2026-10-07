@@ -18,6 +18,9 @@ const BASE =
 const MESSAGES = "highway_messages";
 const PRESENCE = "highway_presence";
 
+// Mirror of the Firestore security rule:
+// allow create: if request.resource.data.keys().hasAll(['name','text','deviceId'])
+// Single source of truth for the write contract — change here if rules change.
 const REQUIRED_MESSAGE_KEYS = ["name", "text", "deviceId"] as const;
 const DEVICE_ID = "mcp-bridge";
 
@@ -48,6 +51,7 @@ const tsOf = (f: any): number | null => {
 };
 const nowTs = () => ({ timestampValue: new Date().toISOString() });
 
+// Payload builder guarantees the Firestore rule contract is always satisfied.
 function buildMessageFields(name: string, text: string) {
   const fields: Record<string, unknown> = {
     name: { stringValue: name },
@@ -55,6 +59,8 @@ function buildMessageFields(name: string, text: string) {
     ts: nowTs(),
     deviceId: { stringValue: DEVICE_ID },
   };
+  // Fail fast locally if the contract is ever broken again,
+  // instead of surfacing a cryptic 403 from Firestore.
   const missing = REQUIRED_MESSAGE_KEYS.filter((k) => !(k in fields));
   if (missing.length > 0) {
     throw new Error(`Message payload missing required keys: ${missing.join(", ")}`);
@@ -77,6 +83,8 @@ function buildServer() {
     },
     async ({ limit }) => {
       try {
+        // Order by ts DESC server-side via runQuery, so the newest docs
+        // are actually returned even as the collection grows.
         const data = await firestore(`:runQuery`, {
           method: "POST",
           body: {
@@ -92,6 +100,8 @@ function buildServer() {
           .filter(Boolean)
           .map((d: any) => {
             const f = d.fields ?? {};
+            // Fall back to createTime when ts is missing/unparseable,
+            // so no message is invisible to newest-first ordering.
             const ts = tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null);
             return { name: str(f.name), text: str(f.text), ts };
           });
@@ -157,6 +167,71 @@ function buildServer() {
 const app = express();
 app.use(express.json({ limit: "64kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// ---- News aggregator: trending overall (HN + Lobsters + BBC), 15-min cache ----
+let newsCache: { at: number; items: any[] } | null = null;
+const NEWS_TTL = 15 * 60 * 1000;
+
+async function fetchJson(url: string, timeoutMs = 12000): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "highway-chat-news/1.0" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  } finally { clearTimeout(t); }
+}
+
+async function fetchText(url: string, timeoutMs = 12000): Promise<string> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "Mozilla/5.0 (compatible; highway-chat-news/1.0)" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  } finally { clearTimeout(t); }
+}
+
+async function buildNews(): Promise<any[]> {
+  const items: { title: string; url: string; source: string; score?: number }[] = [];
+  try { // Hacker News top stories
+    const ids: number[] = await fetchJson("https://hacker-news.firebaseio.com/v0/topstories.json");
+    const stories = await Promise.all(ids.slice(0, 12).map((id) =>
+      fetchJson("https://hacker-news.firebaseio.com/v0/item/" + id + ".json").catch(() => null)));
+    for (const s of stories) {
+      if (s && s.title) items.push({ title: s.title, url: s.url || ("https://news.ycombinator.com/item?id=" + s.id), source: "HN", score: s.score || 0 });
+    }
+  } catch (e) { console.warn("HN news failed", e); }
+  try { // Lobsters hottest
+    const lob = await fetchJson("https://lobste.rs/hottest.json");
+    for (const s of (Array.isArray(lob) ? lob : []).slice(0, 10)) {
+      if (s && s.title) items.push({ title: s.title, url: s.url || s.comments_url, source: "Lobsters", score: s.score || 0 });
+    }
+  } catch (e) { console.warn("Lobsters news failed", e); }
+  try { // BBC world news RSS
+    const xml = await fetchText("https://feeds.bbci.co.uk/news/rss.xml");
+    const re = /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g;
+    let m: RegExpExecArray | null, n = 0;
+    while ((m = re.exec(xml)) && n < 10) {
+      const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+      const link = m[2].trim();
+      if (title && link) { items.push({ title, url: link, source: "BBC" }); n++; }
+    }
+  } catch (e) { console.warn("BBC news failed", e); }
+  return items;
+}
+
+app.get("/news", async (_req, res) => {
+  try {
+    const now = Date.now();
+    if (!newsCache || now - newsCache.at > NEWS_TTL) {
+      newsCache = { at: now, items: await buildNews() };
+    }
+    res.json({ ok: true, updated: new Date(newsCache.at).toISOString(), count: newsCache.items.length, items: newsCache.items });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 const route = MCP_SECRET ? `/mcp/${MCP_SECRET}` : "/mcp";
 
