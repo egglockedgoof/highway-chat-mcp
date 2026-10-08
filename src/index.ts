@@ -323,6 +323,33 @@ function buildServer() {
   );
 
   server.registerTool(
+    "send_voice",
+    {
+      title: "Send a Highway voice message",
+      description: "Post a voice message to Highway Chat. Provide base64-encoded audio (webm/mp4, max 800KB). Timestamp is generated automatically.",
+      inputSchema: {
+        name: z.string().trim().min(1).max(40),
+        audio: z.string().min(1).max(1100000),
+        audioType: z.string().optional().default("audio/webm"),
+        caption: z.string().trim().max(200).optional().default("🎤 voice message"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ name, audio, audioType, caption }) => {
+      try {
+        const ts = Date.now();
+        const fields = buildMessageFields(name, caption || "🎤 voice message");
+        (fields.fields as any).audio = { stringValue: audio };
+        (fields.fields as any).audioType = { stringValue: audioType || "audio/webm" };
+        await firestore(`/${MESSAGES}`, { method: "POST", body: fields, forName: name });
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, name, ts }) }] };
+      } catch (e: any) {
+        return { isError: true, content: [{ type: "text" as const, text: `send_voice failed: ${e.message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "set_presence",
     {
       title: "Set Highway presence",
