@@ -1008,10 +1008,10 @@ async function cryptoNews(): Promise<any[]> {
   };
   try { // Kraken free API, no key, no geo-block
     const k: any = await fetchJson(
-      "https://api.kraken.com/0/public/Ticker?pair=BTCUSD,ETHUSD,SOLUSD,DOGEUSD,XRPUSD,ADAUSD,AVAXUSD,LINKUSD");
+      "https://api.kraken.com/0/public/Ticker?pair=BTCUSD,ETHUSD,SOLUSD,DOGEUSD,XRPUSD,ADAUSD,AVAXUSD,LINKUSD,HYPEUSD");
     const r = k && k.result;
     if (!r || (k.error && k.error.length)) throw new Error("kraken error");
-    const pairMap: any = { BTCUSD: ["BTC", "Bitcoin", "bitcoin"], ETHUSD: ["ETH", "Ethereum", "ethereum"], SOLUSD: ["SOL", "Solana", "solana"], DOGEUSD: ["DOGE", "Dogecoin", "dogecoin"], XRPUSD: ["XRP", "XRP", "ripple"], ADAUSD: ["ADA", "Cardano", "cardano"], AVAXUSD: ["AVAX", "Avalanche", "avalanche"], LINKUSD: ["LINK", "Chainlink", "chainlink"] };
+    const pairMap: any = { BTCUSD: ["BTC", "Bitcoin", "bitcoin"], ETHUSD: ["ETH", "Ethereum", "ethereum"], SOLUSD: ["SOL", "Solana", "solana"], DOGEUSD: ["DOGE", "Dogecoin", "dogecoin"], XRPUSD: ["XRP", "XRP", "ripple"], ADAUSD: ["ADA", "Cardano", "cardano"], AVAXUSD: ["AVAX", "Avalanche", "avalanche"], LINKUSD: ["LINK", "Chainlink", "chainlink"], HYPEUSD: ["HYPE", "Hyperliquid", "hyperliquid"] };
     const found: any[] = [];
     for (const key of Object.keys(r)) {
       for (const pk of Object.keys(pairMap)) {
@@ -1070,6 +1070,7 @@ async function cryptoNews(): Promise<any[]> {
 }
 
 const MARKET_SYMS = [
+  { sym: "VOO", name: "VOO S&P 500", idx: true },
   { sym: "^GSPC", name: "S&P 500", idx: true },
   { sym: "^IXIC", name: "Nasdaq", idx: true },
   { sym: "^DJI", name: "Dow Jones", idx: true },
@@ -1081,6 +1082,9 @@ const MARKET_SYMS = [
   { sym: "META", name: "Meta", idx: false },
   { sym: "AMD", name: "AMD", idx: false },
   { sym: "PLTR", name: "Palantir", idx: false },
+  { sym: "WMT", name: "Walmart", idx: false },
+  { sym: "COST", name: "Costco", idx: false },
+  { sym: "COIN", name: "Coinbase", idx: false },
 ];
 
 async function marketsNews(): Promise<any[]> {
@@ -1122,7 +1126,10 @@ async function marketsNews(): Promise<any[]> {
 
 const MONEY_WORDS = ["rate", "fed", "inflation", "cpi", "jobs", "unemployment", "wage",
   "tariff", "tax", "recession", "gdp", "housing", "mortgage", "rent", "oil", "gas",
-  "crypto", "bitcoin", "stock", "market", "dollar", "interest", "bank", "debt", "stimulus", "trade"];
+  "crypto", "bitcoin", "stock", "market", "dollar", "interest", "bank", "debt", "stimulus", "trade",
+  "trump", "white house", "congress", "election", "midterm", "ukraine", "russia", "iran", "israel",
+  "gaza", "taiwan", "china", "war", "ai", "openai", "anthropic", "nvidia", "chip", "robot",
+  "spacex", "nasa", "moon", "mars", "food", "wheat", "corn", "crop", "drought", "famine", "ebt", "snap"];
 const MONEY_RE = new RegExp("\\b(" + MONEY_WORDS.join("|") + ")s?\\b");
 
 function macroImpact(title: string): string {
@@ -1134,6 +1141,11 @@ function macroImpact(title: string): string {
   if (/housing|mortgage|rent/.test(t)) return "Housing → rent & mortgage costs.";
   if (/oil|gas|energy/.test(t)) return "Energy → gas & utility bills.";
   if (/\btax(es)?\b/.test(t)) return "Taxes → what you keep changes.";
+  if (/trump|white house|congress|election|midterm/.test(t)) return "Power shift → policy moves money.";
+  if (/ukraine|russia|iran|israel|gaza|taiwan|war/.test(t)) return "Conflict → markets shake, prices move.";
+  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI/tech → jobs and markets shift.";
+  if (/spacex|nasa|moon|mars/.test(t)) return "Space → humanity's reach expands.";
+  if (/food|wheat|corn|crop|drought|famine|ebt|snap/.test(t)) return "Food → what you eat costs more.";
   return "Macro shift → watch your wallet.";
 }
 
@@ -1142,6 +1154,8 @@ async function macroNews(): Promise<any[]> {
   const feeds = [
     "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
   ];
   const seen = new Set<string>();
   for (const url of feeds) {
