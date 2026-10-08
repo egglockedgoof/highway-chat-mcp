@@ -1005,6 +1005,28 @@ async function cryptoNews(): Promise<any[]> {
       description: impactLine(pct, name + " holders"),
     });
   };
+  try { // Binance free API, no key, high rate limits
+    const tickers: any[] = await fetchJson(
+      "https://api.binance.com/api/v3/ticker/24hr?symbols=[\"BTCUSDT\",\"ETHUSDT\",\"SOLUSDT\",\"DOGEUSDT\",\"XRPUSDT\",\"ADAUSDT\",\"AVAXUSDT\",\"LINKUSDT\"]");
+    if (!Array.isArray(tickers) || !tickers.length) throw new Error("empty binance");
+    const bySym: any = {};
+    for (const t of tickers) bySym[t.symbol.replace("USDT", "").toLowerCase()] = t;
+    const btc = bySym["btc"], eth = bySym["eth"];
+    const movers = Object.values(bySym).filter((t: any) => t !== btc && t !== eth)
+      .sort((a: any, b: any) => Math.abs(parseFloat(b.priceChangePercent) || 0) - Math.abs(parseFloat(a.priceChangePercent) || 0))
+      .slice(0, 3);
+    const nameMap: any = { btc: ["Bitcoin", "bitcoin"], eth: ["Ethereum", "ethereum"], sol: ["Solana", "solana"], doge: ["Dogecoin", "dogecoin"], xrp: ["XRP", "ripple"], ada: ["Cardano", "cardano"], avax: ["Avalanche", "avalanche"], link: ["Chainlink", "chainlink"] };
+    for (const t of [btc, eth, ...movers]) {
+      if (!t) continue;
+      const sym = t.symbol.replace("USDT", "").toLowerCase();
+      const nm = nameMap[sym] || [sym.toUpperCase(), sym];
+      push(sym, nm[0], nm[1], parseFloat(t.lastPrice), parseFloat(t.priceChangePercent) || 0, "");
+    }
+    if (items.length) return items.slice(0, 5);
+    throw new Error("binance empty");
+  } catch (e) {
+    console.warn("binance failed, trying coingecko", e);
+  }
   try { // CoinGecko free API, no key
     const coins: any[] = await fetchJson(
       "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=60&page=1&sparkline=false&price_change_percentage=24h");
