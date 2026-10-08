@@ -1149,13 +1149,23 @@ function macroImpact(title: string): string {
   return "Macro shift → watch your wallet.";
 }
 
+const MAJOR_WORDS = ["war", "conflict", "strike", "earthquake", "hurricane", "trump", "white house",
+  "fed", "inflation", "missile", "ceasefire", "famine", "outbreak", "sanctions", "election", "midterm",
+  "iran", "ukraine", "russia", "israel", "gaza", "taiwan", "china", "nuclear", "troops", "invasion",
+  "disaster", "flood", "wildfire", "volcano", "tsunami", "pandemic", "ebola", "crisis", "collapse",
+  "spacex", "nasa", "moon", "mars", "artemis", "starship"];
+const MAJOR_RE = new RegExp("\\b(" + MAJOR_WORDS.join("|") + ")s?\\b");
+const SOFT_WORDS = ["obituary", "dies at", "celebrity", "sport", "wins", "fashion", "golf club", "profits"];
+const SOFT_RE = new RegExp(SOFT_WORDS.join("|"));
+
 async function macroNews(): Promise<any[]> {
   const items: any[] = [];
   const feeds = [
-    "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://feeds.bbci.co.uk/news/rss.xml",
-    "https://feeds.bbci.co.uk/news/technology/rss.xml",
-    "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://rss.dw.com/rdf/rss-en-top",
+    "https://www.theguardian.com/world/rss",
+    "https://www.france24.com/en/rss",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
   ];
   const seen = new Set<string>();
   for (const url of feeds) {
@@ -1163,14 +1173,16 @@ async function macroNews(): Promise<any[]> {
       const xml = await fetchText(url);
       const re = /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g;
       let m: RegExpExecArray | null, n = 0;
-      while ((m = re.exec(xml)) && n < 3) {
+      while ((m = re.exec(xml)) && n < 4) {
         const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
         const link = m[2].trim();
         const tl = title.toLowerCase();
         const key = tl.slice(0, 48);
-        if (!title || !link || !MONEY_RE.test(tl) || seen.has(key)) continue;
+        if (!title || !link || seen.has(key)) continue;
+        if (SOFT_RE.test(tl)) continue;
+        if (!MAJOR_RE.test(tl) && !MONEY_RE.test(tl)) continue;
         seen.add(key);
-        items.push({ title, url: link, source: "MACRO", image: faviconFor(link), description: macroImpact(title) });
+        items.push({ title, url: link, source: "WORLD", image: faviconFor(link), description: macroImpact(title) });
         n++;
       }
     } catch (e) { console.warn("macro news failed", url, e); }
@@ -1180,7 +1192,7 @@ async function macroNews(): Promise<any[]> {
 
 async function buildNews(): Promise<any[]> {
   const [crypto, markets, macro] = await Promise.all([cryptoNews(), marketsNews(), macroNews()]);
-  return [...crypto.slice(0, 5), ...markets.slice(0, 5), ...macro.slice(0, 5)].slice(0, 15);
+  return [...macro.slice(0, 8), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 14);
 }
 
 app.get("/news", async (_req, res) => {
