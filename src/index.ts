@@ -1152,8 +1152,9 @@ function macroImpact(title: string): string {
 const MAJOR_WORDS = ["war", "conflict", "strike", "earthquake", "hurricane", "trump", "white house",
   "fed", "inflation", "missile", "ceasefire", "famine", "outbreak", "sanctions", "election", "midterm",
   "iran", "ukraine", "russia", "israel", "gaza", "taiwan", "china", "nuclear", "troops", "invasion",
-  "disaster", "flood", "wildfire", "volcano", "tsunami", "pandemic", "ebola", "crisis", "collapse",
-  "spacex", "nasa", "moon", "mars", "artemis", "starship"];
+  "disaster", "flood", "wildfire", "volcano", "tsunami", "pandemic", "crisis", "collapse",
+  "spacex", "nasa", "moon", "mars", "artemis", "starship",
+  "america", "american", "u.s.", "united states", "congress", "senate", "supreme court"];
 const MAJOR_RE = new RegExp("\\b(" + MAJOR_WORDS.join("|") + ")s?\\b");
 const SOFT_WORDS = ["obituary", "dies at", "celebrity", "sport", "wins", "fashion", "golf club", "profits"];
 const SOFT_RE = new RegExp(SOFT_WORDS.join("|"));
@@ -1161,11 +1162,11 @@ const SOFT_RE = new RegExp(SOFT_WORDS.join("|"));
 async function macroNews(): Promise<any[]> {
   const items: any[] = [];
   const feeds = [
-    "https://www.aljazeera.com/xml/rss/all.xml",
-    "https://rss.dw.com/rdf/rss-en-top",
-    "https://www.theguardian.com/world/rss",
-    "https://www.france24.com/en/rss",
+    "https://feeds.npr.org/1001/rss.xml",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://www.theguardian.com/world/rss",
+    "https://rss.dw.com/rdf/rss-en-top",
+    "https://www.france24.com/en/rss",
   ];
   const seen = new Set<string>();
   for (const url of feeds) {
