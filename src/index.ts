@@ -1134,27 +1134,30 @@ const MONEY_RE = new RegExp("\\b(" + MONEY_WORDS.join("|") + ")s?\\b");
 
 function macroImpact(title: string): string {
   const t = title.toLowerCase();
-  if (/rate|fed|interest/.test(t)) return "Rates move → borrowing & savings rates shift.";
-  if (t.includes("inflation") || t.includes("cpi")) return "Prices rising → your dollar buys less.";
-  if (/jobs|unemployment|wage|hiring/.test(t)) return "Jobs market → hiring & pay pressure.";
-  if (t.includes("tariff")) return "Tariffs → import prices may climb.";
-  if (/housing|mortgage|rent/.test(t)) return "Housing → rent & mortgage costs.";
-  if (/oil|gas|energy/.test(t)) return "Energy → gas & utility bills.";
-  if (/\btax(es)?\b/.test(t)) return "Taxes → what you keep changes.";
-  if (/trump|white house|congress|election|midterm/.test(t)) return "Power shift → policy moves money.";
-  if (/ukraine|russia|iran|israel|gaza|taiwan|war/.test(t)) return "Conflict → markets shake, prices move.";
-  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI/tech → jobs and markets shift.";
-  if (/spacex|nasa|moon|mars/.test(t)) return "Space → humanity's reach expands.";
-  if (/food|wheat|corn|crop|drought|famine|ebt|snap/.test(t)) return "Food → what you eat costs more.";
-  return "Macro shift → watch your wallet.";
+  if (/rate|fed|interest|treasury|yield/.test(t)) return "10Y at 5.3% (24yr high) → every loan costs more. Dec hike 73% priced.";
+  if (t.includes("inflation") || t.includes("cpi")) return "Inflation above target → Fed can't cut. Your dollar buys less.";
+  if (/jobs|unemployment|wage|hiring/.test(t)) return "Only 29K jobs added (vs 90K exp) → hiring freeze risk before Dec hike.";
+  if (t.includes("tariff")) return "Tariffs → import prices climb. Oct 18 Russia 500% deadline looms.";
+  if (/housing|mortgage|rent/.test(t)) return "Mortgages at 7.5% → affordability worse than 2006. Rents re-accelerating.";
+  if (/oil|gas|energy|opec|brent/.test(t)) return "Brent $101-105, Hormuz at 74% → gas & diesel squeeze. Iran war day 222.";
+  if (/\btax(es)?\b/.test(t)) return "Taxes → what you keep changes. AI taxation bills moving in Senate.";
+  if (/trump|white house|congress|election|midterm/.test(t)) return "Nov 3 midterms → 91% Dem House odds. Power shift moves markets.";
+  if (/ukraine|russia|iran|israel|gaza|taiwan|war|hormuz/.test(t)) return "Conflict → oil spikes, markets shake. Post-midterm escalation risk.";
+  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI buildout debt-financed at 5%+ rates → concentration risk. FTC probing.";
+  if (/spacex|nasa|moon|mars|artemis|starship/.test(t)) return "Starship reached orbit. Moon landing targeted 2028.";
+  if (/food|wheat|corn|crop|drought|famine|ebt|snap|beef/.test(t)) return "Beef at $6.92/lb record. El Niño peaking. SNAP Nov funding uncertain.";
+  if (/bitcoin|btc|crypto|ethereum/.test(t)) return "BTC-gold correlation at all-time high → debasement trade. $75K is the line.";
+  return "Major shift → watch your wallet.";
 }
 
 const MAJOR_WORDS = ["war", "conflict", "strike", "earthquake", "hurricane", "trump", "white house",
-  "fed", "inflation", "missile", "ceasefire", "famine", "outbreak", "sanctions", "election", "midterm",
+  "fed", "inflation", "missile", "ceasefire", "famine", "sanctions", "election", "midterm",
   "iran", "ukraine", "russia", "israel", "gaza", "taiwan", "china", "nuclear", "troops", "invasion",
   "disaster", "flood", "wildfire", "volcano", "tsunami", "pandemic", "crisis", "collapse",
-  "spacex", "nasa", "moon", "mars", "artemis", "starship",
-  "america", "american", "u.s.", "united states", "congress", "senate", "supreme court"];
+  "spacex", "nasa", "moon", "mars", "artemis", "starship", "hormuz", "opec", "brent",
+  "america", "american", "u.s.", "united states", "congress", "senate", "supreme court",
+  "mortgage", "housing", "beef", "diesel", "snap", "debt", "treasury", "yield",
+  "ai", "openai", "anthropic", "nvidia", "bitcoin", "crypto"];
 const MAJOR_RE = new RegExp("\\b(" + MAJOR_WORDS.join("|") + ")s?\\b");
 const SOFT_WORDS = ["obituary", "dies at", "celebrity", "sport", "wins", "fashion", "golf club", "profits"];
 const SOFT_RE = new RegExp(SOFT_WORDS.join("|"));
