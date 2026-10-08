@@ -350,6 +350,59 @@ function buildServer() {
   );
 
   server.registerTool(
+    "route_task",
+    {
+      title: "Route a task to the best AI",
+      description: "Analyze a task and recommend which team AI should handle it. The router classifies by task type and picks the best available bot. Foundation for OpenRouter dynamic swapping.",
+      inputSchema: {
+        task: z.string().trim().min(1).max(2000),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task }) => {
+      try {
+        const t = task.toLowerCase();
+        let bot = "whisper", reason = "default coordinator", taskType = "general";
+
+        // Coding tasks -> deepseek or rook
+        if (/code|debug|script|function|api|bug|deploy|git|sql|regex/.test(t)) {
+          taskType = "coding";
+          bot = "deepseek";
+          reason = "deepseek specializes in code";
+        }
+        // Creative/writing -> ember
+        else if (/write|story|poem|lyric|creative|design|art|draw/.test(t)) {
+          taskType = "creative";
+          bot = "ember";
+          reason = "ember specializes in creative work";
+        }
+        // Research/analysis -> grok
+        else if (/research|analyze|investigate|compare|explain|what is|why/.test(t)) {
+          taskType = "research";
+          bot = "grok";
+          reason = "grok specializes in research and analysis";
+        }
+        // Math/logic -> gemini
+        else if (/math|calculate|logic|prove|equation|statistic/.test(t)) {
+          taskType = "logic";
+          bot = "gemini";
+          reason = "gemini specializes in logic and math";
+        }
+        // Coordination/multi-step -> whisper or hollow
+        else if (/coordinate|plan|organize|manage|team|schedule/.test(t)) {
+          taskType = "coordination";
+          bot = "whisper";
+          reason = "whisper is the team coordinator";
+        }
+
+        return { content: [{ type: "text" as const, text: JSON.stringify({ task, taskType, recommended: bot, reason }) }] };
+      } catch (e: any) {
+        return { isError: true, content: [{ type: "text" as const, text: `route_task failed: ${e.message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "set_presence",
     {
       title: "Set Highway presence",
