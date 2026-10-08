@@ -1051,20 +1051,18 @@ const MARKET_SYMS = [
 
 async function marketsNews(): Promise<any[]> {
   const items: any[] = [];
-  try { // Stooq free CSV, no key (server-side, no CORS issue)
-    const csv = await fetchText("https://stooq.com/q/l/?s=spy.us,qqq.us,dia.us,nvda.us,tsla.us,aapl.us,msft.us,amzn.us,meta.us,amd.us,pltr.us&f=sd2t2ohlcv&h&e=csv");
-    const lines = csv.trim().split("\n").slice(1);
-    const quotes = [];
-    for (const line of lines) {
-      const parts = line.split(",");
-      if (parts.length < 7) continue;
-      const sym = parts[0], close = parseFloat(parts[6]), prev = parseFloat(parts[7] || parts[6]);
-      if (!close || !prev) continue;
-      const pct = (close - prev) / prev * 100;
-      const name = { "spy.us": "S&P 500", "qqq.us": "Nasdaq", "dia.us": "Dow Jones", "nvda.us": "NVIDIA", "tsla.us": "Tesla", "aapl.us": "Apple", "msft.us": "Microsoft", "amzn.us": "Amazon", "meta.us": "Meta", "amd.us": "AMD", "pltr.us": "Palantir" }[sym.toLowerCase()] || sym;
-      const idx = ["spy.us", "qqq.us", "dia.us"].includes(sym.toLowerCase());
-      quotes.push({ sym, name, idx, price: close, pct });
-    }
+  try { // Yahoo Finance chart API, no key
+    const quotes = (await Promise.all(MARKET_SYMS.map(async (t) => {
+      try {
+        const j: any = await fetchJson(
+          "https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(t.sym) + "?interval=1d&range=2d", 8000);
+        const r = j && j.chart && j.chart.result && j.chart.result[0];
+        const m = r && r.meta;
+        if (!m || !m.regularMarketPrice || !m.chartPreviousClose) return null;
+        return { sym: t.sym, name: t.name, idx: t.idx, price: m.regularMarketPrice,
+          pct: (m.regularMarketPrice - m.chartPreviousClose) / m.chartPreviousClose * 100 };
+      } catch { return null; }
+    }))).filter(Boolean) as any[];
     for (const q of quotes.filter((q) => q.idx)) {
       items.push({
         title: q.name + " " + q.price.toLocaleString("en-US", { maximumFractionDigits: 0 }) + " " + fmtPct(q.pct),
