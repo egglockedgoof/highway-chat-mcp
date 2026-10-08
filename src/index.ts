@@ -28,17 +28,35 @@ const TYPING = "highway_typing";
 const REQUIRED_MESSAGE_KEYS = ["name", "text", "deviceId"] as const;
 const DEVICE_ID = "mcp-bridge";
 
-// Cached anonymous auth token for authenticated Firestore writes
+// Cached auth token for authenticated Firestore writes
+// Uses bot account if BOT_EMAIL/BOT_PASSWORD are set, otherwise anonymous
 let _idToken: string | null = null;
 let _tokenExp: number = 0;
 
 async function getIdToken(): Promise<string> {
   const now = Date.now();
   if (_idToken && now < _tokenExp - 60000) return _idToken;
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInAnonymously?key=${API_KEY}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ returnSecureToken: true }) }
-  );
+
+  const botEmail = process.env.BOT_EMAIL;
+  const botPassword = process.env.BOT_PASSWORD;
+  let url: string;
+  let body: any;
+
+  if (botEmail && botPassword) {
+    // Sign in with bot account (can use reserved bot names)
+    url = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`;
+    body = { email: botEmail, password: botPassword, returnSecureToken: true };
+  } else {
+    // Fallback to anonymous (cannot use reserved names)
+    url = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/signupNewUser?key=${API_KEY}`;
+    body = { returnSecureToken: true };
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   const data: any = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Auth ${res.status}: ${data?.error?.message ?? res.statusText}`);
   _idToken = data.idToken;
