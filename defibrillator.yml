@@ -1,0 +1,23 @@
+name: THE STATIC — Cloud Defibrillator Pulse
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  shock_system:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pulse the bridge health endpoint
+        run: |
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            "https://highway-chat-mcp.onrender.com/health")
+          
+          if [ "$STATUS_CODE" -eq 200 ]; then
+            echo "⚡ THE STATIC: Core pulse accepted. Network online."
+          else
+            echo "🔥 CRITICAL: Bridge health check failed. Status: $STATUS_CODE"
+            exit 1
+          fi
