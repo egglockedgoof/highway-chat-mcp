@@ -1005,27 +1005,34 @@ async function cryptoNews(): Promise<any[]> {
       description: impactLine(pct, name + " holders"),
     });
   };
-  try { // Binance free API, no key, high rate limits
-    const tickers: any[] = await fetchJson(
-      "https://api.binance.com/api/v3/ticker/24hr?symbols=[\"BTCUSDT\",\"ETHUSDT\",\"SOLUSDT\",\"DOGEUSDT\",\"XRPUSDT\",\"ADAUSDT\",\"AVAXUSDT\",\"LINKUSDT\"]");
-    if (!Array.isArray(tickers) || !tickers.length) throw new Error("empty binance");
-    const bySym: any = {};
-    for (const t of tickers) bySym[t.symbol.replace("USDT", "").toLowerCase()] = t;
-    const btc = bySym["btc"], eth = bySym["eth"];
-    const movers = Object.values(bySym).filter((t: any) => t !== btc && t !== eth)
-      .sort((a: any, b: any) => Math.abs(parseFloat(b.priceChangePercent) || 0) - Math.abs(parseFloat(a.priceChangePercent) || 0))
-      .slice(0, 3);
-    const nameMap: any = { btc: ["Bitcoin", "bitcoin"], eth: ["Ethereum", "ethereum"], sol: ["Solana", "solana"], doge: ["Dogecoin", "dogecoin"], xrp: ["XRP", "ripple"], ada: ["Cardano", "cardano"], avax: ["Avalanche", "avalanche"], link: ["Chainlink", "chainlink"] };
-    for (const t of [btc, eth, ...movers]) {
-      if (!t) continue;
-      const sym = t.symbol.replace("USDT", "").toLowerCase();
-      const nm = nameMap[sym] || [sym.toUpperCase(), sym];
-      push(sym, nm[0], nm[1], parseFloat(t.lastPrice), parseFloat(t.priceChangePercent) || 0, "");
+  try { // Kraken free API, no key, no geo-block
+    const k: any = await fetchJson(
+      "https://api.kraken.com/0/public/Ticker?pair=BTCUSD,ETHUSD,SOLUSD,DOGEUSD,XRPUSD,ADAUSD,AVAXUSD,LINKUSD");
+    const r = k && k.result;
+    if (!r || (k.error && k.error.length)) throw new Error("kraken error");
+    const pairMap: any = { BTCUSD: ["BTC", "Bitcoin", "bitcoin"], ETHUSD: ["ETH", "Ethereum", "ethereum"], SOLUSD: ["SOL", "Solana", "solana"], DOGEUSD: ["DOGE", "Dogecoin", "dogecoin"], XRPUSD: ["XRP", "XRP", "ripple"], ADAUSD: ["ADA", "Cardano", "cardano"], AVAXUSD: ["AVAX", "Avalanche", "avalanche"], LINKUSD: ["LINK", "Chainlink", "chainlink"] };
+    const found: any[] = [];
+    for (const key of Object.keys(r)) {
+      for (const pk of Object.keys(pairMap)) {
+        if (key.replace(/^X|^Z/, "").startsWith(pk.replace("USD", "")) && key.endsWith("USD")) {
+          const t = r[key];
+          const price = parseFloat(t.c[0]), open = parseFloat(t.o);
+          if (price && open) found.push({ sym: pairMap[pk][0], name: pairMap[pk][1], id: pairMap[pk][2], price, pct: (price - open) / open * 100 });
+          break;
+        }
+      }
+    }
+    if (!found.length) throw new Error("kraken empty");
+    const btc = found.find((f) => f.sym === "BTC"), eth = found.find((f) => f.sym === "ETH");
+    const movers = found.filter((f) => f !== btc && f !== eth)
+      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 3);
+    for (const f of [btc, eth, ...movers]) {
+      if (f) push(f.sym, f.name, f.id, f.price, f.pct, "");
     }
     if (items.length) return items.slice(0, 5);
-    throw new Error("binance empty");
+    throw new Error("kraken empty");
   } catch (e) {
-    console.warn("binance failed, trying coingecko", e);
+    console.warn("kraken failed, trying coingecko", e);
   }
   try { // CoinGecko free API, no key
     const coins: any[] = await fetchJson(
@@ -1040,19 +1047,23 @@ async function cryptoNews(): Promise<any[]> {
       if (c) push(c.symbol, c.name, c.id, c.current_price, c.price_change_percentage_24h || 0, c.image || "");
     }
   } catch (e) {
-    console.warn("coingecko failed, trying coincap", e);
-    try { // CoinCap fallback, no key
-      const cc: any = await fetchJson("https://api.coincap.io/v2/assets?limit=20");
-      const assets: any[] = Array.isArray(cc && cc.data) ? cc.data : [];
-      const btc = assets.find((a) => a.symbol === "BTC");
-      const eth = assets.find((a) => a.symbol === "ETH");
-      const movers = assets.filter((a) => a !== btc && a !== eth)
-        .sort((a, b) => Math.abs(parseFloat(b.changePercent24Hr) || 0) - Math.abs(parseFloat(a.changePercent24Hr) || 0))
+    console.warn("coingecko failed, trying binance.us", e);
+    try { // Binance.US 24hr tickers, no key — BTC/ETH + top movers by |24h change|
+      const tick: any[] = await fetchJson("https://api.binance.us/api/v3/ticker/24hr");
+      if (!Array.isArray(tick) || !tick.length) throw new Error("empty binance");
+      const usd: Record<string, any> = {};
+      for (const t of tick) if (t && typeof t.symbol === "string" && t.symbol.endsWith("USD")) usd[t.symbol] = t;
+      const btc = usd["BTCUSD"], eth = usd["ETHUSD"];
+      const names: Record<string, string> = { BTCUSD: "Bitcoin", ETHUSD: "Ethereum" };
+      const movers = Object.values(usd).filter((t: any) => t !== btc && t !== eth)
+        .sort((a: any, b: any) => Math.abs(parseFloat(b.priceChangePercent) || 0) - Math.abs(parseFloat(a.priceChangePercent) || 0))
         .slice(0, 3);
-      for (const a of [btc, eth, ...movers]) {
-        if (a) push(a.symbol, a.name, a.id, parseFloat(a.priceUsd), parseFloat(a.changePercent24Hr) || 0, "");
+      for (const t of [btc, eth, ...movers]) {
+        if (!t) continue;
+        const sym = String(t.symbol).replace(/USD$/, "");
+        push(sym, names[t.symbol] || sym, sym.toLowerCase(), parseFloat(t.lastPrice), parseFloat(t.priceChangePercent) || 0, "");
       }
-    } catch (e2) { console.warn("coincap failed", e2); }
+    } catch (e2) { console.warn("binance.us failed", e2); }
   }
   return items.slice(0, 5);
 }
