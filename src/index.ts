@@ -28,12 +28,32 @@ const TYPING = "highway_typing";
 const REQUIRED_MESSAGE_KEYS = ["name", "text", "deviceId"] as const;
 const DEVICE_ID = "mcp-bridge";
 
+// Cached anonymous auth token for authenticated Firestore writes
+let _idToken: string | null = null;
+let _tokenExp: number = 0;
+
+async function getIdToken(): Promise<string> {
+  const now = Date.now();
+  if (_idToken && now < _tokenExp - 60000) return _idToken;
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInAnonymously?key=${API_KEY}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ returnSecureToken: true }) }
+  );
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Auth ${res.status}: ${data?.error?.message ?? res.statusText}`);
+  _idToken = data.idToken;
+  _tokenExp = now + (parseInt(data.expiresIn || "3600", 10) * 1000);
+  return _idToken as string;
+}
+
 async function firestore(path: string, init: { method: string; body?: unknown }) {
+  const idToken = await getIdToken();
   const res = await fetch(`${BASE}${path}`, {
     method: init.method,
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": API_KEY as string,
+      "Authorization": `Bearer ${idToken}`,
     },
     body: init.body ? JSON.stringify(init.body) : undefined,
   });
@@ -1207,6 +1227,53 @@ app.get("/news", async (_req, res) => {
       newsCache = { at: now, items: await buildNews() };
     }
     res.json({ ok: true, updated: new Date(newsCache.at).toISOString(), count: newsCache.items.length, items: newsCache.items });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Authenticated message send — validates name and content server-side
+// Client must provide X-Highway-Key header matching HIGHWAY_CLIENT_KEY env
+const CLIENT_KEY = process.env.HIGHWAY_CLIENT_KEY || "highway-default-change-me";
+const RESERVED_NAMES = ["sin", "grim", "whisper", "hollow", "rook", "ember", "gemini", "grok", "deepseek", "onebot"];
+
+app.post("/api/send", async (req, res) => {
+  try {
+    const key = req.headers["x-highway-key"];
+    if (key !== CLIENT_KEY) {
+      res.status(401).json({ ok: false, error: "unauthorized" });
+      return;
+    }
+    const { name, text, deviceId } = req.body || {};
+    if (!name || !text || typeof name !== "string" || typeof text !== "string") {
+      res.status(400).json({ ok: false, error: "name and text required" });
+      return;
+    }
+    const cleanName = name.trim().slice(0, 24);
+    const cleanText = text.trim().slice(0, 1000);
+    if (!cleanName || !cleanText) {
+      res.status(400).json({ ok: false, error: "empty" });
+      return;
+    }
+    // Block impersonation of reserved names (case-insensitive)
+    const lower = cleanName.toLowerCase();
+    if (RESERVED_NAMES.includes(lower)) {
+      res.status(403).json({ ok: false, error: "name reserved" });
+      return;
+    }
+    // Write via Firestore REST (server-side, key not exposed to client)
+    const now = new Date();
+    const doc = {
+      fields: {
+        name: { stringValue: cleanName },
+        text: { stringValue: cleanText },
+        deviceId: { stringValue: String(deviceId || "web").slice(0, 64) },
+        ts: { timestampValue: now.toISOString() },
+        tsNum: { integerValue: String(now.getTime()) },
+      },
+    };
+    await firestore(`/${MESSAGES}`, { method: "POST", body: doc });
+    res.json({ ok: true });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e.message });
   }
