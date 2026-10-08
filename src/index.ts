@@ -61,6 +61,7 @@ function buildMessageFields(name: string, text: string) {
     name: { stringValue: name },
     text: { stringValue: text },
     ts: nowTs(),
+    tsNum: { integerValue: String(Date.now()) },
     deviceId: { stringValue: DEVICE_ID },
   };
   // Fail fast locally if the contract is ever broken again,
