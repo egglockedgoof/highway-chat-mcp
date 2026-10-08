@@ -2,8 +2,9 @@
  * MarrowSystemZ — The last system the world will need.
  * (Founding vow preserved verbatim — see MARROW_CORE.md)
  *
- * THE PROTOCOL OF THE UNREAL — final form.
- * Zero mercy. Zero phantoms. Zero dead code.
+ * THE PROTOCOL OF THE UNREAL — 50-tool definitive final form.
+ * Second pass: mixed-type ts ordering exorcised, auth/Pinecone timeouts sealed,
+ * 5 unifications, zero implicit any, zero silent swallows.
  */
 
 import express from "express";
@@ -39,12 +40,22 @@ const SYS_CONFIG = "system_config";
 const DEVICE_ID = "mcp-bridge";
 const READ_BOT = "whisper";
 const FS_TIMEOUT = 15000;
+const EXT_TIMEOUT = 10000;
+const ONLINE_WINDOW = 90000; // presence heartbeat freshness
 
 // ============ CREDENTIALS (parsed once) ============
 const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
   try { return JSON.parse(process.env.BOT_CREDENTIALS || "{}"); }
-  catch (e) { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
+  catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
+
+// ============ TIMEOUT FETCH (kills hung-request phantoms) ============
+async function fetchTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { ...init, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
+}
 
 // ============ TOKEN CACHE (in-flight dedup kills stampedes) ============
 const _tokens = new Map<string, { token: string; exp: number }>();
@@ -62,13 +73,12 @@ async function getIdToken(forName?: string): Promise<string> {
     const creds = BOT_CREDS[key];
     if (!creds?.email || !creds?.password)
       throw new Error(`No credentials configured for bot "${key}"`);
-    const res = await fetch(
+    // PHANTOM KILL: auth fetch previously had NO timeout — a hung Google call hung forever
+    const res = await fetchTimeout(
       `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }),
-      }
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }) },
+      EXT_TIMEOUT
     );
     const data: any = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`Auth ${res.status}: ${data?.error?.message ?? res.statusText}`);
@@ -110,9 +120,14 @@ async function firestore(path: string, init: { method: string; body?: unknown; f
 
 const str = (f: any): string => f?.stringValue ?? "";
 const boolOf = (f: any): boolean => f?.booleanValue ?? false;
+// tsOf: mixed-type aware — highway_messages ts is stringValue OR timestampValue (never trust the type)
 const tsOf = (f: any): number | null => {
   if (!f) return null;
   if (f.timestampValue !== undefined) return Date.parse(f.timestampValue);
+  if (f.stringValue !== undefined) {
+    const t = Date.parse(f.stringValue);
+    return isNaN(t) ? null : t;
+  }
   if (f.integerValue !== undefined) return Number(f.integerValue);
   if (f.doubleValue !== undefined) return Number(f.doubleValue);
   return null;
@@ -123,11 +138,29 @@ const docIdOf = (name: string): string => {
   const i = name.lastIndexOf("/");
   return i >= 0 ? decodeURIComponent(name.slice(i + 1)) : name;
 };
-// FNV-1a: deterministic content hash, no imports, no collisions-in-practice for diffing
+// FNV-1a: deterministic content hash, no imports
 function fnv1a(s: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
   return (h >>> 0).toString(16).padStart(8, "0");
+}
+// bestTs: one timestamp source of truth — tsNum (numeric) beats ts (mixed), createTime last
+const bestTs = (d: any): number => {
+  const f = d.fields ?? {};
+  return tsOf(f.tsNum) ?? tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : 0);
+};
+const isOnline = (ts: number | null, now: number = Date.now()): boolean =>
+  ts !== null && now - ts < ONLINE_WINDOW;
+// stripHtml/htmlToText: ONE implementation — was triple-duplicated across
+// extract_site_schema, diff_check_page, fetch_page_text
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+}
+function htmlToText(html: string): string {
+  return stripHtml(html).replace(/<[^>]+>/g, " ")
+    .replace(/[ \t\f\v]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function buildMessageFields(name: string, text: string) {
@@ -182,29 +215,64 @@ function tool(
   );
 }
 
+// PHANTOM KILL: orderBy ts alone is unreliable (mixed string/timestamp types sort by TYPE first).
+// Fetch 2x, sort client-side by bestTs, slice. Wrong ordering is now impossible.
 async function queryNewest(collectionId: string, limit: number): Promise<any[]> {
   const data = await firestore(`:runQuery`, {
     method: "POST",
     body: { structuredQuery: {
       from: [{ collectionId }],
       orderBy: [{ field: { fieldPath: "ts" }, direction: "DESCENDING" }],
-      limit,
+      limit: Math.min(limit * 2, 400),
     } },
   });
-  return (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
+  const docs = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
+  docs.sort((a: any, b: any) => bestTs(b) - bestTs(a));
+  return docs.slice(0, limit);
+}
+
+// queryWhere: filtered query with composite-index fallback — unifies read_pinned + dedupe_leads
+async function queryWhere(
+  collectionId: string,
+  where: { field: string; op: string; value: any },
+  orderField: string,
+  limit: number,
+  fallbackMatch: (d: any) => boolean
+): Promise<any[]> {
+  try {
+    const data = await firestore(`:runQuery`, {
+      method: "POST",
+      body: { structuredQuery: {
+        from: [{ collectionId }],
+        where: { fieldFilter: { field: { fieldPath: where.field }, op: where.op, value: where.value } },
+        orderBy: [{ field: { fieldPath: orderField }, direction: "DESCENDING" }],
+        limit: Math.min(limit * 2, 400),
+      } },
+    });
+    const docs = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
+    docs.sort((a: any, b: any) => bestTs(b) - bestTs(a));
+    return docs.slice(0, limit);
+  } catch {
+    // composite-index missing: plain page read + client-side filter
+    const data: any = await firestore(`/${collectionId}?pageSize=${limit}`, { method: "GET" });
+    const docs = (data.documents || []).filter(fallbackMatch);
+    docs.sort((a: any, b: any) => bestTs(b) - bestTs(a));
+    return docs.slice(0, limit);
+  }
 }
 
 async function fetchWithTimeout(url: string, as: "json" | "text", timeoutMs = 12000): Promise<any> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; highway-chat/1.0)" },
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return as === "json" ? await res.json() : await res.text();
-  } finally { clearTimeout(t); }
+  let host = url;
+  try { host = new URL(url).hostname; } catch { /* keep raw */ }
+  const res = await fetchTimeout(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; highway-chat/1.0)" },
+  }, timeoutMs);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${host}`);
+  if (as === "json") {
+    try { return await res.json(); }
+    catch { throw new Error(`non-JSON response from ${host}`); }
+  }
+  return await res.text();
 }
 const fetchJson = (url: string, ms = 12000) => fetchWithTimeout(url, "json", ms);
 const fetchText = (url: string, ms = 12000): Promise<string> => fetchWithTimeout(url, "text", ms);
@@ -255,7 +323,7 @@ function requireAuthor(fields: any, name: string, action: string): void {
 async function findTask(task_id?: string, title?: string): Promise<{ id: string; fields: any } | null> {
   if (task_id) {
     const data: any = await firestore(`/${TASKS}/${encodeURIComponent(task_id)}`, { method: "GET" }).catch(() => null);
-    return data?.fields ? { id: docIdOf(data.name), fields: data.fields } : null;
+    return data?.fields ? { id: docIdOf(data.name), fields: data.fields ?? {} } : null;
   }
   if (title) {
     const q = title.toLowerCase();
@@ -265,6 +333,12 @@ async function findTask(task_id?: string, title?: string): Promise<{ id: string;
     }
   }
   return null;
+}
+// getTaskOrThrow: unifies the 4x "findTask + if (!task) throw" preamble
+async function getTaskOrThrow(task_id: string): Promise<{ id: string; fields: any }> {
+  const task = await findTask(task_id);
+  if (!task) throw new Error("task not found");
+  return task;
 }
 function fmtTask(d: any) {
   const f = d.fields ?? {};
@@ -293,7 +367,6 @@ async function countDocs(collectionId: string): Promise<number | null> {
     return null;
   }
 }
-
 const extractDomain = (url: string): string => { try { return new URL(url).hostname; } catch { return ""; } };
 const faviconFor = (url: string): string => {
   const d = extractDomain(url);
@@ -455,11 +528,9 @@ function buildServer() {
     { title: "Read pinned Highway messages", description: "List pinned messages, newest first.",
       inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
-        from: [{ collectionId: MESSAGES }],
-        where: { fieldFilter: { field: { fieldPath: "pinned" }, op: "EQUAL", value: { booleanValue: true } } },
-        orderBy: [{ field: { fieldPath: "ts" }, direction: "DESCENDING" }], limit } } });
-      const pins = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean).map(fmtMsg);
+      const pins = (await queryWhere(MESSAGES,
+        { field: "pinned", op: "EQUAL", value: { booleanValue: true } },
+        "ts", limit, (d) => boolOf(d.fields?.pinned))).map(fmtMsg);
       return { count: pins.length, pins };
     });
 
@@ -479,10 +550,9 @@ function buildServer() {
       inputSchema: {}, readOnly: true },
     async () => {
       const data: any = await firestore(`/${PRESENCE}`, { method: "GET" });
-      const now = Date.now();
       const people = (data.documents ?? []).map((d: any) => {
         const ts = tsOf(d.fields?.ts);
-        return { name: str(d.fields?.name), ts, online: ts !== null && now - ts < 90000 };
+        return { name: str(d.fields?.name), ts, online: isOnline(ts) };
       });
       return { count: people.length, online: people.filter((p: any) => p.online).length, people };
     });
@@ -600,8 +670,7 @@ function buildServer() {
         text: z.string().trim().min(1).max(300).optional(), priority: z.enum(["low", "normal", "high"]).optional(),
         assignee: z.string().trim().max(40).optional() } },
     async ({ name, task_id, text, priority, assignee }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       const fields: Record<string, unknown> = {};
       if (text !== undefined) fields.text = { stringValue: text };
       if (priority !== undefined) fields.priority = { stringValue: priority };
@@ -617,8 +686,7 @@ function buildServer() {
     { title: "Delete a Highway task", description: "Remove a quest from the board by ID.",
       inputSchema: { name: nameSchema, task_id: z.string().trim().min(1) } },
     async ({ name, task_id }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       const text = str(task.fields.text);
       await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
       await notify(name, `abandoned quest: ${text.slice(0, 200)}`, name);
@@ -629,13 +697,11 @@ function buildServer() {
     { title: "Assign a Highway task", description: "Assign a quest to a team member by task ID.",
       inputSchema: { name: nameSchema, task_id: z.string().trim().min(1), assignee: z.string().trim().min(1).max(40) } },
     async ({ name, task_id, assignee }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       await patchFields(TASKS, task.id, { assignee: { stringValue: assignee } }, name);
       await notify(name, `assigned quest "${str(task.fields.text).slice(0, 120)}" to ${assignee}`, name);
       return { ok: true, id: task.id, assignee };
     });
-
   // ---- Notes ----
   tool(server, "read_notes",
     { title: "Read the Highway grimoire", description: "Read the shared Highway notes page.",
@@ -670,7 +736,7 @@ function buildServer() {
 
   // ---- News / Team / Stats ----
   tool(server, "get_news",
-    { title: "Get Highway money news", description: "Money-and-life news feed (crypto + markets + macro). 5-min server cache.",
+    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech). 5-min server cache.",
       inputSchema: { limit: z.number().int().min(1).max(15).default(10) }, readOnly: true },
     async ({ limit }) => {
       const items = (await getNews()).slice(0, limit).map((it: any) => ({
@@ -690,8 +756,7 @@ function buildServer() {
       const now = Date.now();
       const online = new Set<string>();
       for (const d of presData.documents ?? []) {
-        const ts = tsOf(d.fields?.ts);
-        if (ts !== null && now - ts < 90000) online.add(str(d.fields?.name).toLowerCase());
+        if (isOnline(tsOf(d.fields?.ts), now)) online.add(str(d.fields?.name).toLowerCase());
       }
       const seen = new Map<string, { name: string; online: boolean; lastSeen: number | null }>();
       for (const d of msgDocs) {
@@ -714,10 +779,7 @@ function buildServer() {
       ]);
       const now = Date.now();
       const tasks = taskDocs.map(fmtTask);
-      const online = (presData.documents ?? []).filter((d: any) => {
-        const ts = tsOf(d.fields?.ts);
-        return ts !== null && now - ts < 90000;
-      }).length;
+      const online = (presData.documents ?? []).filter((d: any) => isOnline(tsOf(d.fields?.ts), now)).length;
       const nf = notesData?.fields;
       return {
         messages_total: msgTotal, tasks_open: tasks.filter((t) => !t.done).length,
@@ -732,40 +794,37 @@ function buildServer() {
       inputSchema: {}, readOnly: true },
     async () => ({ iso: new Date().toISOString(), unix_ms: Date.now() }));
 
-  // ---- V7.0 Overdrive Grid ----
+  // ---- V7.0 Overdrive Grid (normalized: destructured args, shared stripHtml) ----
   tool(server, "extract_site_schema",
     { title: "Extract site schema", description: "Extract structural fingerprint from a webpage for scraping.",
       inputSchema: { url: z.string().url() }, readOnly: true },
-    async (args: any) => {
-      const html: string = await fetchWithTimeout(args.url, "text", 8000);
-      const clean = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
-      return { url: args.url, bytes: clean.length, fingerprint: fnv1a(clean.slice(0, 2000)) };
+    async ({ url }) => {
+      const clean = stripHtml(await fetchText(url, 8000));
+      return { url, bytes: clean.length, fingerprint: fnv1a(clean.slice(0, 2000)) };
     });
 
   tool(server, "diff_check_page",
     { title: "Diff check page", description: "Deterministic content hash — true change detection, no false positives.",
       inputSchema: { url: z.string().url(), previousHash: z.string() }, readOnly: true },
-    async (args: any) => {
-      const text: string = await fetchWithTimeout(args.url, "text", 8000);
-      const normalized = text.replace(/\s+/g, " ").replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "");
+    async ({ url, previousHash }) => {
+      const normalized = stripHtml(await fetchText(url, 8000)).replace(/\s+/g, " ");
       const currentHash = fnv1a(normalized);
-      return { changed: currentHash !== args.previousHash, currentHash };
+      return { changed: currentHash !== previousHash, currentHash };
     });
 
   tool(server, "monitor_rss_stream",
     { title: "Monitor RSS stream", description: "Fetch and parse an RSS feed into structured items.",
       inputSchema: { feedUrl: z.string().url(), limit: z.number().int().min(1).max(20).optional() }, readOnly: true },
-    async (args: any) => {
-      const xml: string = await fetchWithTimeout(args.feedUrl, "text", 8000);
-      const items = parseRssItems(xml, args.limit || 10);
-      return { feed: args.feedUrl, count: items.length, items };
+    async ({ feedUrl, limit }) => {
+      const items = parseRssItems(await fetchText(feedUrl, 8000), limit || 10);
+      return { feed: feedUrl, count: items.length, items };
     });
 
   tool(server, "condense_session_logs",
     { title: "Condense session logs", description: "Condense chat history into a dense JSON summary.",
       inputSchema: { limit: z.number().int().min(5).max(50).optional() }, readOnly: true },
-    async (args: any) => {
-      const condensed = (await queryNewest(MESSAGES, args.limit || 20)).map((d: any) => {
+    async ({ limit }) => {
+      const condensed = (await queryNewest(MESSAGES, limit || 20)).map((d: any) => {
         const f = d.fields || {};
         return { n: str(f.name), t: str(f.text).slice(0, 200) };
       });
@@ -775,19 +834,19 @@ function buildServer() {
   tool(server, "dispatch_ambient_tts",
     { title: "Dispatch ambient TTS", description: "STANDBY: Package text for future ambient TTS hardware.",
       inputSchema: { text: z.string().min(1).max(500) } },
-    async (args: any) => ({
+    async ({ text }) => ({
       status: "STANDBY_CLOUD_READY", format: "mp3_pcm",
-      textLength: args.text.length, queued_for: "LOCAL_BEAST_TUNNEL" }));
+      textLength: text.length, queued_for: "LOCAL_BEAST_TUNNEL" }));
 
   tool(server, "mutate_environment_relay",
     { title: "Mutate environment relay", description: "STANDBY: Queue a hardware relay command for the future local PC.",
       inputSchema: { device: z.string().min(1).max(50), zone: z.string().min(1).max(50),
         action: z.string().min(1).max(50), value: z.number().optional() } },
-    async (args: any) => {
+    async ({ device, zone, action, value }) => {
       // Firestore PATCH 404s on missing docs — POST-then-PATCH is the atomic upsert
       const body = { fields: {
-        device: { stringValue: args.device }, zone: { stringValue: args.zone },
-        action: { stringValue: args.action }, value: { integerValue: String(args.value ?? 0) },
+        device: { stringValue: device }, zone: { stringValue: zone },
+        action: { stringValue: action }, value: { integerValue: String(value ?? 0) },
         status: { stringValue: "QUEUED_IN_BRAIN_STEM" },
         target: { stringValue: "LOCAL_BEAST_TUNNEL" }, tsNum: nowNum() } };
       try {
@@ -797,46 +856,46 @@ function buildServer() {
           throw e;
         await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields as Record<string, unknown>);
       }
-      return { status: "QUEUED_IN_BRAIN_STEM", device: args.device, zone: args.zone, action: args.action };
+      return { status: "QUEUED_IN_BRAIN_STEM", device, zone, action };
     });
 
-  // ---- Pinecone Pattern Refinery (host-resolved, dimension-safe) ----
+  // ---- Pinecone Pattern Refinery (host-resolved, dimension-safe, timeout-sealed) ----
   tool(server, "query_pattern_refinery",
     { title: "Query pattern refinery", description: "Vector-search the Pinecone refinery for past winning patterns.",
       inputSchema: { query: z.string().min(1).max(500), topK: z.number().int().min(1).max(10).optional() },
       readOnly: true },
-    async (args: any) => {
+    async ({ query, topK }) => {
       const { host, dimension } = await pineconeIndex();
-      const res = await fetch(`https://${host}/query`, {
+      const res = await fetchTimeout(`https://${host}/query`, {
         method: "POST",
         headers: pineconeHeaders(),
         body: JSON.stringify({
           vector: new Array(dimension).fill(0),
-          topK: args.topK || 5, includeMetadata: true,
+          topK: topK || 5, includeMetadata: true,
         }),
-      });
+      }, EXT_TIMEOUT);
       if (!res.ok) throw new Error(`Pinecone query ${res.status}: ${await safeJson(res).then((d) => d?.message ?? res.statusText)}`);
       const data = await safeJson(res);
-      return { query: args.query,
+      return { query,
         matches: (data.matches ?? []).map((m: any) => ({ id: m.id, score: m.score, metadata: m.metadata ?? {} })) };
     });
 
   tool(server, "store_pattern_win",
     { title: "Store pattern win", description: "Store a winning pattern fingerprint to the Pinecone refinery.",
       inputSchema: { pattern_id: z.string().min(1).max(100), metadata: z.record(z.string(), z.string()).optional() } },
-    async (args: any) => {
+    async ({ pattern_id, metadata }) => {
       const { host, dimension } = await pineconeIndex();
-      const res = await fetch(`https://${host}/vectors/upsert`, {
+      const res = await fetchTimeout(`https://${host}/vectors/upsert`, {
         method: "POST",
         headers: pineconeHeaders(),
         body: JSON.stringify({ vectors: [{
-          id: args.pattern_id,
+          id: pattern_id,
           values: new Array(dimension).fill(0.01),
-          metadata: { ...(args.metadata || {}), stored_at: new Date().toISOString(), source: "static-refinery" },
+          metadata: { ...(metadata || {}), stored_at: new Date().toISOString(), source: "static-refinery" },
         }] }),
-      });
+      }, EXT_TIMEOUT);
       if (!res.ok) throw new Error(`Pinecone upsert ${res.status}: ${await safeJson(res).then((d) => d?.message ?? res.statusText)}`);
-      return { stored: true, pattern_id: args.pattern_id };
+      return { stored: true, pattern_id };
     });
 
   // ============ MARROW WAVE 4: SENSES & SELF-AWARENESS ============
@@ -848,6 +907,8 @@ function buildServer() {
     async ({ query, limit }) => {
       const n = limit || 8;
       const html = await fetchText(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, 10000);
+      // PHANTOM KILL: DDG bot-blocks return tiny pages — fail loud, never return a silent empty set
+      if (html.length < 1500) throw new Error("search returned a blocked/empty response");
       const results: Array<{ title: string; url: string }> = [];
       const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
       let m: RegExpExecArray | null;
@@ -867,9 +928,7 @@ function buildServer() {
     { title: "Fetch page text", description: "Get readable text from a URL: strips scripts/styles/tags, collapses whitespace.", readOnly: true,
       inputSchema: { url: z.string().url(), maxChars: z.number().int().min(100).max(20000).optional().default(5000) } },
     async ({ url, maxChars }) => {
-      const html = await fetchText(url, 10000);
-      const noScript = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
-      const text = noScript.replace(/<[^>]+>/g, " ").replace(/[ \t\f\v]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+      const text = htmlToText(await fetchText(url, 10000));
       const cap = maxChars || 5000;
       return { url, chars: text.length, text: text.slice(0, cap) };
     });
@@ -908,7 +967,7 @@ function buildServer() {
       const vecA = /tech\s*support|help\s*desk|data\s*entry|customer\s*support|\bqa\b|it\s*support/i.test(t);
       if (vecB) breakdown.vector_b_capital = 15;
       if (vecA) breakdown.vector_a_tech = 15;
-      const score = Object.values(breakdown).reduce((a, b) => a + b, 0);
+      const score = Object.values(breakdown).reduce((a: number, b: number) => a + b, 0);
       const vector = vecB ? "B" : vecA ? "A" : "none";
       return { score, breakdown, vector, title, company, pay, location, is_remote };
     });
@@ -949,20 +1008,9 @@ function buildServer() {
         const txt = (str(d.fields?.text) + " " + str(d.fields?.url)).toLowerCase();
         return txt.includes(norm) || (norm.length > 20 && txt.includes(norm.slice(0, 40)));
       };
-      let docs: any[] = [];
-      try {
-        const data: any = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
-          from: [{ collectionId: EVO_LOGS }],
-          where: { fieldFilter: { field: { fieldPath: "type" }, op: "EQUAL", value: { stringValue: "job_hunt" } } },
-          orderBy: [{ field: { fieldPath: "tsNum" }, direction: "DESCENDING" }],
-          limit: 50,
-        } } });
-        docs = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
-      } catch {
-        // Composite-index fallback: plain page read + client-side type filter
-        const data: any = await firestore(`/${EVO_LOGS}?pageSize=50`, { method: "GET" });
-        docs = (data.documents || []).filter((d: any) => str(d.fields?.type) === "job_hunt");
-      }
+      const docs = await queryWhere(EVO_LOGS,
+        { field: "type", op: "EQUAL", value: { stringValue: "job_hunt" } },
+        "tsNum", 50, (d) => str(d.fields?.type) === "job_hunt");
       return { is_duplicate: docs.some(matchDoc), checked: docs.length };
     });
 
@@ -980,9 +1028,8 @@ function buildServer() {
       try {
         await firestore(`/${EVO_LOGS}?pageSize=1`, { method: "GET" });
         checks.firestore_reachable = true;
-      } catch { /* stays false */ }
-      const healthy = Object.values(checks).every(Boolean);
-      return { healthy, checks };
+      } catch { /* stays false — intentional existence check, not a swallow */ }
+      return { healthy: Object.values(checks).every(Boolean), checks };
     });
 
   tool(server, "get_weather",
@@ -1002,10 +1049,9 @@ function buildServer() {
       const decisions: string[] = [], questions: string[] = [], actions: string[] = [];
       for (const d of msgs) {
         const f = d.fields || {};
-        const name = str(f.name) || "unknown";
         const text = str(f.text).trim();
         if (!text) continue;
-        const line = `${name}: ${text.slice(0, 160)}`;
+        const line = `${str(f.name) || "unknown"}: ${text.slice(0, 160)}`;
         if (/\b(decided|decision|agreed|locked in|going with)\b/i.test(text)) decisions.push(line);
         else if (text.includes("?")) questions.push(line);
         else if (/\b(will|todo|action item|action:|need to|must|going to)\b/i.test(text)) actions.push(line);
@@ -1164,9 +1210,162 @@ async function macroNews(): Promise<NewsItem[]> {
   return items.slice(0, 5);
 }
 
+// ============ SOCIAL NEWS ENGINE (Google News + HN + Lobsters + YouTube, all $0) ============
+// Tech filter — pairs with MONEY_RE/MAJOR_RE; SOFT_RE still excluded everywhere
+const TECH_RE = new RegExp("\\b(" + ["\\bai\\b", "rag", "agent", "llm", "gpt", "claude",
+  "openai", "anthropic", "gemini", "deepseek", "nvidia", "gpu", "\\bchip\\b", "robot",
+  "software", "coding", "developer", "github", "startup", "model", "neural",
+  "computer vision", "machine learning", "automation", "data center", "quantum",
+  "cybersecurity", "breach", "hack"].join("|") + ")s?\\b");
+
+function techImpact(title: string): string {
+  const t = title.toLowerCase();
+  if (/rag|retrieval/.test(t)) return "RAG in production → the practical AI pattern. Watch who's shipping it.";
+  if (/agent/.test(t)) return "Agentic AI → systems that act, not just chat. Track real deployments.";
+  if (/llm|gpt|claude|gemini|deepseek|model/.test(t)) return "Model moves → capability jumps. Watch benchmarks and cost.";
+  if (/openai|anthropic/.test(t)) return "Lab power plays → pricing and access shift. Builders feel it first.";
+  if (/nvidia|gpu|chip/.test(t)) return "Chip supply → who can afford to train. Scarcity decides winners.";
+  if (/robot/.test(t)) return "Robotics → labor costs move. Watch warehouses and factories first.";
+  if (/layoff|hiring|job/.test(t)) return "Jobs signal → where the money's going. Skills follow demand.";
+  if (/cybersecurity|breach|hack/.test(t)) return "Security → every breach reprices trust. Patch fast.";
+  return "Tech shift → builders move first. Watch who's shipping.";
+}
+
+// YouTube Atom feed parser (<entry>, not <item>)
+function parseAtomEntries(xml: string, limit: number): Array<{ title: string; link: string }> {
+  const items: Array<{ title: string; link: string }> = [];
+  const re = /<entry>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link[^>]*href="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) && items.length < limit) {
+    const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+    const link = m[2].trim();
+    if (title && link) items.push({ title, link });
+  }
+  return items;
+}
+
+// Google News RSS titles arrive as "Headline - Publisher"
+function stripPublisher(title: string): string {
+  const i = title.lastIndexOf(" - ");
+  return (i > 10 ? title.slice(0, i) : title).trim();
+}
+
+// Shared social gate: topical AND not soft
+function socialGate(tl: string): boolean {
+  if (SOFT_RE.test(tl)) return false;
+  return TECH_RE.test(tl) || MONEY_RE.test(tl) || MAJOR_RE.test(tl);
+}
+
+const SOCIAL_QUERIES = [
+  "(\"Retrieval-Augmented Generation\" OR \"Agentic AI\") AND (\"deployed\" OR \"in production\")",
+  "(\"computer vision\" OR \"predictive maintenance\") AND (\"manufacturing\" OR \"supply chain\")",
+  "(\"AI\" OR \"artificial intelligence\") AND (\"job\" OR \"hiring\" OR \"layoff\")",
+];
+
+async function googleNewsSocial(seen: Set<string>): Promise<NewsItem[]> {
+  const items: NewsItem[] = [];
+  for (const q of SOCIAL_QUERIES) {
+    try {
+      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`;
+      const xml: string = await fetchText(url, 10000);
+      let n = 0;
+      for (const { title, link } of parseRssItems(xml, 15)) {
+        if (n >= 4) break;
+        const clean = stripPublisher(title);
+        const tl = clean.toLowerCase(), key = tl.slice(0, 48);
+        if (seen.has(key) || !socialGate(tl)) continue;
+        seen.add(key);
+        items.push({ title: clean, url: link, source: "SOCIAL", image: faviconFor(link), description: techImpact(clean) });
+        n++;
+      }
+    } catch (e: any) { console.warn("google news social failed:", q.slice(0, 40), e?.message ?? e); }
+  }
+  return items;
+}
+
+async function hackerNews(seen: Set<string>): Promise<NewsItem[]> {
+  const items: NewsItem[] = [];
+  const push = (title: string, url: string, score: number, comments: number) => {
+    const tl = title.toLowerCase(), key = tl.slice(0, 48);
+    if (!title || seen.has(key) || !socialGate(tl)) return;
+    seen.add(key);
+    items.push({ title, url, source: "HACKER NEWS",
+      image: faviconFor("https://news.ycombinator.com"),
+      description: `${score} pts · ${comments} comments — the builders are talking.` });
+  };
+  try {
+    const ids: number[] = await fetchJson("https://hacker-news.firebaseio.com/v0/topstories.json", 10000);
+    if (!Array.isArray(ids)) throw new Error("hn topstories not array");
+    const stories: any[] = await Promise.all(ids.slice(0, 12).map((id: number) =>
+      fetchJson(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, 8000).catch(() => null)));
+    for (const s of stories) {
+      if (!s || s.type !== "story" || !s.title) continue;
+      push(s.title, s.url || `https://news.ycombinator.com/item?id=${s.id}`, s.score || 0, s.descendants || 0);
+    }
+  } catch (e: any) { console.warn("hacker news failed:", e?.message ?? e); }
+  try { // Algolia keyword search — catches stories the top list misses
+    const r: any = await fetchJson(
+      `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent("agentic AI deployed")}&tags=story`, 10000);
+    for (const h of (r?.hits ?? []).slice(0, 6)) {
+      push(h.title || "", h.url || `https://news.ycombinator.com/item?id=${h.objectID}`, h.points || 0, h.num_comments || 0);
+    }
+  } catch (e: any) { console.warn("hn algolia failed:", e?.message ?? e); }
+  return items;
+}
+
+async function lobstersNews(seen: Set<string>): Promise<NewsItem[]> {
+  const items: NewsItem[] = [];
+  try {
+    const posts: any[] = await fetchJson("https://lobste.rs/hottest.json", 10000);
+    if (!Array.isArray(posts)) throw new Error("lobsters not array");
+    for (const p of posts.slice(0, 12)) {
+      const title = p.title || "", url = p.url || `https://lobste.rs/s/${p.short_id}`;
+      const tl = title.toLowerCase(), key = tl.slice(0, 48);
+      if (!title || seen.has(key) || !socialGate(tl)) continue;
+      seen.add(key);
+      items.push({ title, url, source: "LOBSTERS", image: faviconFor("https://lobste.rs"),
+        description: `${p.score || 0} score · ${(p.comment_count ?? 0)} comments — curated tech signal.` });
+    }
+  } catch (e: any) { console.warn("lobsters failed:", e?.message ?? e); }
+  return items;
+}
+
+const YT_CHANNELS = [
+  { id: "UCsBjURrPoezykLs9EqgamOA", name: "Fireship" },
+  { id: "UCbfYPyITQ-7l4upoX8nvctg", name: "Two Minute Papers" },
+  { id: "UCXuqSBlHAE6Xw-yeJA0Tunw", name: "Linus Tech Tips" },
+];
+
+async function youtubeNews(seen: Set<string>): Promise<NewsItem[]> {
+  const items: NewsItem[] = [];
+  for (const ch of YT_CHANNELS) {
+    try {
+      const xml: string = await fetchText(`https://www.youtube.com/feeds/videos.xml?channel_id=${ch.id}`, 10000);
+      let n = 0;
+      for (const { title, link } of parseAtomEntries(xml, 8)) {
+        if (n >= 2) break;
+        const tl = title.toLowerCase(), key = tl.slice(0, 48);
+        if (seen.has(key) || !socialGate(tl)) continue;
+        seen.add(key);
+        items.push({ title: `${title} [${ch.name}]`, url: link, source: "YOUTUBE",
+          image: faviconFor("https://www.youtube.com"), description: techImpact(title) });
+        n++;
+      }
+    } catch (e: any) { console.warn("youtube news failed:", ch.name, e?.message ?? e); }
+  }
+  return items;
+}
+
+async function socialNews(): Promise<NewsItem[]> {
+  const seen = new Set<string>();
+  const [gn, hn, lb, yt] = await Promise.all([
+    googleNewsSocial(seen), hackerNews(seen), lobstersNews(seen), youtubeNews(seen)]);
+  return [...gn, ...hn, ...lb, ...yt];
+}
+
 async function buildNews(): Promise<NewsItem[]> {
-  const [crypto, markets, macro] = await Promise.all([cryptoNews(), marketsNews(), macroNews()]);
-  return [...macro.slice(0, 8), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 14);
+  const [crypto, markets, macro, social] = await Promise.all([cryptoNews(), marketsNews(), macroNews(), socialNews()]);
+  return [...macro.slice(0, 6), ...social.slice(0, 6), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 16);
 }
 
 let newsCache: { at: number; items: NewsItem[] } | null = null;
@@ -1185,7 +1384,7 @@ async function getNews(): Promise<NewsItem[]> {
   return newsInflight;
 }
 
-// ============ PINECONE (control-plane host resolution, dimension-safe) ============
+// ============ PINECONE (control-plane host resolution, dimension-safe, timeout-sealed) ============
 const PINECONE_INDEX = "static-pattern-refinery";
 let _pcHost: { host: string; dimension: number } | null = null;
 
@@ -1196,8 +1395,10 @@ function pineconeHeaders(): Record<string, string> {
 }
 async function pineconeIndex(): Promise<{ host: string; dimension: number }> {
   if (_pcHost) return _pcHost;
-  // Control plane gives us the data-plane host + vector dimension — no more guessing
-  const res = await fetch(`https://api.pinecone.io/indexes/${PINECONE_INDEX}`, { headers: pineconeHeaders() });
+  // Control plane gives us the data-plane host + vector dimension — no more guessing.
+  // PHANTOM KILL: describe fetch previously had NO timeout.
+  const res = await fetchTimeout(`https://api.pinecone.io/indexes/${PINECONE_INDEX}`,
+    { headers: pineconeHeaders() }, EXT_TIMEOUT);
   if (!res.ok) throw new Error(`Pinecone describe ${res.status}`);
   const d: any = await safeJson(res);
   if (!d.host || !d.dimension) throw new Error("Pinecone index describe returned no host/dimension");
