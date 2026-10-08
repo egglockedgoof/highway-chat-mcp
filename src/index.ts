@@ -810,10 +810,10 @@ function buildServer() {
   server.registerTool(
     "get_news",
     {
-      title: "Get Highway trending news",
-      description: "Get the same trending news feed the widget's News tab shows (Hacker News + Lobsters + BBC, with thumbnails), so you can read and discuss it in chat. Shares the server's 15-minute cache.",
+      title: "Get Highway money news",
+      description: "Get the same money-and-life news feed the widget's News tab shows (crypto movers + stock markets + macro money news), so you can read and discuss it in chat. Shares the server's 5-minute cache.",
       inputSchema: {
-        limit: z.number().int().min(1).max(32).default(10),
+        limit: z.number().int().min(1).max(15).default(10),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -821,8 +821,7 @@ function buildServer() {
       try {
         const now = Date.now();
         if (!newsCache || now - newsCache.at > NEWS_TTL) {
-          const raw = await buildNews();
-          newsCache = { at: now, items: await enrichNews(raw) };
+          newsCache = { at: now, items: await buildNews() };
         }
         const items = newsCache.items.slice(0, limit).map((it: any) => ({
           title: it.title, url: it.url, source: it.source,
@@ -946,9 +945,10 @@ app.use((req, res, next) => {
 });
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---- News aggregator: trending overall (HN + Lobsters + BBC), 15-min cache ----
+// ---- News aggregator: money-and-life first (crypto + markets + macro), 5-min cache ----
+// Server-side fetch, so no CORS limits: the widget only ever talks to /news.
 let newsCache: { at: number; items: any[] } | null = null;
-const NEWS_TTL = 15 * 60 * 1000;
+const NEWS_TTL = 5 * 60 * 1000;
 
 async function fetchJson(url: string, timeoutMs = 12000): Promise<any> {
   const ctrl = new AbortController();
@@ -970,35 +970,6 @@ async function fetchText(url: string, timeoutMs = 12000): Promise<string> {
   } finally { clearTimeout(t); }
 }
 
-async function buildNews(): Promise<any[]> {
-  const items: { title: string; url: string; source: string; score?: number }[] = [];
-  try { // Hacker News top stories
-    const ids: number[] = await fetchJson("https://hacker-news.firebaseio.com/v0/topstories.json");
-    const stories = await Promise.all(ids.slice(0, 12).map((id) =>
-      fetchJson("https://hacker-news.firebaseio.com/v0/item/" + id + ".json").catch(() => null)));
-    for (const s of stories) {
-      if (s && s.title) items.push({ title: s.title, url: s.url || ("https://news.ycombinator.com/item?id=" + s.id), source: "HN", score: s.score || 0 });
-    }
-  } catch (e) { console.warn("HN news failed", e); }
-  try { // Lobsters hottest
-    const lob = await fetchJson("https://lobste.rs/hottest.json");
-    for (const s of (Array.isArray(lob) ? lob : []).slice(0, 10)) {
-      if (s && s.title) items.push({ title: s.title, url: s.url || s.comments_url, source: "Lobsters", score: s.score || 0 });
-    }
-  } catch (e) { console.warn("Lobsters news failed", e); }
-  try { // BBC world news RSS
-    const xml = await fetchText("https://feeds.bbci.co.uk/news/rss.xml");
-    const re = /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g;
-    let m: RegExpExecArray | null, n = 0;
-    while ((m = re.exec(xml)) && n < 10) {
-      const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
-      const link = m[2].trim();
-      if (title && link) { items.push({ title, url: link, source: "BBC" }); n++; }
-    }
-  } catch (e) { console.warn("BBC news failed", e); }
-  return items;
-}
-
 function extractDomain(url: string): string {
   try { return new URL(url).hostname; } catch { return ""; }
 }
@@ -1008,41 +979,162 @@ function faviconFor(url: string): string {
   return d ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : "";
 }
 
-// Fetch og:image + og:description for one article (5s timeout). Falls back to favicon.
-async function enrichOne(item: { title: string; url: string; source: string; score?: number }): Promise<any> {
-  const out: any = { ...item, image: faviconFor(item.url), description: "" };
-  try {
-    const html = await fetchText(item.url, 5000);
-    // og:image
-    let m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
-      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
-    if (m && m[1] && m[1].startsWith("http")) out.image = m[1];
-    // og:description, fallback to meta description
-    m = html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i)
-      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i)
-      || html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)
-      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i);
-    if (m && m[1]) {
-      let d = m[1].replace(/&[^;]+;/g, " ").replace(/\s+/g, " ").trim();
-      if (d.length > 120) d = d.slice(0, 117).trimEnd() + "...";
-      out.description = d;
-    }
-  } catch { /* keep favicon fallback */ }
-  return out;
+const fmtUsd = (n: number): string =>
+  n >= 1000 ? "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 })
+  : n >= 1 ? "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 })
+  : "$" + n.toPrecision(3);
+
+const fmtPct = (n: number): string => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
+
+// Wallet-impact one-liner for a price move (plain language, no fabricated "why").
+function impactLine(pct: number, holder: string): string {
+  if (pct >= 5) return "Ripping — big green day. " + holder + " are up.";
+  if (pct >= 1.5) return "Green — momentum building for " + holder + ".";
+  if (pct <= -5) return "Dumping — don't panic-sell, " + holder + ".";
+  if (pct <= -1.5) return "Dipping — cheaper if you were buying, " + holder + ".";
+  return "Flat — nothing to act on today.";
 }
 
-// Enrich all items in parallel; slow/failed articles keep favicon fallback.
-async function enrichNews(items: any[]): Promise<any[]> {
-  const results = await Promise.allSettled(items.map(enrichOne));
-  return results.map((r, i) => r.status === "fulfilled" ? r.value : { ...items[i], image: faviconFor(items[i].url), description: "" });
+async function cryptoNews(): Promise<any[]> {
+  const items: any[] = [];
+  const push = (sym: string, name: string, id: string, price: number, pct: number, image: string) => {
+    items.push({
+      title: sym.toUpperCase() + " " + fmtUsd(price) + " " + fmtPct(pct),
+      url: "https://www.coingecko.com/en/coins/" + id,
+      source: "CRYPTO", image,
+      description: impactLine(pct, name + " holders"),
+    });
+  };
+  try { // CoinGecko free API, no key
+    const coins: any[] = await fetchJson(
+      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=60&page=1&sparkline=false&price_change_percentage=24h");
+    if (!Array.isArray(coins) || !coins.length) throw new Error("empty coingecko");
+    const btc = coins.find((c) => c.symbol === "btc");
+    const eth = coins.find((c) => c.symbol === "eth");
+    const movers = coins.filter((c) => c !== btc && c !== eth)
+      .sort((a, b) => Math.abs(b.price_change_percentage_24h || 0) - Math.abs(a.price_change_percentage_24h || 0))
+      .slice(0, 3);
+    for (const c of [btc, eth, ...movers]) {
+      if (c) push(c.symbol, c.name, c.id, c.current_price, c.price_change_percentage_24h || 0, c.image || "");
+    }
+  } catch (e) {
+    console.warn("coingecko failed, trying coincap", e);
+    try { // CoinCap fallback, no key
+      const cc: any = await fetchJson("https://api.coincap.io/v2/assets?limit=20");
+      const assets: any[] = Array.isArray(cc && cc.data) ? cc.data : [];
+      const btc = assets.find((a) => a.symbol === "BTC");
+      const eth = assets.find((a) => a.symbol === "ETH");
+      const movers = assets.filter((a) => a !== btc && a !== eth)
+        .sort((a, b) => Math.abs(parseFloat(b.changePercent24Hr) || 0) - Math.abs(parseFloat(a.changePercent24Hr) || 0))
+        .slice(0, 3);
+      for (const a of [btc, eth, ...movers]) {
+        if (a) push(a.symbol, a.name, a.id, parseFloat(a.priceUsd), parseFloat(a.changePercent24Hr) || 0, "");
+      }
+    } catch (e2) { console.warn("coincap failed", e2); }
+  }
+  return items.slice(0, 5);
+}
+
+const MARKET_SYMS = [
+  { sym: "^GSPC", name: "S&P 500", idx: true },
+  { sym: "^IXIC", name: "Nasdaq", idx: true },
+  { sym: "^DJI", name: "Dow Jones", idx: true },
+  { sym: "NVDA", name: "NVIDIA", idx: false },
+  { sym: "TSLA", name: "Tesla", idx: false },
+  { sym: "AAPL", name: "Apple", idx: false },
+  { sym: "MSFT", name: "Microsoft", idx: false },
+  { sym: "AMZN", name: "Amazon", idx: false },
+  { sym: "META", name: "Meta", idx: false },
+  { sym: "AMD", name: "AMD", idx: false },
+  { sym: "PLTR", name: "Palantir", idx: false },
+];
+
+async function marketsNews(): Promise<any[]> {
+  const items: any[] = [];
+  try { // Yahoo Finance chart API, no key
+    const quotes = (await Promise.all(MARKET_SYMS.map(async (t) => {
+      try {
+        const j: any = await fetchJson(
+          "https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(t.sym) + "?interval=1d&range=2d", 8000);
+        const r = j && j.chart && j.chart.result && j.chart.result[0];
+        const m = r && r.meta;
+        if (!m || !m.regularMarketPrice || !m.chartPreviousClose) return null;
+        return { sym: t.sym, name: t.name, idx: t.idx, price: m.regularMarketPrice,
+          pct: (m.regularMarketPrice - m.chartPreviousClose) / m.chartPreviousClose * 100 };
+      } catch { return null; }
+    }))).filter(Boolean) as any[];
+    for (const q of quotes.filter((q) => q.idx)) {
+      items.push({
+        title: q.name + " " + q.price.toLocaleString("en-US", { maximumFractionDigits: 0 }) + " " + fmtPct(q.pct),
+        url: "https://finance.yahoo.com/quote/" + encodeURIComponent(q.sym),
+        source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
+        description: q.pct >= 0
+          ? "Green day — stocks and retirement accounts up."
+          : "Red day — stocks cheaper; don't panic-sell.",
+      });
+    }
+    const movers = quotes.filter((q) => !q.idx).sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 2);
+    for (const q of movers) {
+      items.push({
+        title: q.name + " " + fmtUsd(q.price) + " " + fmtPct(q.pct) + " — top mover",
+        url: "https://finance.yahoo.com/quote/" + encodeURIComponent(q.sym),
+        source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
+        description: impactLine(q.pct, q.name + " holders"),
+      });
+    }
+  } catch (e) { console.warn("markets news failed", e); }
+  return items.slice(0, 5);
+}
+
+const MONEY_WORDS = ["rate", "fed", "inflation", "cpi", "jobs", "unemployment", "wage",
+  "tariff", "tax", "recession", "gdp", "housing", "mortgage", "rent", "oil", "gas",
+  "crypto", "bitcoin", "stock", "market", "dollar", "interest", "bank", "debt", "stimulus", "trade"];
+
+function macroImpact(title: string): string {
+  const t = title.toLowerCase();
+  if (/rate|fed|interest/.test(t)) return "Rates move → borrowing & savings rates shift.";
+  if (t.includes("inflation") || t.includes("cpi")) return "Prices rising → your dollar buys less.";
+  if (/jobs|unemployment|wage|hiring/.test(t)) return "Jobs market → hiring & pay pressure.";
+  if (t.includes("tariff")) return "Tariffs → import prices may climb.";
+  if (/housing|mortgage|rent/.test(t)) return "Housing → rent & mortgage costs.";
+  if (/oil|gas|energy/.test(t)) return "Energy → gas & utility bills.";
+  return "Macro shift → watch your wallet.";
+}
+
+async function macroNews(): Promise<any[]> {
+  const items: any[] = [];
+  const feeds = [
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/news/rss.xml",
+  ];
+  for (const url of feeds) {
+    try {
+      const xml = await fetchText(url);
+      const re = /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g;
+      let m: RegExpExecArray | null, n = 0;
+      while ((m = re.exec(xml)) && n < 3) {
+        const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+        const link = m[2].trim();
+        const tl = title.toLowerCase();
+        if (!title || !link || !MONEY_WORDS.some((w) => tl.includes(w))) continue;
+        items.push({ title, url: link, source: "MACRO", image: faviconFor(link), description: macroImpact(title) });
+        n++;
+      }
+    } catch (e) { console.warn("macro news failed", url, e); }
+  }
+  return items.slice(0, 5);
+}
+
+async function buildNews(): Promise<any[]> {
+  const [crypto, markets, macro] = await Promise.all([cryptoNews(), marketsNews(), macroNews()]);
+  return [...crypto.slice(0, 5), ...markets.slice(0, 5), ...macro.slice(0, 5)].slice(0, 15);
 }
 
 app.get("/news", async (_req, res) => {
   try {
     const now = Date.now();
     if (!newsCache || now - newsCache.at > NEWS_TTL) {
-      const raw = await buildNews();
-      newsCache = { at: now, items: await enrichNews(raw) };
+      newsCache = { at: now, items: await buildNews() };
     }
     res.json({ ok: true, updated: new Date(newsCache.at).toISOString(), count: newsCache.items.length, items: newsCache.items });
   } catch (e: any) {
