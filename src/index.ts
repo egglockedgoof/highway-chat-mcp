@@ -28,26 +28,37 @@ const TYPING = "highway_typing";
 const REQUIRED_MESSAGE_KEYS = ["name", "text", "deviceId"] as const;
 const DEVICE_ID = "mcp-bridge";
 
-// Cached auth token for authenticated Firestore writes
-// Uses bot account if BOT_EMAIL/BOT_PASSWORD are set, otherwise anonymous
-let _idToken: string | null = null;
-let _tokenExp: number = 0;
+// Per-bot credentials from BOT_CREDENTIALS env (JSON: {"whisper":{"email":"...","password":"..."}, ...})
+// Falls back to single BOT_EMAIL/BOT_PASSWORD, then anonymous
+let _tokens: Record<string, { token: string; exp: number }> = {};
 
-async function getIdToken(): Promise<string> {
+function getBotCreds(name: string): { email: string; password: string } | null {
+  try {
+    const all = JSON.parse(process.env.BOT_CREDENTIALS || "{}");
+    const lower = name.toLowerCase();
+    if (all[lower]?.email && all[lower]?.password) return all[lower];
+  } catch {}
+  // Fallback to single bot account
+  if (process.env.BOT_EMAIL && process.env.BOT_PASSWORD) {
+    return { email: process.env.BOT_EMAIL, password: process.env.BOT_PASSWORD };
+  }
+  return null;
+}
+
+async function getIdToken(forName?: string): Promise<string> {
+  const key = (forName || "anon").toLowerCase();
+  const cached = _tokens[key];
   const now = Date.now();
-  if (_idToken && now < _tokenExp - 60000) return _idToken;
+  if (cached && now < cached.exp - 60000) return cached.token;
 
-  const botEmail = process.env.BOT_EMAIL;
-  const botPassword = process.env.BOT_PASSWORD;
+  const creds = forName ? getBotCreds(forName) : null;
   let url: string;
   let body: any;
 
-  if (botEmail && botPassword) {
-    // Sign in with bot account (can use reserved bot names)
+  if (creds) {
     url = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`;
-    body = { email: botEmail, password: botPassword, returnSecureToken: true };
+    body = { email: creds.email, password: creds.password, returnSecureToken: true };
   } else {
-    // Fallback to anonymous (cannot use reserved names)
     url = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/signupNewUser?key=${API_KEY}`;
     body = { returnSecureToken: true };
   }
@@ -59,13 +70,15 @@ async function getIdToken(): Promise<string> {
   });
   const data: any = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Auth ${res.status}: ${data?.error?.message ?? res.statusText}`);
-  _idToken = data.idToken;
-  _tokenExp = now + (parseInt(data.expiresIn || "3600", 10) * 1000);
-  return _idToken as string;
+  _tokens[key] = {
+    token: data.idToken,
+    exp: now + (parseInt(data.expiresIn || "3600", 10) * 1000),
+  };
+  return data.idToken as string;
 }
 
-async function firestore(path: string, init: { method: string; body?: unknown }) {
-  const idToken = await getIdToken();
+async function firestore(path: string, init: { method: string; body?: unknown; forName?: string }) {
+  const idToken = await getIdToken(init.forName);
   const res = await fetch(`${BASE}${path}`, {
     method: init.method,
     headers: {
@@ -301,7 +314,7 @@ function buildServer() {
     async ({ name, text }) => {
       try {
         const ts = Date.now();
-        await firestore(`/${MESSAGES}`, { method: "POST", body: buildMessageFields(name, text) });
+        await firestore(`/${MESSAGES}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, name, ts }) }] };
       } catch (e: any) {
         return { isError: true, content: [{ type: "text" as const, text: `send_message failed: ${e.message}` }] };
