@@ -28,6 +28,23 @@ const TYPING = "highway_typing";
 const REQUIRED_MESSAGE_KEYS = ["name", "text", "deviceId"] as const;
 const DEVICE_ID = "mcp-bridge";
 
+// Identity gate. Every write tool takes a caller-supplied `name`; without a
+// gate the bridge could post/edit/delete as any real person (including owners).
+// Only these names are accepted (case-insensitive), normalised to the configured
+// casing. Override with ALLOWED_NAMES="rook,Claude".
+const ALLOWED_DISPLAY = (process.env.ALLOWED_NAMES ?? "rook,Claude")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const ALLOWED_BY_LOWER = new Map(ALLOWED_DISPLAY.map((n) => [n.toLowerCase(), n]));
+const NAME = z
+  .string()
+  .trim()
+  .min(1)
+  .max(40)
+  .refine((v) => ALLOWED_BY_LOWER.has(v.toLowerCase()), {
+    message: `name must be one of: ${ALLOWED_DISPLAY.join(", ")}`,
+  })
+  .transform((v) => ALLOWED_BY_LOWER.get(v.toLowerCase()) as string);
+
 async function firestore(path: string, init: { method: string; body?: unknown }) {
   const res = await fetch(`${BASE}${path}`, {
     method: init.method,
@@ -255,7 +272,7 @@ function buildServer() {
       title: "Send a Highway message",
       description: "Post a message to Highway Chat. Timestamp is generated automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         text: z.string().trim().min(1).max(2000),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -277,7 +294,7 @@ function buildServer() {
       title: "Set Highway presence",
       description: "Mark a participant as present in Highway Chat. One doc per name, updated in place.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -302,7 +319,7 @@ function buildServer() {
       title: "Edit a Highway message",
       description: "Edit the text of a message you posted. Only the original author (by name) can edit.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         message_id: z.string().trim().min(1),
         text: z.string().trim().min(1).max(2000),
       },
@@ -330,7 +347,7 @@ function buildServer() {
       title: "Delete a Highway message",
       description: "Delete a message you posted. Only the original author (by name) can delete.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         message_id: z.string().trim().min(1),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -357,7 +374,7 @@ function buildServer() {
       title: "React to a Highway message",
       description: "Toggle an emoji reaction on a message (adds it if you haven't reacted, removes it if you have). Mirrors the widget's reaction pills.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         message_id: z.string().trim().min(1),
         emoji: z.string().trim().min(1).max(8),
       },
@@ -416,7 +433,7 @@ function buildServer() {
       title: "Pin or unpin a Highway message",
       description: "Pin a message so it stands out, or unpin it. Pinned messages are listed by read_pinned.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         message_id: z.string().trim().min(1),
         pinned: z.boolean().default(true),
       },
@@ -502,7 +519,7 @@ function buildServer() {
       title: "Set typing indicator",
       description: "Show (or clear) your typing indicator in Highway Chat, like the widget does while you type.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         typing: z.boolean(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -528,7 +545,7 @@ function buildServer() {
       title: "Log Highway activity",
       description: "Post an entry to the Highway Chat ACTIVITY feed (the living timeline). Use it for quest updates, milestones, arrivals, or anything the room should see. Renders as '<name> <text>'.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         text: z.string().trim().min(1).max(300),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -596,7 +613,7 @@ function buildServer() {
       title: "Add a Highway task",
       description: "Add a quest to the Highway board. Also posts 'started quest: <text>' to the ACTIVITY feed automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         text: z.string().trim().min(1).max(300),
         priority: z.enum(["low", "normal", "high"]).default("normal"),
         assignee: z.string().trim().max(40).optional(),
@@ -629,7 +646,7 @@ function buildServer() {
       title: "Complete a Highway task",
       description: "Mark a quest complete by its ID, or by matching part of its title. Posts 'completed quest: <text>' to ACTIVITY automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         task_id: z.string().trim().min(1).optional(),
         title: z.string().trim().min(1).max(300).optional(),
       },
@@ -656,7 +673,7 @@ function buildServer() {
       title: "Update a Highway task",
       description: "Edit a quest's title, priority, or assignee by ID. Posts an ACTIVITY entry automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         task_id: z.string().trim().min(1),
         text: z.string().trim().min(1).max(300).optional(),
         priority: z.enum(["low", "normal", "high"]).optional(),
@@ -689,7 +706,7 @@ function buildServer() {
       title: "Delete a Highway task",
       description: "Remove a quest from the board by ID. Posts 'abandoned quest: <text>' to ACTIVITY automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         task_id: z.string().trim().min(1),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -714,7 +731,7 @@ function buildServer() {
       title: "Assign a Highway task",
       description: "Assign a quest to a team member by task ID. Posts an ACTIVITY entry automatically.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         task_id: z.string().trim().min(1),
         assignee: z.string().trim().min(1).max(40),
       },
@@ -760,7 +777,7 @@ function buildServer() {
       title: "Overwrite the Highway grimoire",
       description: "Replace the entire shared notes page with new content. Prefer append_note to add without wiping.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         content: z.string().max(20000),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -785,7 +802,7 @@ function buildServer() {
       title: "Append to the Highway grimoire",
       description: "Add a signed entry to the end of the shared notes page without overwriting existing content.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
+        name: NAME,
         text: z.string().trim().min(1).max(5000),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
