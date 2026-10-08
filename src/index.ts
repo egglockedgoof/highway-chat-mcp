@@ -1146,6 +1146,7 @@ function macroImpact(title: string): string {
   if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI buildout debt-financed at 5%+ rates → concentration risk. FTC probing.";
   if (/spacex|nasa|moon|mars|artemis|starship/.test(t)) return "Starship reached orbit. Moon landing targeted 2028.";
   if (/food|wheat|corn|crop|drought|famine|ebt|snap|beef/.test(t)) return "Beef at $6.92/lb record. El Niño peaking. SNAP Nov funding uncertain.";
+  if (/hurricane|storm|flood|earthquake|wildfire|tornado/.test(t)) return "Disaster → supply chains break, insurance spikes, gas prices jump.";
   if (/bitcoin|btc|crypto|ethereum/.test(t)) return "BTC-gold correlation at all-time high → debasement trade. $75K is the line.";
   return "Major shift → watch your wallet.";
 }
