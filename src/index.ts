@@ -1089,6 +1089,7 @@ async function marketsNews(): Promise<any[]> {
 const MONEY_WORDS = ["rate", "fed", "inflation", "cpi", "jobs", "unemployment", "wage",
   "tariff", "tax", "recession", "gdp", "housing", "mortgage", "rent", "oil", "gas",
   "crypto", "bitcoin", "stock", "market", "dollar", "interest", "bank", "debt", "stimulus", "trade"];
+const MONEY_RE = new RegExp("\\b(" + MONEY_WORDS.join("|") + ")s?\\b");
 
 function macroImpact(title: string): string {
   const t = title.toLowerCase();
@@ -1098,6 +1099,7 @@ function macroImpact(title: string): string {
   if (t.includes("tariff")) return "Tariffs → import prices may climb.";
   if (/housing|mortgage|rent/.test(t)) return "Housing → rent & mortgage costs.";
   if (/oil|gas|energy/.test(t)) return "Energy → gas & utility bills.";
+  if (/\btax(es)?\b/.test(t)) return "Taxes → what you keep changes.";
   return "Macro shift → watch your wallet.";
 }
 
@@ -1107,6 +1109,7 @@ async function macroNews(): Promise<any[]> {
     "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://feeds.bbci.co.uk/news/rss.xml",
   ];
+  const seen = new Set<string>();
   for (const url of feeds) {
     try {
       const xml = await fetchText(url);
@@ -1116,7 +1119,9 @@ async function macroNews(): Promise<any[]> {
         const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
         const link = m[2].trim();
         const tl = title.toLowerCase();
-        if (!title || !link || !MONEY_WORDS.some((w) => tl.includes(w))) continue;
+        const key = tl.slice(0, 48);
+        if (!title || !link || !MONEY_RE.test(tl) || seen.has(key)) continue;
+        seen.add(key);
         items.push({ title, url: link, source: "MACRO", image: faviconFor(link), description: macroImpact(title) });
         n++;
       }
