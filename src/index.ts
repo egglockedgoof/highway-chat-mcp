@@ -16,9 +16,9 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-
 // ============ FAIL-CLOSED ENV ============
 const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
@@ -34,7 +34,11 @@ const BASE =
   process.env.FIRESTORE_BASE ||
   "https://firestore.googleapis.com/v1/projects/highway-chat/databases/(default)/documents";
 
+
 const MESSAGES = "highway_messages";
+const DMS = "highway_dm";
+
+
 const PRESENCE = "highway_presence";
 const ACTIVITY = "highway_activity";
 const TASKS = "highway_tasks";
@@ -634,6 +638,8 @@ const ROUTES: Array<{ type: string; bot: string; reason: string; re: RegExp }> =
 ];
 
 const nameSchema = z.string().trim().min(1).max(40);
+const channelSchema = z.enum(["room", "dm"]).default("room");
+const channelCollection = (channel: string): string => (channel === "dm" ? DMS : MESSAGES);
 
 // Built PER REQUEST. A shared McpServer rejects every overlapping call with
 // "Already connected to a transport" — the SDK's stateless pattern is one server per request.
@@ -642,18 +648,18 @@ function buildServer(): McpServer {
 
   // ---- Messages ----
   tool(server, "read_messages",
-    { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first.",
-      inputSchema: { limit: z.number().int().min(1).max(50).default(10) }, readOnly: true },
-    async ({ limit }) => {
-      const messages = (await queryNewest(MESSAGES, limit)).map(fmtMsg);
+        { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first. Use channel 'dm' for the private Nexus DM channel.",
+      inputSchema: { limit: z.number().int().min(1).max(50).default(10), channel: channelSchema }, readOnly: true },
+    async ({ limit, channel }) => {
+      const messages = (await queryNewest(channelCollection(channel), limit)).map(fmtMsg);
       return { count: messages.length, messages };
     });
 
   tool(server, "send_message",
-    { title: "Send a Highway message", description: "Post a message to Highway Chat.",
-      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(2000) } },
-    async ({ name, text }) => {
-      await firestore(`/${MESSAGES}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
+    { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
+      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(2000), channel: channelSchema } },
+    async ({ name, text, channel }) => {
+      await firestore(`/${channelCollection(channel)}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
       return { ok: true, name, ts: Date.now() };
     });
 
