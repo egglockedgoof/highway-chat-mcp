@@ -1356,11 +1356,128 @@ async function youtubeNews(seen: Set<string>): Promise<NewsItem[]> {
   return items;
 }
 
+// ============ APIFY SOCIAL SCRAPING (TikTok + X, $0 free tier) ============
+// Expensive calls (~$0.05-0.10 each) — Firestore rate-limited to once per 6h.
+const APIFY_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
+const APIFY_CALL_TIMEOUT = 60000;
+
+async function apifyConfig(): Promise<{ lastRun: number | null; cached: NewsItem[] }> {
+  const empty = { lastRun: null as number | null, cached: [] as NewsItem[] };
+  try {
+    const doc: any = await firestore("/system_config/apify_last_run", { method: "GET" });
+    const f = doc?.fields ?? {};
+    const ts = tsOf(f.tsNum) ?? tsOf(f.ts);
+    const cached: NewsItem[] = [];
+    try {
+      const raw = str(f.items);
+      if (raw) { const arr = JSON.parse(raw); if (Array.isArray(arr)) cached.push(...arr); }
+    } catch { /* corrupt cache: ignore */ }
+    return { lastRun: ts, cached };
+  } catch {
+    return empty; // doc missing (404) — never ran
+  }
+}
+
+async function apifySave(items: NewsItem[]): Promise<void> {
+  try {
+    await firestore("/system_config/apify_last_run", {
+      method: "PATCH",
+      body: { fields: {
+        tsNum: nowNum(),
+        ts: nowTs(),
+        items: { stringValue: JSON.stringify(items).slice(0, 900000) },
+      } },
+    });
+  } catch (e: any) { console.warn("apify cache save failed:", e?.message ?? e); }
+}
+
+async function apifyTikTok(seen: Set<string>): Promise<NewsItem[]> {
+  const token = process.env.APIFY_API_TOKEN;
+  if (!token) return [];
+  const items: NewsItem[] = [];
+  const res = await fetchTimeout(
+    `https://api.apify.com/v2/acts/clockworks~tiktok-scraper/run-sync-get-dataset-items?token=${encodeURIComponent(token)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hashtags: ["AI", "artificialintelligence", "tech"],
+        resultsPerPage: 10, shouldDownloadVideos: false, shouldDownloadCovers: false }) },
+    APIFY_CALL_TIMEOUT
+  );
+  if (!res.ok) throw new Error(`Apify TikTok HTTP ${res.status}`);
+  const arr: any[] = await res.json().catch(() => []);
+  if (!Array.isArray(arr)) throw new Error("Apify TikTok non-array response");
+  for (const v of arr.slice(0, 10)) {
+    const text = (v.text || "").trim(), url = v.webVideoUrl || "";
+    const tl = text.toLowerCase(), key = tl.slice(0, 48);
+    if (!text || !url || seen.has(key) || !socialGate(tl)) continue;
+    seen.add(key);
+    const author = v.authorMeta?.name || v.authorMeta?.nickName || "tiktok";
+    const likes = v.diggCount ?? 0;
+    items.push({ title: text.slice(0, 140), url, source: "TIKTOK",
+      image: faviconFor("https://www.tiktok.com"),
+      description: `@${author} · ${likes.toLocaleString("en-US")} likes — trending on TikTok.` });
+  }
+  return items;
+}
+
+async function apifyX(seen: Set<string>): Promise<NewsItem[]> {
+  const token = process.env.APIFY_API_TOKEN;
+  if (!token) return [];
+  const items: NewsItem[] = [];
+  const res = await fetchTimeout(
+    `https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items?token=${encodeURIComponent(token)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ searchTerms: ["AI deployed", "built an AI agent"],
+        maxItems: 10, tweetLanguage: "en" }) },
+    APIFY_CALL_TIMEOUT
+  );
+  if (!res.ok) throw new Error(`Apify X HTTP ${res.status}`);
+  const arr: any[] = await res.json().catch(() => []);
+  if (!Array.isArray(arr)) throw new Error("Apify X non-array response");
+  for (const t of arr.slice(0, 10)) {
+    const text = (t.text || "").trim(), url = t.url || "";
+    const tl = text.toLowerCase(), key = tl.slice(0, 48);
+    if (!text || !url || seen.has(key) || !socialGate(tl)) continue;
+    seen.add(key);
+    const author = t.author?.userName || "x";
+    const likes = t.likeCount ?? 0;
+    items.push({ title: text.slice(0, 140), url, source: "X",
+      image: faviconFor("https://x.com"),
+      description: `@${author} · ${likes.toLocaleString("en-US")} likes — trending on X.` });
+  }
+  return items;
+}
+
+async function apifySocialNews(seen: Set<string>): Promise<NewsItem[]> {
+  if (!process.env.APIFY_API_TOKEN) return []; // graceful fallback: no token, no calls
+  const { lastRun, cached } = await apifyConfig();
+  const now = Date.now();
+  if (lastRun !== null && now - lastRun < APIFY_RATE_LIMIT_MS) {
+    // Within rate limit — serve cache (deduped against current run)
+    const out: NewsItem[] = [];
+    for (const item of cached) {
+      const key = (item.title || "").toLowerCase().slice(0, 48);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+  // Fresh pull (expensive — at most once per 6h)
+  const items: NewsItem[] = [];
+  try { items.push(...await apifyTikTok(seen)); }
+  catch (e: any) { console.warn("apify tiktok failed:", e?.message ?? e); }
+  try { items.push(...await apifyX(seen)); }
+  catch (e: any) { console.warn("apify x failed:", e?.message ?? e); }
+  if (items.length) await apifySave(items);
+  return items;
+}
+
 async function socialNews(): Promise<NewsItem[]> {
   const seen = new Set<string>();
-  const [gn, hn, lb, yt] = await Promise.all([
-    googleNewsSocial(seen), hackerNews(seen), lobstersNews(seen), youtubeNews(seen)]);
-  return [...gn, ...hn, ...lb, ...yt];
+  const [gn, hn, lb, yt, ap] = await Promise.all([
+    googleNewsSocial(seen), hackerNews(seen), lobstersNews(seen), youtubeNews(seen),
+    apifySocialNews(seen)]);
+  return [...ap, ...gn, ...hn, ...lb, ...yt];
 }
 
 async function buildNews(): Promise<NewsItem[]> {
