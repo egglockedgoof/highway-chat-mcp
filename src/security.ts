@@ -846,8 +846,8 @@ export function createResolveAuth(deps: AuthDeps): (req: AuthRequest, urlPath: s
     // Post-sunset / disabled-legacy: identical 404 decoy (no oracle)
     if (!deps.config.legacyEnabled || deps.isSunset()) { deps.count('rejected'); return { kind: 'decoy' }; }
     if (!constantTimeEqual(pathSecret, deps.config.legacySecret)) { deps.count('rejected'); return { kind: 'decoy' }; }
-    // Telemetry is fire-and-forget — auth must not depend on it (fix Oct 9 2026).
-    deps.recordLegacySignal('path_legacy').catch(() => {});
+    // Legacy authenticated — durability precedes acknowledgment (lesson #30).
+    await deps.recordLegacySignal('path_legacy');
     deps.count('legacy_auth');
     return { kind: 'ctx', ctx: { bot: null, method: 'path_legacy' } };
   };
