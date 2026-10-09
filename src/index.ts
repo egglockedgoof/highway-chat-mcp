@@ -18,6 +18,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
+import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx,
 } from './security.js';
@@ -33,8 +35,12 @@ for (const k of REQUIRED_ENV) {
 const API_KEY = process.env.FIREBASE_API_KEY as string;
 const MCP_SECRET = process.env.MCP_SECRET as string;
 
-// Phase 3 Section B: Firebase Storage for attachments
-const STORAGE_BUCKET = "highway-chat.firebasestorage.app";
+// Phase 3 Section B: attachment size limits (validated for client-supplied refs
+// and bridge-side uploads alike).
+// NOTE (lesson #40): Firebase Storage is NOT provisioned — Blaze takes $30
+// upfront even for the "free" tier, so the project stays on Spark. Binary
+// storage is Cloudinary (free tier, no card, secret stays server-side).
+// Long messages post in full as the message text (zero cost, no truncation).
 const ATTACHMENT_LIMITS: Record<string, number> = {
   "image/jpeg": 5 * 1024 * 1024,
   "image/png": 5 * 1024 * 1024,
@@ -46,6 +52,13 @@ const ATTACHMENT_LIMITS: Record<string, number> = {
   "audio/mpeg": 10 * 1024 * 1024,
   "audio/wav": 10 * 1024 * 1024,
   "audio/ogg": 10 * 1024 * 1024,
+  "audio/webm": 10 * 1024 * 1024,
+  "audio/mp4": 10 * 1024 * 1024,
+  "video/mp4": 10 * 1024 * 1024,
+  "video/webm": 10 * 1024 * 1024,
+  "video/quicktime": 10 * 1024 * 1024,
+  "application/msword": 10 * 1024 * 1024,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 10 * 1024 * 1024,
 };
 
 const BASE =
@@ -355,38 +368,9 @@ function buildMessageFields(name: string, text: string, opts?: { reply_to?: stri
   return { fields };
 }
 
-// ---- Infinite text: long messages become text file attachments ----
-// Firestore rules cap text at 1000 chars. Messages exceeding that are split:
-// - text field: preview (first 200 chars + marker)
-// - full content: uploaded by client to Storage as .txt, passed as attachment
-// This keeps Firestore docs tiny while allowing unlimited message length.
-const TEXT_PREVIEW_LIMIT = 200;
-const TEXT_INLINE_LIMIT = 1000;
-
-function splitLongText(text: string): { preview: string; needsAttachment: boolean } {
-  if (text.length <= TEXT_INLINE_LIMIT) {
-    return { preview: text, needsAttachment: false };
-  }
-  const preview = text.slice(0, TEXT_PREVIEW_LIMIT).trimEnd() + "\n\n[📄 full text attached — tap to expand]";
-  return { preview, needsAttachment: true };
-}
-
-function makeTextAttachment(fullText: string, senderName: string): Record<string, unknown> {
-  const id = `txt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const filename = `message_${id}.txt`;
-  const sizeBytes = Buffer.byteLength(fullText, 'utf8');
-  return {
-    id,
-    filename,
-    mime_type: "text/plain",
-    size_bytes: sizeBytes,
-    storage_path: `attachments/text/${id}.txt`,
-    download_url: "", // client fills after Storage upload
-    is_image: false,
-    _pendingUpload: true, // signals client to upload fullText to storage_path
-    _fullText: fullText,  // carried through for client-side upload
-  };
-}
+// ---- Long messages post in full: no preview split, no truncation, no
+// attachment machinery (sin's directive 2026-10-09). Bounds live in
+// src/message-limits.ts (pure module, tested).
 
 // Dispatch Lock: check if a message is locked to a specific agent
 async function checkDispatchLock(replyToId: string, senderName: string): Promise<{ allowed: boolean; reason?: string }> {
@@ -762,15 +746,24 @@ function buildServer(): McpServer {
     is_image: z.boolean().optional().default(false),
   });
 
+  // Input variant: storage_path/download_url optional when data_base64 is
+  // supplied — the bridge uploads to Cloudinary first and fills them in.
+  const attachmentInputSchema = attachmentSchema.extend({
+    storage_path: z.string().trim().min(1).max(500).optional(),
+    download_url: z.string().url().max(2000).optional(),
+    data_base64: z.string().min(1).max(14_000_000).optional()
+      .describe("Inline file content (base64, ~10MB max). When present the bridge uploads to Cloudinary and returns the CDN URL as download_url."),
+  });
+
   tool(server, "send_message",
     { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
       inputSchema: {
         name: nameSchema,
-        text: z.string().trim().min(1).max(100000).describe("Message text. Over 1000 chars auto-splits: preview in text field, full content as text attachment."),
+        text: messageTextSchema().describe(`Message text, posted in full (up to ${MESSAGE_MAX_CHARS.toLocaleString("en-US")} chars; long messages display collapsed with tap-to-expand).`),
         channel: channelSchema,
         reply_to: z.string().trim().min(1).optional().describe("Doc ID of the message being replied to (for threading + dispatch lock)"),
         idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
-        attachments: z.array(attachmentSchema).max(5).optional().describe("File attachments (uploaded to Storage by client, validated here)"),
+        attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
       } },
     async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
       // Phase 3 Section D: Dispatch lock enforcement
@@ -784,29 +777,38 @@ function buildServer(): McpServer {
           }
         }
       }
-      // Phase 3 Section B: Validate attachments
+      // Phase 3 Section B: attachments — inline data uploads to Cloudinary
+      // first (secret stays server-side); metadata refs are validated as-is.
+      const finalAttachments: AttachmentMeta[] = [];
       if (attachments) {
         for (const att of attachments) {
-          validateAttachment(att, name);
+          if (att.data_base64) {
+            finalAttachments.push(await uploadAttachmentData({
+              filename: att.filename, mime_type: att.mime_type,
+              data_base64: att.data_base64, uploadedBy: name,
+            }));
+          } else {
+            if (!att.storage_path || !att.download_url) {
+              throw new UserError("Attachment needs storage_path + download_url, or data_base64 for bridge-side upload");
+            }
+            validateAttachment({ mime_type: att.mime_type, size_bytes: att.size_bytes, storage_path: att.storage_path }, name);
+            finalAttachments.push({
+              id: att.id, filename: att.filename, mime_type: att.mime_type,
+              size_bytes: att.size_bytes, storage_path: att.storage_path,
+              download_url: att.download_url, is_image: att.is_image ?? false,
+              uploaded_by: name,
+            });
+          }
         }
       }
-      // Infinite text: split long messages into preview + text file attachment
-      const { preview, needsAttachment } = splitLongText(text);
-      const effectiveAttachments = [...(attachments || [])];
-      let pendingTextUpload: string | null = null;
-      if (needsAttachment) {
-        const txtAtt = makeTextAttachment(text, name) as any;
-        pendingTextUpload = txtAtt._fullText;
-        delete txtAtt._fullText;
-        // Validate size against text/plain limit
-        validateAttachment({ ...txtAtt, download_url: "https://placeholder.local/pending" } as any, name);
-        delete (txtAtt as any)._pendingUpload;
-        effectiveAttachments.push(txtAtt);
-      }
-      const body = buildMessageFields(name, preview, { reply_to, idempotency_key });
-      if (effectiveAttachments && effectiveAttachments.length > 0) {
+      // Long messages: the FULL text posts as the message — no preview split,
+      // no truncation, no attachment machinery (sin's directive 2026-10-09).
+      // The schema cap (100k chars, ~400KB worst case) sits well under
+      // Firestore's 1 MiB doc limit. Zero cost, zero services.
+      const body = buildMessageFields(name, text, { reply_to, idempotency_key });
+      if (finalAttachments.length > 0) {
         (body.fields as Record<string, unknown>).attachments = {
-          arrayValue: { values: effectiveAttachments.map(att => ({
+          arrayValue: { values: finalAttachments.map(att => ({
             mapValue: { fields: {
               id: { stringValue: att.id },
               filename: { stringValue: att.filename },
@@ -815,7 +817,7 @@ function buildServer(): McpServer {
               storage_path: { stringValue: att.storage_path },
               download_url: { stringValue: att.download_url },
               is_image: { booleanValue: att.is_image || false },
-              uploaded_by: { stringValue: name },
+              uploaded_by: { stringValue: att.uploaded_by },
               uploaded_at: nowTs(),
             } }
           })) }
@@ -826,7 +828,7 @@ function buildServer(): McpServer {
         body,
         forName: name,
       });
-      return { ok: true, name, ts: Date.now() };
+      return { ok: true, name, ts: Date.now(), chars: text.length };
     });
 
   tool(server, "send_voice",
@@ -845,28 +847,6 @@ function buildServer(): McpServer {
       return { ok: true, name, ts: Date.now() };
     });
 
-  // Phase 3 Section B: Attachment metadata validation
-  // Frontend uploads directly to Firebase Storage; bridge validates refs.
-
-
-  function validateAttachment(att: z.infer<typeof attachmentSchema>, uploaderName: string): void {
-    // Check MIME against allowlist
-    const limit = ATTACHMENT_LIMITS[att.mime_type];
-    if (!limit) {
-      throw new UserError(`MIME type not allowed: ${att.mime_type}`);
-    }
-    if (att.size_bytes > limit) {
-      throw new UserError(`File too large: ${att.size_bytes} > ${limit} for ${att.mime_type}`);
-    }
-    // Block dangerous types
-    if (att.mime_type.includes("html") || att.mime_type.includes("javascript") || att.mime_type.includes("executable")) {
-      throw new UserError(`File type blocked for security: ${att.mime_type}`);
-    }
-    // Storage path must be in attachments/ directory (prevent path traversal)
-    if (!att.storage_path.startsWith("attachments/") || att.storage_path.includes("..")) {
-      throw new UserError("Invalid storage path");
-    }
-  }
 
   tool(server, "route_task",
     { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it.",
@@ -2038,18 +2018,139 @@ async function pineconeIndex(): Promise<{ host: string; dimension: number }> {
   return _pcHost;
 }
 
+// Phase 3 Section B: Attachment metadata validation
+// Binary uploads go to Cloudinary via uploadAttachmentData (used by
+// POST /upload for the widget and by send_message for inline data_base64).
+// Metadata-only refs are validated here.
+
+
+function validateAttachment(att: { mime_type: string; size_bytes: number; storage_path: string }, uploaderName: string): void {
+  // Check MIME against allowlist
+  const limit = ATTACHMENT_LIMITS[att.mime_type];
+  if (!limit) {
+    throw new UserError(`MIME type not allowed: ${att.mime_type}`);
+  }
+  if (att.size_bytes > limit) {
+    throw new UserError(`File too large: ${att.size_bytes} > ${limit} for ${att.mime_type}`);
+  }
+  // Block dangerous types
+  if (att.mime_type.includes("html") || att.mime_type.includes("javascript") || att.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${att.mime_type}`);
+  }
+  // Storage path must be in attachments/ directory (prevent path traversal)
+  if (!att.storage_path.startsWith("attachments/") || att.storage_path.includes("..")) {
+    throw new UserError("Invalid storage path");
+  }
+}
+
+/**
+ * Verify an end-user Firebase ID token (widget clients). Returns the
+ * Firebase user or null. Used by POST /upload — the widget is a
+ * Firebase-authenticated client, not an MCP bot.
+ */
+async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string; email?: string } | null> {
+  try {
+    const r = await http(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) },
+      EXT_TIMEOUT);
+    if (!r.ok) return null;
+    const u = parseJson(r.body)?.users?.[0];
+    return u?.localId ? { localId: u.localId, email: u.email } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Shared shape for attachment metadata stored in Firestore docs. */
+interface AttachmentMeta {
+  id: string; filename: string; mime_type: string; size_bytes: number;
+  storage_path: string; download_url: string; is_image: boolean; uploaded_by: string;
+}
+
+/**
+ * Validate inline file data and upload it to Cloudinary. Returns the
+ * attachment metadata to store in the Firestore doc. The API secret
+ * never leaves the server — only the public secure_url is returned.
+ */
+async function uploadAttachmentData(input: {
+  filename: string; mime_type: string; data_base64: string; uploadedBy: string;
+}): Promise<AttachmentMeta> {
+  const filename = (input.filename || "").trim();
+  if (!filename || filename.length > 255) throw new UserError("Invalid filename");
+  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+    throw new UserError("Invalid filename");
+  }
+  const limit = ATTACHMENT_LIMITS[input.mime_type];
+  if (!limit) throw new UserError(`MIME type not allowed: ${input.mime_type}`);
+  if (input.mime_type.includes("html") || input.mime_type.includes("javascript") || input.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${input.mime_type}`);
+  }
+  let bytes: number;
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(input.data_base64, "base64");
+    bytes = buf.length;
+  } catch {
+    throw new UserError("Invalid base64 data");
+  }
+  if (bytes < 1) throw new UserError("Empty file");
+  if (bytes > limit) throw new UserError(`File too large: ${bytes} > ${limit} for ${input.mime_type}`);
+  if (!cloudinaryConfigured()) throw new UserError("Uploads unavailable: storage not configured");
+  const up = await uploadToCloudinary({
+    dataUri: `data:${input.mime_type};base64,${input.data_base64}`,
+    filename, mimeType: input.mime_type,
+  });
+  const id = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id, filename, mime_type: input.mime_type, size_bytes: up.bytes || bytes,
+    storage_path: `attachments/cloudinary/${up.public_id}`,
+    download_url: up.secure_url,
+    is_image: input.mime_type.toLowerCase().startsWith("image/"),
+    uploaded_by: input.uploadedBy,
+  };
+}
+
 // ============ EXPRESS ============
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
+
+// POST /upload — widget file uploads via the bridge (secret stays server-side).
+// Auth: Firebase ID token (the widget is a Firebase-authenticated client).
+// Registered BEFORE the global 2mb JSON parser so uploads get their own limit.
+// NOTE: this route is intentionally outside sec.resolveAuth — it uses the
+// end-user's Firebase identity, not the bot MCP secret.
+app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: Response) => {
+  try {
+    const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
+    if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
+    const who = await verifyFirebaseIdToken(m[1]);
+    if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
+    const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
+    const att = await uploadAttachmentData({
+      filename: typeof filename === "string" ? filename : "",
+      mime_type: typeof mime_type === "string" ? mime_type : "",
+      data_base64: typeof data_base64 === "string" ? data_base64 : "",
+      uploadedBy: who.email || who.localId,
+    });
+    res.json({ ok: true, ...att });
+  } catch (e) {
+    const msg = errMsg(e);
+    const status = e instanceof UserError ? 400 : 500;
+    res.status(status).json({ ok: false, error: msg });
+  }
+});
+
+app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
+
 app.get("/health", (_req, res) => { res.json({ ok: true }); });
 
 app.get("/news", async (_req, res) => {
