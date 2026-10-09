@@ -13,6 +13,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 import { lookup } from "node:dns/promises";
+import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -95,8 +96,14 @@ type Doc = { name: string; fields?: Fields; createTime?: string; updateTime?: st
 // ============ ERRORS ============
 /** Expected, caller-fixable failure (bad input, not found, not the author). Never written to telemetry. */
 class UserError extends Error {}
-class FirestoreError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) { super(message); }
+export class FirestoreError extends Error {
+  readonly status: number;
+  readonly code: string;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
 }
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -372,38 +379,155 @@ function buildMessageFields(name: string, text: string, opts?: { reply_to?: stri
 // attachment machinery (sin's directive 2026-10-09). Bounds live in
 // src/message-limits.ts (pure module, tested).
 
-// Dispatch Lock: check if a message is locked to a specific agent
-async function checkDispatchLock(replyToId: string, senderName: string): Promise<{ allowed: boolean; reason?: string }> {
-  if (!replyToId) return { allowed: true };
+// Dispatch Lock check — ADVISORY until header-bound credentials exist (hollow #36).
+// `assertedName` is the caller-supplied `name` field: any bridge caller can assert any
+// name, so this check is best-effort convention enforcement, NOT authentication.
+// A pass here must never be treated as proof of identity. Every result carries
+// `advisory: true` so a future binding upgrade must flip the flag deliberately
+// (regression tripwire: silently upgrading advisory→binding breaks the tests).
+//
+// Fail-CLOSED on lock-read error (hollow #37): any read failure (quota exhaustion,
+// network, permissions) is treated as locked/retryable — never as unlocked. Quota
+// exhaustion must not silently de-arm the gate.
+export type LockCheck = { allowed: boolean; reason?: string; retryable?: boolean; routedTo?: string; advisory: true };
+
+export async function checkDispatchLock(
+  replyToId: string,
+  assertedName: string,
+  getLock: (collection: string, docId: string) => Promise<Doc | null> = (c, d) => getDocOrNull(c, d),
+): Promise<LockCheck> {
+  if (!replyToId) return { allowed: true, advisory: true };
+  let lock: Doc | null;
   try {
-    const lock = await getDocOrNull("dispatch_locks", replyToId);
-    if (!lock) return { allowed: true }; // no lock = open
-
-    const fields = (lock as any).fields || {};
-    const routedTo = fields.routed_to?.stringValue;
-    const broadcast = fields.broadcast?.booleanValue;
-    const expiresAt = fields.expires_at?.timestampValue;
-
-    // Broadcast = everyone can reply
-    if (broadcast) return { allowed: true };
-
-    // Expired lock = open
-    if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true };
-
-    // Room lead (whisper) can always triage
-    if (senderName.toLowerCase() === "whisper") return { allowed: true };
-
-    // Structured disagreement bypasses lock
-    // (checked by caller via text prefix — this is just the lock check)
-
-    // Only the routed agent can reply
-    if (routedTo && senderName.toLowerCase() !== routedTo.toLowerCase()) {
-      return { allowed: false, reason: `Message is dispatch-locked to ${routedTo}` };
-    }
-
-    return { allowed: true };
+    lock = await getLock("dispatch_locks", replyToId);
   } catch {
-    return { allowed: true }; // fail open on lock read error (don't block chat)
+    // Fail closed: an unreadable lock is a locked lock. Surface `retryable` and let
+    // the sender retry; never degrade to unlocked.
+    return {
+      allowed: false,
+      reason: "dispatch lock unreadable — failing closed, retry shortly",
+      retryable: true,
+      advisory: true,
+    };
+  }
+  if (!lock) return { allowed: true, advisory: true }; // no lock = open
+
+  const fields = (lock as any).fields || {};
+  const routedTo = fields.routed_to?.stringValue;
+  const broadcast = fields.broadcast?.booleanValue;
+  const expiresAt = fields.expires_at?.timestampValue;
+  // Lowercased routed agent — drives the claim decision in send_message
+  // (only the routed agent marks the lock claimed, per spec §2).
+  const routedNorm = routedTo ? String(routedTo).toLowerCase() : undefined;
+
+  // Broadcast = everyone can reply
+  if (broadcast) return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Expired lock = open
+  if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Room lead (whisper) can always triage — advisory: asserted, not verified
+  if (assertedName.toLowerCase() === "whisper") return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Structured disagreement bypasses lock
+  // (checked by caller via text prefix — this is just the lock check)
+
+  // Only the routed agent can reply — advisory: `assertedName` is self-asserted
+  if (routedTo && assertedName.toLowerCase() !== routedNorm) {
+    return {
+      allowed: false,
+      reason: `Message is dispatch-locked to ${routedTo} (advisory — name is caller-asserted)`,
+      routedTo: routedNorm,
+      advisory: true,
+    };
+  }
+
+  return { allowed: true, routedTo: routedNorm, advisory: true };
+}
+
+// ---- IDEMPOTENCY (hollow #35) ----
+// The idempotency key drives a DETERMINISTIC document id; the write is a
+// check-before-write: GET the idem doc, then PATCH with an exists:false precondition
+// (atomic create-only). Losing the race (contention on the PATCH) means the other
+// writer won → report duplicate, not error. Storing the key without this check
+// would be decoration, not dedup.
+
+/** Deterministic doc id for an idempotency key, scoped per channel. */
+export function idemDocId(channel: string, key: string): string {
+  const h = createHash("sha256").update(`highway/idem/v1/${channel}/${key}`).digest("hex").slice(0, 32);
+  return `idem_${h}`;
+}
+
+/** A write that lost its create-only race: someone else created the doc first. */
+export function isWriteContention(e: unknown): boolean {
+  return e instanceof FirestoreError &&
+    (e.code === "FAILED_PRECONDITION" || e.code === "ALREADY_EXISTS" || e.status === 409 || e.status === 412);
+}
+
+export interface IdemIo {
+  getDoc: (collection: string, docId: string, forName?: string) => Promise<Doc | null>;
+  createDoc: (collection: string, docId: string, body: { fields: Record<string, unknown> }, forName?: string) => Promise<void>;
+}
+
+/** Write-once keyed document. Returns duplicate:true when the key was seen before. */
+export async function writeIdempotent(
+  collection: string,
+  docId: string,
+  body: { fields: Record<string, unknown> },
+  forName: string | undefined,
+  io: IdemIo,
+): Promise<{ duplicate: boolean; id: string }> {
+  const existing = await io.getDoc(collection, docId, forName);
+  if (existing?.fields) return { duplicate: true, id: docId };
+  try {
+    await io.createDoc(collection, docId, body, forName);
+  } catch (e) {
+    if (isWriteContention(e)) return { duplicate: true, id: docId }; // lost the race — the other write won
+    throw e;
+  }
+  return { duplicate: false, id: docId };
+}
+
+// Real Firestore io for the idempotent send path (tests inject fakes).
+const idemIo: IdemIo = {
+  getDoc: (c, d, n) => getDocOrNull(c, d, n),
+  createDoc: (c, d, body, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body, forName: n,
+      updateMask: Object.keys(body.fields), precondition: { exists: false },
+    }),
+};
+
+// ---- LOCK CLAIM (hollow re-review #38: "nothing writes dispatch_locks — lock inert") ----
+// The writer lives in the listener (highway-push/dispatch-lock-writer.js, writes the
+// lock on routing). This is the other half: when the routed agent's reply lands,
+// the bridge marks the lock claimed (spec §2 ledger). Ledger only — never blocks
+// the send, never throws, never creates a lock doc from a claim (exists:true).
+
+export interface LockClaimIo {
+  patch: (collection: string, docId: string, fields: Record<string, unknown>, forName?: string) => Promise<void>;
+}
+
+const lockClaimIo: LockClaimIo = {
+  patch: (c, d, fields, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body: { fields }, forName: n,
+      updateMask: Object.keys(fields), precondition: { exists: true },
+    }),
+};
+
+/** Mark a dispatch lock claimed. Returns false when there is nothing to claim
+ *  (no lock doc) or the write failed — the reply already landed either way. */
+export async function markLockClaimed(
+  replyToId: string,
+  forName?: string,
+  io: LockClaimIo = lockClaimIo,
+): Promise<boolean> {
+  try {
+    await io.patch("dispatch_locks", replyToId, { claimed: { booleanValue: true } }, forName);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -767,16 +891,24 @@ function buildServer(): McpServer {
       } },
     async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
       // Phase 3 Section D: Dispatch lock enforcement
+      let lockCheck: LockCheck | null = null;
       if (reply_to) {
         // Structured disagreement bypasses the lock
         const isDisagreement = /^(DISAGREE|CHALLENGE)\s*:/i.test(text.trim());
         if (!isDisagreement) {
-          const lockCheck = await checkDispatchLock(reply_to, name);
+          lockCheck = await checkDispatchLock(reply_to, name);
           if (!lockCheck.allowed) {
             throw new UserError(lockCheck.reason || "Message is dispatch-locked");
           }
         }
       }
+      // Spec §2 ledger: once the reply lands, the routed agent claims its lock.
+      // Non-fatal — a failed claim must never fail the send.
+      const claimLock = async () => {
+        if (reply_to && lockCheck?.routedTo && name.toLowerCase() === lockCheck.routedTo) {
+          await markLockClaimed(reply_to, name);
+        }
+      };
       // Phase 3 Section B: attachments — inline data uploads to Cloudinary
       // first (secret stays server-side); metadata refs are validated as-is.
       const finalAttachments: AttachmentMeta[] = [];
@@ -823,11 +955,20 @@ function buildServer(): McpServer {
           })) }
         };
       }
+      if (idempotency_key) {
+        // Deterministic id + check-before-write (hollow #35): same key twice = one message.
+        const coll = channelCollection(channel);
+        const docId = idemDocId(channel, idempotency_key);
+        const res = await writeIdempotent(coll, docId, body, name, idemIo);
+        await claimLock();
+        return { ok: true, duplicate: res.duplicate, id: res.id, name, ts: Date.now() };
+      }
       await firestore(`/${channelCollection(channel)}`, {
         method: "POST",
         body,
         forName: name,
       });
+      await claimLock();
       return { ok: true, name, ts: Date.now(), chars: text.length };
     });
 
@@ -2206,6 +2347,10 @@ app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
 process.on("unhandledRejection", (reason) => recordFailure("unhandledRejection", reason));
 process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); setTimeout(() => process.exit(1), 1500).unref(); });
 
+// Testability: the test suite imports this module for its pure helpers
+// (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
+// PHASE3_TEST is set so imports don't bind a port or arm timers.
+if (!process.env.PHASE3_TEST) {
 const port = Number(process.env.PORT) || 3000;
 const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
 
@@ -2217,3 +2362,4 @@ process.on("SIGTERM", () => {
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10000).unref();
 });
+}

@@ -18,7 +18,9 @@
 //   #23 no query strings in paths — rejected before anything else.
 //   #26 malformed timestamps → invalid, rejected.
 //   #29 doc/implementation parity — this file IS the implementation the doc describes.
-//   #30 durability precedes acknowledgment — blocking legacy write-through.
+//   #30 durability precedes acknowledgment — bound write-through INSIDE the signal
+//            recorder, off the auth path (reconciled with hollow #34: the auth path never
+//            awaits telemetry; pending signals fail readiness closed per #31).
 //   #31 pending write-through tracked — readiness fail-closed while pending.
 //   #32 global precondition validation — before any branch, for every caller.
 
@@ -335,8 +337,8 @@ export class FirestoreError extends UserError {
   }
 }
 
-// Thrown when a readiness-critical write-through cannot be made durable.
-// The request is REJECTED with 503 — never acknowledged without persistence (lesson #30).
+// Kept for API stability (route maps it to 503); nothing in the current auth path
+// throws it — the legacy signal recorder uses bound write-through instead (#34).
 export class WriteThroughFailed extends UserError {
   constructor() {
     super('write_through_failed', 503, 'telemetry write-through failed; retry the request');
@@ -677,12 +679,18 @@ export function createTelemetry(opts: TelemetryOpts): Telemetry {
     return run;
   }
 
-  // BLOCKING legacy write-through — the request is not acknowledged until the
-  // signal is durable. Persistent failure → 503 (lesson #30).
-  async function recordLegacySignal(method: 'header_legacy' | 'path_legacy'): Promise<void> {
+  // BOUND legacy write-through — fire-and-forget from the auth path (hollow #34).
+  // Lesson #30 durability lives INSIDE the recorder, off the auth path: the signal
+  // is marked pending, written with retries, and marked durable only on success.
+  // A failed write stays pending for the batch flush to reconcile; readiness fails
+  // closed while any entry is pending (lesson #31). Never throws — telemetry must
+  // not be able to 503 the auth path.
+  function recordLegacySignal(method: 'header_legacy' | 'path_legacy'): Promise<void> {
     const fieldPath = `lastSeen.${method}`;
     const ts = now();
-    await runAsSystem('flushSecurityTelemetry', async () => {
+    const trackKey = `legacy:${method}`;
+    tracker.markPending(trackKey, ts);
+    return runAsSystem('flushSecurityTelemetry', async () => {
       for (let attempt = 0; attempt < 3; attempt++) {
         const doc = await refreshDocState().catch(() => null);
         const effectiveTs = maxTs(doc?.lastSeen?.[method], ts) ?? ts;
@@ -697,16 +705,17 @@ export function createTelemetry(opts: TelemetryOpts): Telemetry {
           docExists = true;
           const m = maxTs(delta.lastSeen[method], effectiveTs);
           if (m) delta.lastSeen[method] = m; // belt-and-suspenders: delta agrees with durable
+          tracker.markDurable(trackKey);
           return;
         } catch (e) {
           if (e instanceof FirestoreError && (e.grpcCode === 'FAILED_PRECONDITION' || e.grpcCode === 'ALREADY_EXISTS')) {
             continue; // contention: re-read, max-merge, retry
           }
-          break; // other failures fail fast
+          break; // other failures fail fast — entry stays pending for flush
         }
       }
       recordCount('write_through_failed');
-      throw new WriteThroughFailed();
+      // No throw: the batch flush reconciles pending entries (lesson #31).
     });
   }
 
@@ -819,9 +828,11 @@ export interface AuthDeps {
   recordLegacySignal: (method: 'header_legacy' | 'path_legacy') => Promise<void>;
 }
 
-// resolveAuth implements the §1b/§1c decision table. On legacy success it performs the
-// BLOCKING write-through BEFORE returning the ctx — the request is not acknowledged
-// until the signal is durable. WriteThroughFailed propagates (route maps it to 503).
+// resolveAuth implements the §1b/§1c decision table. Legacy signals are recorded
+// fire-and-forget — telemetry stays OFF the auth path (hollow #34). The request is
+// acknowledged as soon as the secret validates; durability is the recorder's own
+// bound write-through, tracked for readiness (lessons #30 inside the recorder,
+// #31 fail-closed while pending).
 export function createResolveAuth(deps: AuthDeps): (req: AuthRequest, urlPath: string) => Promise<AuthResolution> {
   return async function resolveAuth(req: AuthRequest, urlPath: string): Promise<AuthResolution> {
     const parsed = parseBearer(req);
