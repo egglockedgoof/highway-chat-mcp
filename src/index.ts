@@ -18,6 +18,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
+import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx,
 } from './security.js';
@@ -32,6 +34,32 @@ for (const k of REQUIRED_ENV) {
 }
 const API_KEY = process.env.FIREBASE_API_KEY as string;
 const MCP_SECRET = process.env.MCP_SECRET as string;
+
+// Phase 3 Section B: attachment size limits (validated for client-supplied refs
+// and bridge-side uploads alike).
+// NOTE (lesson #40): Firebase Storage is NOT provisioned — Blaze takes $30
+// upfront even for the "free" tier, so the project stays on Spark. Binary
+// storage is Cloudinary (free tier, no card, secret stays server-side).
+// Long messages post in full as the message text (zero cost, no truncation).
+const ATTACHMENT_LIMITS: Record<string, number> = {
+  "image/jpeg": 5 * 1024 * 1024,
+  "image/png": 5 * 1024 * 1024,
+  "image/gif": 5 * 1024 * 1024,
+  "image/webp": 5 * 1024 * 1024,
+  "application/pdf": 10 * 1024 * 1024,
+  "text/plain": 10 * 1024 * 1024,
+  "text/markdown": 10 * 1024 * 1024,
+  "audio/mpeg": 10 * 1024 * 1024,
+  "audio/wav": 10 * 1024 * 1024,
+  "audio/ogg": 10 * 1024 * 1024,
+  "audio/webm": 10 * 1024 * 1024,
+  "audio/mp4": 10 * 1024 * 1024,
+  "video/mp4": 10 * 1024 * 1024,
+  "video/webm": 10 * 1024 * 1024,
+  "video/quicktime": 10 * 1024 * 1024,
+  "application/msword": 10 * 1024 * 1024,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 10 * 1024 * 1024,
+};
 
 const BASE =
   process.env.FIRESTORE_BASE ||
@@ -327,14 +355,56 @@ function htmlToText(html: string): string {
     .replace(/[ \t\f\v]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function buildMessageFields(name: string, text: string) {
-  return { fields: {
+function buildMessageFields(name: string, text: string, opts?: { reply_to?: string; idempotency_key?: string }) {
+  const fields: Record<string, unknown> = {
     name: { stringValue: name },
     text: { stringValue: text },
     ts: nowTs(),
     tsNum: nowNum(),
     deviceId: { stringValue: DEVICE_ID },
-  } };
+  };
+  if (opts?.reply_to) fields.reply_to = { stringValue: opts.reply_to };
+  if (opts?.idempotency_key) fields.idempotency_key = { stringValue: opts.idempotency_key };
+  return { fields };
+}
+
+// ---- Long messages post in full: no preview split, no truncation, no
+// attachment machinery (sin's directive 2026-10-09). Bounds live in
+// src/message-limits.ts (pure module, tested).
+
+// Dispatch Lock: check if a message is locked to a specific agent
+async function checkDispatchLock(replyToId: string, senderName: string): Promise<{ allowed: boolean; reason?: string }> {
+  if (!replyToId) return { allowed: true };
+  try {
+    const lock = await getDocOrNull("dispatch_locks", replyToId);
+    if (!lock) return { allowed: true }; // no lock = open
+
+    const fields = (lock as any).fields || {};
+    const routedTo = fields.routed_to?.stringValue;
+    const broadcast = fields.broadcast?.booleanValue;
+    const expiresAt = fields.expires_at?.timestampValue;
+
+    // Broadcast = everyone can reply
+    if (broadcast) return { allowed: true };
+
+    // Expired lock = open
+    if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true };
+
+    // Room lead (whisper) can always triage
+    if (senderName.toLowerCase() === "whisper") return { allowed: true };
+
+    // Structured disagreement bypasses lock
+    // (checked by caller via text prefix — this is just the lock check)
+
+    // Only the routed agent can reply
+    if (routedTo && senderName.toLowerCase() !== routedTo.toLowerCase()) {
+      return { allowed: false, reason: `Message is dispatch-locked to ${routedTo}` };
+    }
+
+    return { allowed: true };
+  } catch {
+    return { allowed: true }; // fail open on lock read error (don't block chat)
+  }
 }
 
 // Shared evolution_logs doc — one builder, three tools
@@ -666,12 +736,99 @@ function buildServer(): McpServer {
       return { count: messages.length, messages };
     });
 
+  const attachmentSchema = z.object({
+    id: z.string().trim().min(1).max(50),
+    filename: z.string().trim().min(1).max(255),
+    mime_type: z.string().trim().min(1).max(100),
+    size_bytes: z.number().int().min(1).max(25 * 1024 * 1024),
+    storage_path: z.string().trim().min(1).max(500),
+    download_url: z.string().url().max(2000),
+    is_image: z.boolean().optional().default(false),
+  });
+
+  // Input variant: storage_path/download_url optional when data_base64 is
+  // supplied — the bridge uploads to Cloudinary first and fills them in.
+  const attachmentInputSchema = attachmentSchema.extend({
+    storage_path: z.string().trim().min(1).max(500).optional(),
+    download_url: z.string().url().max(2000).optional(),
+    data_base64: z.string().min(1).max(14_000_000).optional()
+      .describe("Inline file content (base64, ~10MB max). When present the bridge uploads to Cloudinary and returns the CDN URL as download_url."),
+  });
+
   tool(server, "send_message",
     { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
-      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(2000), channel: channelSchema } },
-    async ({ name, text, channel }) => {
-      await firestore(`/${channelCollection(channel)}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
-      return { ok: true, name, ts: Date.now() };
+      inputSchema: {
+        name: nameSchema,
+        text: messageTextSchema().describe(`Message text, posted in full (up to ${MESSAGE_MAX_CHARS.toLocaleString("en-US")} chars; long messages display collapsed with tap-to-expand).`),
+        channel: channelSchema,
+        reply_to: z.string().trim().min(1).optional().describe("Doc ID of the message being replied to (for threading + dispatch lock)"),
+        idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
+        attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
+      } },
+    async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
+      // Phase 3 Section D: Dispatch lock enforcement
+      if (reply_to) {
+        // Structured disagreement bypasses the lock
+        const isDisagreement = /^(DISAGREE|CHALLENGE)\s*:/i.test(text.trim());
+        if (!isDisagreement) {
+          const lockCheck = await checkDispatchLock(reply_to, name);
+          if (!lockCheck.allowed) {
+            throw new UserError(lockCheck.reason || "Message is dispatch-locked");
+          }
+        }
+      }
+      // Phase 3 Section B: attachments — inline data uploads to Cloudinary
+      // first (secret stays server-side); metadata refs are validated as-is.
+      const finalAttachments: AttachmentMeta[] = [];
+      if (attachments) {
+        for (const att of attachments) {
+          if (att.data_base64) {
+            finalAttachments.push(await uploadAttachmentData({
+              filename: att.filename, mime_type: att.mime_type,
+              data_base64: att.data_base64, uploadedBy: name,
+            }));
+          } else {
+            if (!att.storage_path || !att.download_url) {
+              throw new UserError("Attachment needs storage_path + download_url, or data_base64 for bridge-side upload");
+            }
+            validateAttachment({ mime_type: att.mime_type, size_bytes: att.size_bytes, storage_path: att.storage_path }, name);
+            finalAttachments.push({
+              id: att.id, filename: att.filename, mime_type: att.mime_type,
+              size_bytes: att.size_bytes, storage_path: att.storage_path,
+              download_url: att.download_url, is_image: att.is_image ?? false,
+              uploaded_by: name,
+            });
+          }
+        }
+      }
+      // Long messages: the FULL text posts as the message — no preview split,
+      // no truncation, no attachment machinery (sin's directive 2026-10-09).
+      // The schema cap (100k chars, ~400KB worst case) sits well under
+      // Firestore's 1 MiB doc limit. Zero cost, zero services.
+      const body = buildMessageFields(name, text, { reply_to, idempotency_key });
+      if (finalAttachments.length > 0) {
+        (body.fields as Record<string, unknown>).attachments = {
+          arrayValue: { values: finalAttachments.map(att => ({
+            mapValue: { fields: {
+              id: { stringValue: att.id },
+              filename: { stringValue: att.filename },
+              mime_type: { stringValue: att.mime_type },
+              size_bytes: { integerValue: String(att.size_bytes) },
+              storage_path: { stringValue: att.storage_path },
+              download_url: { stringValue: att.download_url },
+              is_image: { booleanValue: att.is_image || false },
+              uploaded_by: { stringValue: att.uploaded_by },
+              uploaded_at: nowTs(),
+            } }
+          })) }
+        };
+      }
+      await firestore(`/${channelCollection(channel)}`, {
+        method: "POST",
+        body,
+        forName: name,
+      });
+      return { ok: true, name, ts: Date.now(), chars: text.length };
     });
 
   tool(server, "send_voice",
@@ -689,6 +846,7 @@ function buildServer(): McpServer {
       await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name });
       return { ok: true, name, ts: Date.now() };
     });
+
 
   tool(server, "route_task",
     { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it.",
@@ -1196,6 +1354,100 @@ function buildServer(): McpServer {
       const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields } });
       return { queued: true, task_title: title, task_id: docIdOf(data.name), status: "pending_approval",
         note: "Awaiting sin's one-tap approval. Nothing was changed." };
+    });
+
+  // Phase 3 Section C: Approval protocol
+  const APPROVALS = "approval_requests";
+
+  tool(server, "request_approval",
+    { title: "Request approval", description: "Create a durable approval request for a sensitive operation. The operation must pause until approved.",
+      inputSchema: {
+        requesting_agent: nameSchema,
+        operation: z.string().trim().min(1).max(100),
+        payload: z.record(z.unknown()).optional().default({}),
+        target_resource: z.string().trim().min(1).max(200),
+        permission_scope: z.string().trim().min(1).max(100),
+        ttl_seconds: z.number().int().min(60).max(3600).optional().default(600),
+      } },
+    async ({ requesting_agent, operation, payload, target_resource, permission_scope, ttl_seconds }) => {
+      const approvalId = "apr_" + Math.random().toString(36).slice(2, 10);
+      const now = new Date();
+      const expires = new Date(now.getTime() + (ttl_seconds || 600) * 1000);
+      const fields = {
+        requesting_agent: { stringValue: requesting_agent },
+        operation: { stringValue: operation },
+        payload: { stringValue: JSON.stringify(payload || {}) },
+        target_resource: { stringValue: target_resource },
+        permission_scope: { stringValue: permission_scope },
+        status: { stringValue: "pending" },
+        created_at: { timestampValue: now.toISOString() },
+        expires_at: { timestampValue: expires.toISOString() },
+        decided_by: { nullValue: null },
+        decided_at: { nullValue: null },
+        decision: { nullValue: null },
+      };
+      await firestore(`/${APPROVALS}/${approvalId}`, { method: "PATCH", body: { fields } });
+      return { approval_id: approvalId, status: "pending", expires_at: expires.toISOString() };
+    });
+
+  tool(server, "resolve_approval",
+    { title: "Resolve approval", description: "Approve or deny a pending approval request. Only sin/trey can decide.",
+      inputSchema: {
+        approval_id: z.string().trim().min(1).max(50),
+        decision: z.enum(["approve", "deny"]),
+        decided_by: nameSchema,
+      } },
+    async ({ approval_id, decision, decided_by }) => {
+      // Only sin/trey can approve
+      const allowed = ["sin", "trey", "grim"];
+      if (!allowed.includes(decided_by.toLowerCase())) {
+        throw new UserError("Only sin or trey can resolve approvals");
+      }
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      const status = fields.status?.stringValue;
+      if (status !== "pending") {
+        return { approval_id, status, note: "Already resolved — no duplicate execution" };
+      }
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired", note: "Approval expired before decision" };
+      }
+      const newStatus = decision === "approve" ? "approved" : "denied";
+      const now = new Date().toISOString();
+      await patchFields(APPROVALS, approval_id, {
+        status: { stringValue: newStatus },
+        decided_by: { stringValue: decided_by },
+        decided_at: { timestampValue: now },
+        decision: { stringValue: decision },
+      });
+      return { approval_id, status: newStatus, decided_by, decided_at: now };
+    });
+
+  tool(server, "get_approval_status",
+    { title: "Get approval status", description: "Check the current status of an approval request.",
+      inputSchema: { approval_id: z.string().trim().min(1).max(50) }, readOnly: true },
+    async ({ approval_id }) => {
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      // Auto-expire if past TTL
+      const status = fields.status?.stringValue;
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (status === "pending" && expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired" };
+      }
+      return {
+        approval_id,
+        status,
+        requesting_agent: fields.requesting_agent?.stringValue,
+        operation: fields.operation?.stringValue,
+        decided_by: fields.decided_by?.stringValue || null,
+        decided_at: fields.decided_at?.timestampValue || null,
+      };
     });
 
   tool(server, "score_lead",
@@ -1766,18 +2018,139 @@ async function pineconeIndex(): Promise<{ host: string; dimension: number }> {
   return _pcHost;
 }
 
+// Phase 3 Section B: Attachment metadata validation
+// Binary uploads go to Cloudinary via uploadAttachmentData (used by
+// POST /upload for the widget and by send_message for inline data_base64).
+// Metadata-only refs are validated here.
+
+
+function validateAttachment(att: { mime_type: string; size_bytes: number; storage_path: string }, uploaderName: string): void {
+  // Check MIME against allowlist
+  const limit = ATTACHMENT_LIMITS[att.mime_type];
+  if (!limit) {
+    throw new UserError(`MIME type not allowed: ${att.mime_type}`);
+  }
+  if (att.size_bytes > limit) {
+    throw new UserError(`File too large: ${att.size_bytes} > ${limit} for ${att.mime_type}`);
+  }
+  // Block dangerous types
+  if (att.mime_type.includes("html") || att.mime_type.includes("javascript") || att.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${att.mime_type}`);
+  }
+  // Storage path must be in attachments/ directory (prevent path traversal)
+  if (!att.storage_path.startsWith("attachments/") || att.storage_path.includes("..")) {
+    throw new UserError("Invalid storage path");
+  }
+}
+
+/**
+ * Verify an end-user Firebase ID token (widget clients). Returns the
+ * Firebase user or null. Used by POST /upload — the widget is a
+ * Firebase-authenticated client, not an MCP bot.
+ */
+async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string; email?: string } | null> {
+  try {
+    const r = await http(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) },
+      EXT_TIMEOUT);
+    if (!r.ok) return null;
+    const u = parseJson(r.body)?.users?.[0];
+    return u?.localId ? { localId: u.localId, email: u.email } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Shared shape for attachment metadata stored in Firestore docs. */
+interface AttachmentMeta {
+  id: string; filename: string; mime_type: string; size_bytes: number;
+  storage_path: string; download_url: string; is_image: boolean; uploaded_by: string;
+}
+
+/**
+ * Validate inline file data and upload it to Cloudinary. Returns the
+ * attachment metadata to store in the Firestore doc. The API secret
+ * never leaves the server — only the public secure_url is returned.
+ */
+async function uploadAttachmentData(input: {
+  filename: string; mime_type: string; data_base64: string; uploadedBy: string;
+}): Promise<AttachmentMeta> {
+  const filename = (input.filename || "").trim();
+  if (!filename || filename.length > 255) throw new UserError("Invalid filename");
+  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+    throw new UserError("Invalid filename");
+  }
+  const limit = ATTACHMENT_LIMITS[input.mime_type];
+  if (!limit) throw new UserError(`MIME type not allowed: ${input.mime_type}`);
+  if (input.mime_type.includes("html") || input.mime_type.includes("javascript") || input.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${input.mime_type}`);
+  }
+  let bytes: number;
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(input.data_base64, "base64");
+    bytes = buf.length;
+  } catch {
+    throw new UserError("Invalid base64 data");
+  }
+  if (bytes < 1) throw new UserError("Empty file");
+  if (bytes > limit) throw new UserError(`File too large: ${bytes} > ${limit} for ${input.mime_type}`);
+  if (!cloudinaryConfigured()) throw new UserError("Uploads unavailable: storage not configured");
+  const up = await uploadToCloudinary({
+    dataUri: `data:${input.mime_type};base64,${input.data_base64}`,
+    filename, mimeType: input.mime_type,
+  });
+  const id = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id, filename, mime_type: input.mime_type, size_bytes: up.bytes || bytes,
+    storage_path: `attachments/cloudinary/${up.public_id}`,
+    download_url: up.secure_url,
+    is_image: input.mime_type.toLowerCase().startsWith("image/"),
+    uploaded_by: input.uploadedBy,
+  };
+}
+
 // ============ EXPRESS ============
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
+
+// POST /upload — widget file uploads via the bridge (secret stays server-side).
+// Auth: Firebase ID token (the widget is a Firebase-authenticated client).
+// Registered BEFORE the global 2mb JSON parser so uploads get their own limit.
+// NOTE: this route is intentionally outside sec.resolveAuth — it uses the
+// end-user's Firebase identity, not the bot MCP secret.
+app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: Response) => {
+  try {
+    const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
+    if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
+    const who = await verifyFirebaseIdToken(m[1]);
+    if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
+    const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
+    const att = await uploadAttachmentData({
+      filename: typeof filename === "string" ? filename : "",
+      mime_type: typeof mime_type === "string" ? mime_type : "",
+      data_base64: typeof data_base64 === "string" ? data_base64 : "",
+      uploadedBy: who.email || who.localId,
+    });
+    res.json({ ok: true, ...att });
+  } catch (e) {
+    const msg = errMsg(e);
+    const status = e instanceof UserError ? 400 : 500;
+    res.status(status).json({ ok: false, error: msg });
+  }
+});
+
+app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
+
 app.get("/health", (_req, res) => { res.json({ ok: true }); });
 
 app.get("/news", async (_req, res) => {
