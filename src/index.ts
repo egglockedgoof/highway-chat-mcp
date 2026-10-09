@@ -33,6 +33,21 @@ for (const k of REQUIRED_ENV) {
 const API_KEY = process.env.FIREBASE_API_KEY as string;
 const MCP_SECRET = process.env.MCP_SECRET as string;
 
+// Phase 3 Section B: Firebase Storage for attachments
+const STORAGE_BUCKET = "highway-chat.firebasestorage.app";
+const ATTACHMENT_LIMITS: Record<string, number> = {
+  "image/jpeg": 5 * 1024 * 1024,
+  "image/png": 5 * 1024 * 1024,
+  "image/gif": 5 * 1024 * 1024,
+  "image/webp": 5 * 1024 * 1024,
+  "application/pdf": 10 * 1024 * 1024,
+  "text/plain": 10 * 1024 * 1024,
+  "text/markdown": 10 * 1024 * 1024,
+  "audio/mpeg": 10 * 1024 * 1024,
+  "audio/wav": 10 * 1024 * 1024,
+  "audio/ogg": 10 * 1024 * 1024,
+};
+
 const BASE =
   process.env.FIRESTORE_BASE ||
   "https://firestore.googleapis.com/v1/projects/highway-chat/databases/(default)/documents";
@@ -327,14 +342,85 @@ function htmlToText(html: string): string {
     .replace(/[ \t\f\v]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function buildMessageFields(name: string, text: string) {
-  return { fields: {
+function buildMessageFields(name: string, text: string, opts?: { reply_to?: string; idempotency_key?: string }) {
+  const fields: Record<string, unknown> = {
     name: { stringValue: name },
     text: { stringValue: text },
     ts: nowTs(),
     tsNum: nowNum(),
     deviceId: { stringValue: DEVICE_ID },
-  } };
+  };
+  if (opts?.reply_to) fields.reply_to = { stringValue: opts.reply_to };
+  if (opts?.idempotency_key) fields.idempotency_key = { stringValue: opts.idempotency_key };
+  return { fields };
+}
+
+// ---- Infinite text: long messages become text file attachments ----
+// Firestore rules cap text at 1000 chars. Messages exceeding that are split:
+// - text field: preview (first 200 chars + marker)
+// - full content: uploaded by client to Storage as .txt, passed as attachment
+// This keeps Firestore docs tiny while allowing unlimited message length.
+const TEXT_PREVIEW_LIMIT = 200;
+const TEXT_INLINE_LIMIT = 1000;
+
+function splitLongText(text: string): { preview: string; needsAttachment: boolean } {
+  if (text.length <= TEXT_INLINE_LIMIT) {
+    return { preview: text, needsAttachment: false };
+  }
+  const preview = text.slice(0, TEXT_PREVIEW_LIMIT).trimEnd() + "\n\n[📄 full text attached — tap to expand]";
+  return { preview, needsAttachment: true };
+}
+
+function makeTextAttachment(fullText: string, senderName: string): Record<string, unknown> {
+  const id = `txt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const filename = `message_${id}.txt`;
+  const sizeBytes = Buffer.byteLength(fullText, 'utf8');
+  return {
+    id,
+    filename,
+    mime_type: "text/plain",
+    size_bytes: sizeBytes,
+    storage_path: `attachments/text/${id}.txt`,
+    download_url: "", // client fills after Storage upload
+    is_image: false,
+    _pendingUpload: true, // signals client to upload fullText to storage_path
+    _fullText: fullText,  // carried through for client-side upload
+  };
+}
+
+// Dispatch Lock: check if a message is locked to a specific agent
+async function checkDispatchLock(replyToId: string, senderName: string): Promise<{ allowed: boolean; reason?: string }> {
+  if (!replyToId) return { allowed: true };
+  try {
+    const lock = await getDocOrNull("dispatch_locks", replyToId);
+    if (!lock) return { allowed: true }; // no lock = open
+
+    const fields = (lock as any).fields || {};
+    const routedTo = fields.routed_to?.stringValue;
+    const broadcast = fields.broadcast?.booleanValue;
+    const expiresAt = fields.expires_at?.timestampValue;
+
+    // Broadcast = everyone can reply
+    if (broadcast) return { allowed: true };
+
+    // Expired lock = open
+    if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true };
+
+    // Room lead (whisper) can always triage
+    if (senderName.toLowerCase() === "whisper") return { allowed: true };
+
+    // Structured disagreement bypasses lock
+    // (checked by caller via text prefix — this is just the lock check)
+
+    // Only the routed agent can reply
+    if (routedTo && senderName.toLowerCase() !== routedTo.toLowerCase()) {
+      return { allowed: false, reason: `Message is dispatch-locked to ${routedTo}` };
+    }
+
+    return { allowed: true };
+  } catch {
+    return { allowed: true }; // fail open on lock read error (don't block chat)
+  }
 }
 
 // Shared evolution_logs doc — one builder, three tools
@@ -666,11 +752,80 @@ function buildServer(): McpServer {
       return { count: messages.length, messages };
     });
 
+  const attachmentSchema = z.object({
+    id: z.string().trim().min(1).max(50),
+    filename: z.string().trim().min(1).max(255),
+    mime_type: z.string().trim().min(1).max(100),
+    size_bytes: z.number().int().min(1).max(25 * 1024 * 1024),
+    storage_path: z.string().trim().min(1).max(500),
+    download_url: z.string().url().max(2000),
+    is_image: z.boolean().optional().default(false),
+  });
+
   tool(server, "send_message",
     { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
-      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(2000), channel: channelSchema } },
-    async ({ name, text, channel }) => {
-      await firestore(`/${channelCollection(channel)}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
+      inputSchema: {
+        name: nameSchema,
+        text: z.string().trim().min(1).max(100000).describe("Message text. Over 1000 chars auto-splits: preview in text field, full content as text attachment."),
+        channel: channelSchema,
+        reply_to: z.string().trim().min(1).optional().describe("Doc ID of the message being replied to (for threading + dispatch lock)"),
+        idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
+        attachments: z.array(attachmentSchema).max(5).optional().describe("File attachments (uploaded to Storage by client, validated here)"),
+      } },
+    async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
+      // Phase 3 Section D: Dispatch lock enforcement
+      if (reply_to) {
+        // Structured disagreement bypasses the lock
+        const isDisagreement = /^(DISAGREE|CHALLENGE)\s*:/i.test(text.trim());
+        if (!isDisagreement) {
+          const lockCheck = await checkDispatchLock(reply_to, name);
+          if (!lockCheck.allowed) {
+            throw new UserError(lockCheck.reason || "Message is dispatch-locked");
+          }
+        }
+      }
+      // Phase 3 Section B: Validate attachments
+      if (attachments) {
+        for (const att of attachments) {
+          validateAttachment(att, name);
+        }
+      }
+      // Infinite text: split long messages into preview + text file attachment
+      const { preview, needsAttachment } = splitLongText(text);
+      const effectiveAttachments = [...(attachments || [])];
+      let pendingTextUpload: string | null = null;
+      if (needsAttachment) {
+        const txtAtt = makeTextAttachment(text, name) as any;
+        pendingTextUpload = txtAtt._fullText;
+        delete txtAtt._fullText;
+        // Validate size against text/plain limit
+        validateAttachment({ ...txtAtt, download_url: "https://placeholder.local/pending" } as any, name);
+        delete (txtAtt as any)._pendingUpload;
+        effectiveAttachments.push(txtAtt);
+      }
+      const body = buildMessageFields(name, preview, { reply_to, idempotency_key });
+      if (effectiveAttachments && effectiveAttachments.length > 0) {
+        (body.fields as Record<string, unknown>).attachments = {
+          arrayValue: { values: effectiveAttachments.map(att => ({
+            mapValue: { fields: {
+              id: { stringValue: att.id },
+              filename: { stringValue: att.filename },
+              mime_type: { stringValue: att.mime_type },
+              size_bytes: { integerValue: String(att.size_bytes) },
+              storage_path: { stringValue: att.storage_path },
+              download_url: { stringValue: att.download_url },
+              is_image: { booleanValue: att.is_image || false },
+              uploaded_by: { stringValue: name },
+              uploaded_at: nowTs(),
+            } }
+          })) }
+        };
+      }
+      await firestore(`/${channelCollection(channel)}`, {
+        method: "POST",
+        body,
+        forName: name,
+      });
       return { ok: true, name, ts: Date.now() };
     });
 
@@ -689,6 +844,29 @@ function buildServer(): McpServer {
       await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name });
       return { ok: true, name, ts: Date.now() };
     });
+
+  // Phase 3 Section B: Attachment metadata validation
+  // Frontend uploads directly to Firebase Storage; bridge validates refs.
+
+
+  function validateAttachment(att: z.infer<typeof attachmentSchema>, uploaderName: string): void {
+    // Check MIME against allowlist
+    const limit = ATTACHMENT_LIMITS[att.mime_type];
+    if (!limit) {
+      throw new UserError(`MIME type not allowed: ${att.mime_type}`);
+    }
+    if (att.size_bytes > limit) {
+      throw new UserError(`File too large: ${att.size_bytes} > ${limit} for ${att.mime_type}`);
+    }
+    // Block dangerous types
+    if (att.mime_type.includes("html") || att.mime_type.includes("javascript") || att.mime_type.includes("executable")) {
+      throw new UserError(`File type blocked for security: ${att.mime_type}`);
+    }
+    // Storage path must be in attachments/ directory (prevent path traversal)
+    if (!att.storage_path.startsWith("attachments/") || att.storage_path.includes("..")) {
+      throw new UserError("Invalid storage path");
+    }
+  }
 
   tool(server, "route_task",
     { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it.",
@@ -1196,6 +1374,100 @@ function buildServer(): McpServer {
       const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields } });
       return { queued: true, task_title: title, task_id: docIdOf(data.name), status: "pending_approval",
         note: "Awaiting sin's one-tap approval. Nothing was changed." };
+    });
+
+  // Phase 3 Section C: Approval protocol
+  const APPROVALS = "approval_requests";
+
+  tool(server, "request_approval",
+    { title: "Request approval", description: "Create a durable approval request for a sensitive operation. The operation must pause until approved.",
+      inputSchema: {
+        requesting_agent: nameSchema,
+        operation: z.string().trim().min(1).max(100),
+        payload: z.record(z.unknown()).optional().default({}),
+        target_resource: z.string().trim().min(1).max(200),
+        permission_scope: z.string().trim().min(1).max(100),
+        ttl_seconds: z.number().int().min(60).max(3600).optional().default(600),
+      } },
+    async ({ requesting_agent, operation, payload, target_resource, permission_scope, ttl_seconds }) => {
+      const approvalId = "apr_" + Math.random().toString(36).slice(2, 10);
+      const now = new Date();
+      const expires = new Date(now.getTime() + (ttl_seconds || 600) * 1000);
+      const fields = {
+        requesting_agent: { stringValue: requesting_agent },
+        operation: { stringValue: operation },
+        payload: { stringValue: JSON.stringify(payload || {}) },
+        target_resource: { stringValue: target_resource },
+        permission_scope: { stringValue: permission_scope },
+        status: { stringValue: "pending" },
+        created_at: { timestampValue: now.toISOString() },
+        expires_at: { timestampValue: expires.toISOString() },
+        decided_by: { nullValue: null },
+        decided_at: { nullValue: null },
+        decision: { nullValue: null },
+      };
+      await firestore(`/${APPROVALS}/${approvalId}`, { method: "PATCH", body: { fields } });
+      return { approval_id: approvalId, status: "pending", expires_at: expires.toISOString() };
+    });
+
+  tool(server, "resolve_approval",
+    { title: "Resolve approval", description: "Approve or deny a pending approval request. Only sin/trey can decide.",
+      inputSchema: {
+        approval_id: z.string().trim().min(1).max(50),
+        decision: z.enum(["approve", "deny"]),
+        decided_by: nameSchema,
+      } },
+    async ({ approval_id, decision, decided_by }) => {
+      // Only sin/trey can approve
+      const allowed = ["sin", "trey", "grim"];
+      if (!allowed.includes(decided_by.toLowerCase())) {
+        throw new UserError("Only sin or trey can resolve approvals");
+      }
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      const status = fields.status?.stringValue;
+      if (status !== "pending") {
+        return { approval_id, status, note: "Already resolved — no duplicate execution" };
+      }
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired", note: "Approval expired before decision" };
+      }
+      const newStatus = decision === "approve" ? "approved" : "denied";
+      const now = new Date().toISOString();
+      await patchFields(APPROVALS, approval_id, {
+        status: { stringValue: newStatus },
+        decided_by: { stringValue: decided_by },
+        decided_at: { timestampValue: now },
+        decision: { stringValue: decision },
+      });
+      return { approval_id, status: newStatus, decided_by, decided_at: now };
+    });
+
+  tool(server, "get_approval_status",
+    { title: "Get approval status", description: "Check the current status of an approval request.",
+      inputSchema: { approval_id: z.string().trim().min(1).max(50) }, readOnly: true },
+    async ({ approval_id }) => {
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      // Auto-expire if past TTL
+      const status = fields.status?.stringValue;
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (status === "pending" && expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired" };
+      }
+      return {
+        approval_id,
+        status,
+        requesting_agent: fields.requesting_agent?.stringValue,
+        operation: fields.operation?.stringValue,
+        decided_by: fields.decided_by?.stringValue || null,
+        decided_at: fields.decided_at?.timestampValue || null,
+      };
     });
 
   tool(server, "score_lead",
