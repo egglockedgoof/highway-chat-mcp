@@ -12,13 +12,16 @@
  */
 
 import express, { type NextFunction, type Request, type Response } from "express";
-import { createHash, timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import {
+  createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx,
+} from './security.js';
+import type { AuthRequest, CallerCtx } from './security.js';
 // ============ FAIL-CLOSED ENV ============
 const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
@@ -74,6 +77,30 @@ const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
   try { return JSON.parse(process.env.BOT_CREDENTIALS || "{}"); }
   catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
+
+// ============ REV 19 SECURITY ============
+// All Firestore access flows through sec.firestore (the choke point); all MCP auth
+// flows through sec.resolveAuth. See src/security.ts for the full decision tables.
+const sec = createSecurity(
+  {
+    baseUrl: BASE,
+    fsTimeoutMs: FS_TIMEOUT,
+    readBot: READ_BOT,
+    isSunset: () => false,
+    request: (method, url, opts) =>
+      http(url, { method, headers: opts.headers, body: opts.body }, opts.timeoutMs)
+        .then((r) => ({ status: r.status, body: r.body ? parseJson(r.body) : null })),
+    getIdToken,
+    now: () => new Date().toISOString(),
+  },
+  {
+    instanceId: process.env.RENDER_INSTANCE_ID || `local-${Date.now().toString(36)}`,
+    instanceStartedAt: new Date().toISOString(),
+    quietWindowMs: 14 * 24 * 3600 * 1000,
+    boundWriteThroughMs: 3600 * 1000,
+  },
+  { mcpCallers: {}, legacySecret: MCP_SECRET, legacyEnabled: true },
+);
 
 // ============ HTTP PRIMITIVE ============
 // One timer covers headers AND body (a stalled body used to hang forever); bytes are capped;
@@ -192,8 +219,9 @@ const _authBackoff = new Map<string, { until: number; message: string }>();
 const AUTH_BACKOFF_MS = 15000;
 const tokenKey = (forName?: string): string => (forName || READ_BOT).toLowerCase();
 
-async function getIdToken(forName?: string): Promise<string> {
+async function getIdToken(forName?: string, forceRefresh?: boolean): Promise<string> {
   const key = tokenKey(forName);
+  if (forceRefresh) { _tokens.delete(key); _inflight.delete(key); }
   const cached = _tokens.get(key);
   if (cached && Date.now() < cached.exp - 60000) return cached.token;
   const pending = _inflight.get(key);
@@ -228,24 +256,11 @@ async function getIdToken(forName?: string): Promise<string> {
 }
 
 // ============ FIRESTORE PRIMITIVES ============
-async function firestore(path: string, init: { method: string; body?: unknown; forName?: string }): Promise<any> {
-  for (let attempt = 0; ; attempt++) {
-    const idToken = await getIdToken(init.forName);
-    const r = await http(`${BASE}${path}`, {
-      method: init.method,
-      headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY, "Authorization": `Bearer ${idToken}` },
-      body: init.body ? JSON.stringify(init.body) : undefined,
-    }, FS_TIMEOUT);
-    // revoked/expired-early token: drop the cache and retry exactly once
-    if (r.status === 401 && attempt === 0) { _tokens.delete(tokenKey(init.forName)); continue; }
-    const data = parseJson(r.body);
-    if (!r.ok) {
-      const err = Array.isArray(data) ? data[0]?.error : data?.error;
-      throw new FirestoreError(r.status, String(err?.status ?? ""), `Firestore ${r.status}: ${err?.message ?? r.statusText}`);
-    }
-    return data;
-  }
-}
+// REV 19 choke point: global precondition validation → gate → system allowlist →
+// validated URL → 401 retry. All Firestore access in this file goes through here.
+// Query strings are rejected in paths — use structured init (pageSize, documentId,
+// updateMask, precondition) instead.
+const firestore = sec.firestore;
 
 const is404 = (e: unknown): boolean => e instanceof FirestoreError && e.status === 404;
 
@@ -255,10 +270,9 @@ async function getDocOrNull(collectionId: string, docId: string, forName?: strin
 }
 
 async function listDocs(collectionId: string, pageSize = 300): Promise<Doc[]> {
-  const data = await firestore(`/${collectionId}?pageSize=${pageSize}`, { method: "GET" });
+  const data = await firestore(`/${collectionId}`, { method: "GET", pageSize });
   return (data.documents ?? []) as Doc[];
 }
-
 const str = (f: any): string => f?.stringValue ?? "";
 const boolOf = (f: any): boolean => f?.booleanValue ?? false;
 // tsOf: mixed-type aware — highway_messages ts is stringValue OR timestampValue (never trust the type)
@@ -356,9 +370,11 @@ function recordFailure(scope: string, err: unknown, latencyMs = 0): void {
   _budget.used++;
   _failSeen.set(key, now);
   if (_failSeen.size > 500) for (const [k, t] of _failSeen) if (now - t > FAIL_DEDUPE_MS) _failSeen.delete(k);
-  // fire-and-forget; this path never calls recordFailure, so it cannot recurse
-  firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(scope, latencyMs, false, msg) })
-    .catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
+  // fire-and-forget; this path never calls recordFailure, so it cannot recurse.
+  // REV 19: runs as the 'recordFailure' system op — works outside request context.
+  runAsSystem('recordFailure', () =>
+    firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(scope, latencyMs, false, msg) })
+  ).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
 }
 
 async function settle<T>(label: string, p: Promise<T>, fallback: T, degraded: string[]): Promise<T> {
@@ -449,13 +465,9 @@ async function queryNewestNum(collectionId: string, limit: number): Promise<Doc[
 }
 
 // ============ SHARED MUTATION HELPERS ============
-const maskKey = (k: string): string => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : `\`${k.replace(/`/g, "\\`")}\``);
-const maskOf = (fields: Record<string, unknown>): string =>
-  Object.keys(fields).map((k) => `updateMask.fieldPaths=${encodeURIComponent(maskKey(k))}`).join("&");
-
 async function patchFields(collectionId: string, docId: string, fields: Record<string, unknown>, forName?: string) {
-  await firestore(`/${collectionId}/${encodeURIComponent(docId)}?${maskOf(fields)}`, {
-    method: "PATCH", body: { fields }, forName,
+  await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, {
+    method: "PATCH", body: { fields }, forName, updateMask: Object.keys(fields),
   });
 }
 
@@ -471,11 +483,11 @@ async function mutateDoc(
     const cur = await getDocOrNull(collectionId, docId, forName);
     const patch = mutate(cur?.fields ?? null);
     const precondition = cur?.updateTime
-      ? `currentDocument.updateTime=${encodeURIComponent(cur.updateTime)}`
-      : "currentDocument.exists=false";
+      ? { updateTime: cur.updateTime }
+      : { exists: false };
     try {
-      await firestore(`/${collectionId}/${encodeURIComponent(docId)}?${maskOf(patch)}&${precondition}`,
-        { method: "PATCH", body: { fields: patch }, forName });
+      await firestore(`/${collectionId}/${encodeURIComponent(docId)}`,
+        { method: "PATCH", body: { fields: patch }, forName, updateMask: Object.keys(patch), precondition });
       return;
     } catch (e) {
       const contended = e instanceof FirestoreError &&
@@ -566,7 +578,6 @@ async function countDocs(collectionId: string): Promise<number | null> {
     return null;
   }
 }
-
 const faviconFor = (url: string): string => {
   const d = hostOf(url);
   return d && d !== url ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : "";
@@ -1089,7 +1100,7 @@ function buildServer(): McpServer {
         target: { stringValue: "LOCAL_BEAST_TUNNEL" }, tsNum: nowNum() } };
       // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update
       try {
-        await firestore(`/${SYS_CONFIG}?documentId=hardware_relay_buffer`, { method: "POST", body });
+        await firestore(`/${SYS_CONFIG}`, { method: "POST", body, documentId: "hardware_relay_buffer" });
       } catch (e) {
         if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
         await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
@@ -1256,7 +1267,7 @@ function buildServer(): McpServer {
       };
       let firestore_error: string | undefined;
       try {
-        await firestore(`/${EVO_LOGS}?pageSize=1`, { method: "GET" });
+        await firestore(`/${EVO_LOGS}`, { method: "GET", pageSize: 1 });
         checks.firestore_reachable = true;
       } catch (e) {
         firestore_error = errMsg(e);
@@ -1610,10 +1621,13 @@ async function apifyState(): Promise<{ lastRun: number | null; cached: NewsItem[
 }
 
 async function apifyWrite(items: NewsItem[]): Promise<void> {
-  await firestore(APIFY_DOC, { method: "PATCH", body: { fields: {
-    tsNum: nowNum(), ts: nowTs(),
-    items: { stringValue: JSON.stringify(items.slice(0, APIFY_CACHE_MAX_ITEMS)) },
-  } } });
+  // REV 19: runs as the 'apifyWrite' system op — scoped to /system_config/apify_last_run.
+  await runAsSystem('apifyWrite', () =>
+    firestore(APIFY_DOC, { method: "PATCH", body: { fields: {
+      tsNum: nowNum(), ts: nowTs(),
+      items: { stringValue: JSON.stringify(items.slice(0, APIFY_CACHE_MAX_ITEMS)) },
+    } } })
+  );
 }
 
 async function apifyRun(actor: string, input: unknown, token: string): Promise<any[]> {
@@ -1775,11 +1789,8 @@ app.get("/news", async (_req, res) => {
   }
 });
 
-// Constant-time secret check (digest compare: equal length, no early exit).
-const secretDigest = createHash("sha256").update(MCP_SECRET).digest();
-const secretOk = (candidate: string): boolean =>
-  timingSafeEqual(createHash("sha256").update(candidate).digest(), secretDigest);
-
+// REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with
+// duplicate-safe Bearer parsing and no-oracle decoys). The inline check is retired.
 const jsonRpcError = (code: number, message: string) => ({ jsonrpc: "2.0", error: { code, message }, id: null });
 
 async function handleMcp(req: Request, res: Response): Promise<void> {
@@ -1798,9 +1809,18 @@ async function handleMcp(req: Request, res: Response): Promise<void> {
 }
 
 app.all(/^\/mcp\/(.+?)\/?$/, async (req: Request, res: Response) => {
-  if (!secretOk(String(req.params[0]))) { res.status(404).json({ error: "not found" }); return; }
+  // REV 19 auth: Bearer authoritative, duplicate-safe, no-oracle decoys.
+  let ctx: CallerCtx;
+  try {
+    const authRes = await sec.resolveAuth(req as AuthRequest, req.url || '');
+    if (authRes.kind === 'decoy') { res.status(DECOY_STATUS).json(DECOY_BODY); return; }
+    ctx = authRes.ctx;
+  } catch (e) {
+    if (e instanceof WriteThroughFailed) { res.status(503).json({ error: 'write_through_failed' }); return; }
+    throw e;
+  }
   if (req.method !== "POST") { res.status(405).json(jsonRpcError(-32000, "Method not allowed.")); return; }
-  await handleMcp(req, res);
+  await reqCtx.run(ctx, () => handleMcp(req, res));
 });
 
 // Body-parser failures (bad JSON, >2mb) answered as JSON-RPC, not an HTML stack page.
@@ -1815,6 +1835,9 @@ process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); 
 
 const port = Number(process.env.PORT) || 3000;
 const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
+
+// REV 19: periodic security-telemetry flush (bound write-through buffer → Firestore).
+setInterval(() => sec.telemetry.flush().catch(() => {}), 5 * 60 * 1000);
 
 // Render sends SIGTERM on deploy: stop accepting, let in-flight calls finish, then exit.
 process.on("SIGTERM", () => {
