@@ -378,6 +378,10 @@ export interface FirestoreInit {
   /** Field paths for updateMask — §3e write-through/flush need this; the allowlist
    *  gates (op, path, method, precondition), updateMask only selects touched fields. */
   updateMask?: string[];
+  /** Page size for list queries — validated positive int ≤ 1000. */
+  pageSize?: number;
+  /** Document ID for POST creates — validated against safe charset. */
+  documentId?: string;
 }
 
 export interface SecurityDeps {
@@ -404,6 +408,16 @@ export function buildFirestoreQuery(init: FirestoreInit): string {
   const pc = preconditionKind(init.precondition); // validated upstream; recompute for the kind
   if (pc === 'exists-false') params.set('currentDocument.exists', 'false');
   else if (pc === 'updateTime') params.set('currentDocument.updateTime', init.precondition!.updateTime!);
+  if (init.pageSize !== undefined) {
+    if (!Number.isInteger(init.pageSize) || init.pageSize <= 0 || init.pageSize > 1000)
+      throw new UserError('bad-page-size', 400, 'pageSize must be a positive integer ≤ 1000');
+    params.set('pageSize', String(init.pageSize));
+  }
+  if (init.documentId !== undefined) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(init.documentId))
+      throw new UserError('bad-document-id', 400, 'documentId contains unsafe characters');
+    params.set('documentId', init.documentId);
+  }
   const s = params.toString();
   return s ? '?' + s : '';
 }
@@ -767,7 +781,7 @@ export function createTelemetry(opts: TelemetryOpts): Telemetry {
 // All authentication failures produce the IDENTICAL 404 decoy (lesson #10: no oracle).
 
 export const DECOY_STATUS = 404;
-export const DECOY_BODY = { error: 'not_found' };
+export const DECOY_BODY = { error: 'not found' };
 
 export interface AuthConfig {
   /** token -> bot name (MCP_CALLERS) */
