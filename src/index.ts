@@ -37,6 +37,7 @@ import {
   backfillStatus, startMessagesBackfill,
   type Store, type StoreCollection, type StoreDoc,
 } from "./store/index.js";
+import { mirrorToPg, removeFromPg, setMirrorStore, setMirrorFailureHandler } from "./store/mirror.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
 } from "./site-api.js";
@@ -792,9 +793,11 @@ function recordFailure(scope: string, err: unknown, latencyMs = 0): void {
   if (_failSeen.size > 500) for (const [k, t] of _failSeen) if (now - t > FAIL_DEDUPE_MS) _failSeen.delete(k);
   // fire-and-forget; this path never calls recordFailure, so it cannot recurse.
   // REV 19: runs as the 'recordFailure' system op — works outside request context.
-  runAsSystem('recordFailure', () =>
-    firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(scope, latencyMs, false, msg) })
-  ).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
+  runAsSystem('recordFailure', () => {
+    const body = telemetryDoc(scope, latencyMs, false, msg);
+    return firestore(`/${EVO_LOGS}`, { method: "POST", body })
+      .then((res) => { const id = docIdOf(String(res?.name ?? "")); if (id) mirrorToPg(EVO_LOGS, id, body.fields); });
+  }).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
 }
 
 async function settle<T>(label: string, p: Promise<T>, fallback: T, degraded: string[]): Promise<T> {
@@ -934,7 +937,7 @@ async function mutateDoc(
   docId: string,
   mutate: (current: Fields | null) => Record<string, unknown>,
   forName?: string
-): Promise<void> {
+): Promise<Fields> {
   for (let attempt = 0; ; attempt++) {
     const cur = await getDocOrNull(collectionId, docId, forName);
     const patch = mutate(cur?.fields ?? null);
@@ -944,7 +947,7 @@ async function mutateDoc(
     try {
       await firestore(`/${collectionId}/${encodeURIComponent(docId)}`,
         { method: "PATCH", body: { fields: patch }, forName, updateMask: Object.keys(patch), precondition });
-      return;
+      return { ...(cur?.fields ?? {}), ...patch } as Fields;
     } catch (e) {
       const contended = e instanceof FirestoreError &&
         (e.code === "FAILED_PRECONDITION" || e.code === "ABORTED" || e.status === 409 || e.status === 412);
@@ -967,8 +970,9 @@ function encodeReactions(rx: Record<string, string[]>): unknown {
 }
 
 async function postActivity(by: string, text: string, forName?: string): Promise<void> {
-  await firestore(`/${ACTIVITY}`, { method: "POST", forName,
-    body: { fields: { text: { stringValue: text }, by: { stringValue: by }, ts: nowTs() } } });
+  const fields: Fields = { text: { stringValue: text }, by: { stringValue: by }, ts: nowTs() };
+  const data = await firestore(`/${ACTIVITY}`, { method: "POST", forName, body: { fields } });
+  mirrorToPg(ACTIVITY, docIdOf(data.name), fields);
 }
 // notify: postActivity that NEVER throws — failures go to the permanent log
 async function notify(by: string, text: string, forName?: string): Promise<void> {
@@ -1186,14 +1190,25 @@ function storeDocAsDoc(d: StoreDoc): Doc {
   return { name: `${d.collection}/${d.id}`, fields: d.fields as Fields };
 }
 
-function mirrorToPg(coll: string, id: string, fields: Fields) {
-  if (!dualWriteEnabled() || !pgStore || !id || !isStoreCollection(coll)) return;
-  pgStore.upsert(coll, id, fields).catch((e) => recordFailure(`dual_write:${coll}`, e));
+/** Newest-N read honoring the pg read flip; falls back to the Firestore query path. */
+async function queryNewestNumFlip(collectionId: string, limit: number): Promise<Doc[]> {
+  if (pgStore && readsFromPg(collectionId) && isStoreCollection(collectionId)) {
+    try {
+      return (await pgStore.listNewest(collectionId, limit)).map(storeDocAsDoc);
+    } catch { /* fall through to Firestore */ }
+  }
+  return queryNewestNum(collectionId, limit);
 }
 
-function removeFromPg(coll: string, id: string) {
-  if (!dualWriteEnabled() || !pgStore || !id || !isStoreCollection(coll)) return;
-  pgStore.remove(coll, id).catch((e) => recordFailure(`dual_write_del:${coll}`, e));
+/** Single-doc read honoring the pg read flip; falls back to the Firestore GET. */
+async function getDocOrNullFlip(collectionId: string, docId: string, forName?: string): Promise<Doc | null> {
+  if (pgStore && readsFromPg(collectionId) && isStoreCollection(collectionId)) {
+    try {
+      const d = await pgStore.get(collectionId, docId);
+      if (d) return storeDocAsDoc(d);
+    } catch { /* fall through to Firestore */ }
+  }
+  return getDocOrNull(collectionId, docId, forName);
 }
 
 async function readChannelMessages(
@@ -1202,7 +1217,7 @@ async function readChannelMessages(
 ): Promise<{ messages: CachedMessage[]; newest_ts: number | null; cached: boolean }> {
   const coll = channelCollection(channel);
   if (pgStore && readsFromPg(coll)) {
-    const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100));
+    const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
     const all = docs.map((d) => cachedFromDoc(storeDocAsDoc(d)));
     return { messages: selectMessages(all, q), newest_ts: all[0]?.ts ?? null, cached: false };
   }
@@ -1431,9 +1446,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "React to a Highway message", description: "Toggle an emoji reaction on a message.",
       inputSchema: { name: nameSchema, message_id: z.string().trim().min(1), emoji: z.string().trim().min(1).max(8) } },
     async ({ name, message_id, emoji }) => {
-      const { id } = await getMessageOrThrow(message_id, name);
+      const { id, fields } = await getMessageOrThrow(message_id, name);
       let action = "added";
       let result: Record<string, string[]> = {};
+      let patch: Record<string, unknown> = {};
       await mutateDoc(MESSAGES, id, (current) => {
         const rx = parseReactions(current?.reactions);
         const users = rx[emoji] ?? [];
@@ -1441,8 +1457,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         if (i >= 0) { users.splice(i, 1); action = "removed"; } else { users.push(name); action = "added"; }
         if (users.length) rx[emoji] = users; else delete rx[emoji];
         result = rx;
-        return { reactions: encodeReactions(rx) };
+        patch = { reactions: encodeReactions(rx) };
+        return patch;
       }, name);
+      mirrorToPg(MESSAGES, id, { ...fields, ...patch });
       return { ok: true, message_id: id, emoji, action, reactions: result };
     });
 
@@ -1470,6 +1488,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, message_id, pinned }) => {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       await patchFields(MESSAGES, id, { pinned: { booleanValue: pinned } }, name);
+      mirrorToPg(MESSAGES, id, { ...fields, pinned: { booleanValue: pinned } });
       await notify(name, `${pinned ? "pinned" : "unpinned"} a message: ${str(fields.text).slice(0, 120)}`, name);
       return { ok: true, message_id: id, pinned };
     });
@@ -1478,8 +1497,17 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Read pinned Highway messages", description: "List pinned messages, newest first.",
       inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const { docs, degraded } = await queryDocs(MESSAGES, { orderField: "ts", limit, where: {
-        field: "pinned", op: "EQUAL", value: { booleanValue: true }, match: (d) => boolOf(d.fields?.pinned) } });
+      let docs: Doc[];
+      let degraded = false;
+      if (pgStore && readsFromPg(MESSAGES)) {
+        const rows = await pgStore.listNewest(MESSAGES, Math.min(limit * 2, 400));
+        docs = newest(rows.map(storeDocAsDoc).filter((d) => boolOf(d.fields?.pinned)), limit);
+      } else {
+        const r = await queryDocs(MESSAGES, { orderField: "ts", limit, where: {
+          field: "pinned", op: "EQUAL", value: { booleanValue: true }, match: (d) => boolOf(d.fields?.pinned) } });
+        docs = r.docs;
+        degraded = r.degraded;
+      }
       const pins = docs.map(fmtMsg);
       return { count: pins.length, pins, ...(degraded ? { degraded: true } : {}) };
     });
@@ -1520,7 +1548,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Save a milestone to evolution log", description: "Log a significant moment to the permanent timeline.",
       inputSchema: { text: z.string().trim().min(1).max(2000), type: z.string().optional().default("milestone") } },
     async ({ text, type }) => {
-      await firestore(`/${EVO_LOGS}`, { method: "POST", body: evoDoc(type || "milestone", text) });
+      const body = evoDoc(type || "milestone", text);
+      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+      const mid = docIdOf(String(res?.name ?? ""));
+      if (mid) mirrorToPg(EVO_LOGS, mid, body.fields);
       rememberQuietly(text, "milestone", "save_milestone");
       return { ok: true };
     });
@@ -1534,8 +1565,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ limit, include_telemetry }) => {
       const n = limit || 20;
       const [logDocs, memDocs] = await Promise.all([
-        queryNewestNum(EVO_LOGS, include_telemetry ? n : Math.min(n * 3, 150)),
-        queryNewestNum(JARVIS_MEM, n),
+        queryNewestNumFlip(EVO_LOGS, include_telemetry ? n : Math.min(n * 3, 150)),
+        queryNewestNumFlip(JARVIS_MEM, n),
       ]);
       const evolution_logs = logDocs
         .filter((d) => include_telemetry || str(d.fields?.type) !== "telemetry")
@@ -1550,8 +1581,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Store a user preference", description: "Save a durable preference to permanent memory.",
       inputSchema: { key: z.string().trim().min(1).max(200), value: z.string().trim().min(1).max(2000) } },
     async ({ key, value }) => {
-      await firestore(`/${JARVIS_MEM}`, { method: "POST",
-        body: { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } } });
+      const body = { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } };
+      const res = await firestore(`/${JARVIS_MEM}`, { method: "POST", body });
+      const pid = docIdOf(String(res?.name ?? ""));
+      if (pid) mirrorToPg(JARVIS_MEM, pid, body.fields);
       rememberQuietly(`${key}: ${value}`, "preference", "store_preference");
       return { ok: true, key };
     });
@@ -1560,8 +1593,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Log a correction to permanent memory", description: "Log a user correction so the mistake is never repeated.",
       inputSchema: { correction: z.string().trim().min(1).max(2000), context: z.string().trim().max(500).optional().default("") } },
     async ({ correction, context }) => {
-      await firestore(`/${EVO_LOGS}`, { method: "POST",
-        body: evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`) });
+      const body = evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`);
+      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+      const cid = docIdOf(String(res?.name ?? ""));
+      if (cid) mirrorToPg(EVO_LOGS, cid, body.fields);
       rememberQuietly(context ? `${correction} (context: ${context})` : correction, "correction", "log_correction");
       return { ok: true };
     });
@@ -1766,7 +1801,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Read Highway activity", description: "Read recent ACTIVITY feed entries, newest first.",
       inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const entries = (await queryPage(ACTIVITY, "ts", limit, ["by", "text", "ts"])).map((d) => {
+      let docs: Doc[];
+      if (pgStore && readsFromPg(ACTIVITY)) {
+        docs = (await pgStore.listNewest(ACTIVITY as StoreCollection, Math.min(Math.max(limit, 1), 100))).map(storeDocAsDoc);
+      } else {
+        docs = await queryPage(ACTIVITY, "ts", limit, ["by", "text", "ts"]);
+      }
+      const entries = docs.map((d) => {
         const f = d.fields ?? {};
         return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
       });
@@ -1779,7 +1820,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { limit: z.number().int().min(1).max(100).default(30), include_done: z.boolean().default(true) },
       readOnly: true },
     async ({ limit, include_done }) => {
-      let tasks = (await queryPage(TASKS, "ts", limit, ["text", "done", "createdBy", "assignee", "priority", "ts"])).map(fmtTask);
+      let tasks: ReturnType<typeof fmtTask>[];
+      if (pgStore && readsFromPg(TASKS)) {
+        tasks = (await pgStore.listNewest(TASKS as StoreCollection, Math.min(Math.max(limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
+      } else {
+        tasks = (await queryPage(TASKS, "ts", limit, ["text", "done", "createdBy", "assignee", "priority", "ts"])).map(fmtTask);
+      }
       if (!include_done) tasks = tasks.filter((t) => !t.done);
       return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
     });
@@ -1794,6 +1840,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         createdBy: { stringValue: name }, priority: { stringValue: priority }, ts: nowTs() };
       if (assignee) fields.assignee = { stringValue: assignee };
       const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
+      mirrorToPg(TASKS, docIdOf(data.name), fields);
       await notify(name, `started quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: docIdOf(data.name), text };
     });
@@ -1806,6 +1853,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const task = await findTask(task_id, title);
       if (!task) throw new UserError("task not found");
       await patchFields(TASKS, task.id, { done: { booleanValue: true } }, name);
+      mirrorToPg(TASKS, task.id, { ...task.fields, done: { booleanValue: true } });
       const text = str(task.fields.text);
       await notify(name, `completed quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text, done: true };
@@ -1824,6 +1872,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       if (assignee !== undefined) fields.assignee = { stringValue: assignee };
       if (!Object.keys(fields).length) throw new UserError("nothing to update");
       await patchFields(TASKS, task.id, fields, name);
+      mirrorToPg(TASKS, task.id, { ...task.fields, ...fields });
       const newText = text ?? str(task.fields.text);
       await notify(name, `updated quest: ${newText.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text: newText };
@@ -1836,6 +1885,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const task = await getTaskOrThrow(task_id);
       const text = str(task.fields.text);
       await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
+      removeFromPg(TASKS, task.id);
       await notify(name, `abandoned quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, deleted: true };
     });
@@ -1846,6 +1896,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, task_id, assignee }) => {
       const task = await getTaskOrThrow(task_id);
       await patchFields(TASKS, task.id, { assignee: { stringValue: assignee } }, name);
+      mirrorToPg(TASKS, task.id, { ...task.fields, assignee: { stringValue: assignee } });
       await notify(name, `assigned quest "${str(task.fields.text).slice(0, 120)}" to ${assignee}`, name);
       return { ok: true, id: task.id, assignee };
     });
@@ -1855,6 +1906,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Read the Highway grimoire", description: "Read the shared Highway notes page.",
       inputSchema: {}, readOnly: true },
     async () => {
+      if (pgStore && readsFromPg(NOTES)) {
+        const d = await pgStore.get(NOTES as StoreCollection, "shared");
+        const f = d?.fields;
+        if (!f) return { exists: false, content: "", updatedBy: null, ts: null };
+        return { exists: true, content: str(f.content), updatedBy: str(f.updatedBy), ts: tsOf(f.ts) };
+      }
       const doc = await getDocOrNull(NOTES, "shared");
       if (!doc?.fields) return { exists: false, content: "", updatedBy: null, ts: null };
       const f = doc.fields;
@@ -1865,8 +1922,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Overwrite the Highway grimoire", description: "Replace the entire shared notes page. Prefer append_note.",
       inputSchema: { name: nameSchema, content: z.string().max(20000) }, destructive: true },
     async ({ name, content }) => {
-      await patchFields(NOTES, "shared",
-        { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() }, name);
+      const fields: Fields = { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() };
+      await patchFields(NOTES, "shared", fields, name);
+      mirrorToPg(NOTES, "shared", fields);
       return { ok: true, updatedBy: name, chars: content.length };
     });
 
@@ -1875,11 +1933,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(5000) } },
     async ({ name, text }) => {
       let chars = 0;
-      await mutateDoc(NOTES, "shared", (current) => {
+      const finalFields = await mutateDoc(NOTES, "shared", (current) => {
         const content = (str(current?.content) + `\n\n— ${name} · ${new Date().toISOString()}\n${text}`).slice(-20000);
         chars = content.length;
         return { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() };
       }, name);
+      mirrorToPg(NOTES, "shared", finalFields);
       return { ok: true, updatedBy: name, chars };
     });
 
@@ -2043,6 +2102,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
         await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
       }
+      mirrorToPg(SYS_CONFIG, "hardware_relay_buffer", body.fields);
       return { status: "QUEUED_IN_BRAIN_STEM", device, zone, action };
     });
 
@@ -2119,6 +2179,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         ts: nowTs(),
       };
       const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields } });
+      mirrorToPg(TASKS, docIdOf(data.name), fields);
       return { queued: true, task_title: title, task_id: docIdOf(data.name), status: "pending_approval",
         note: "Awaiting sin's one-tap approval. Nothing was changed." };
     });
@@ -2154,6 +2215,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         decision: { nullValue: null },
       };
       await firestore(`/${APPROVALS}/${approvalId}`, { method: "PATCH", body: { fields } });
+      mirrorToPg(APPROVALS, approvalId, fields);
       return { approval_id: approvalId, status: "pending", expires_at: expires.toISOString() };
     });
 
@@ -2170,7 +2232,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       if (!allowed.includes(decided_by.toLowerCase())) {
         throw new UserError("Only sin or trey can resolve approvals");
       }
-      const doc = await getDocOrNull(APPROVALS, approval_id);
+      const doc = await getDocOrNullFlip(APPROVALS, approval_id);
       if (!doc) throw new UserError("Approval not found");
       const fields = (doc as any).fields || {};
       const status = fields.status?.stringValue;
@@ -2180,11 +2242,18 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const expiresAt = fields.expires_at?.timestampValue;
       if (expiresAt && new Date(expiresAt) < new Date()) {
         await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        mirrorToPg(APPROVALS, approval_id, { ...fields, status: { stringValue: "expired" } });
         return { approval_id, status: "expired", note: "Approval expired before decision" };
       }
       const newStatus = decision === "approve" ? "approved" : "denied";
       const now = new Date().toISOString();
       await patchFields(APPROVALS, approval_id, {
+        status: { stringValue: newStatus },
+        decided_by: { stringValue: decided_by },
+        decided_at: { timestampValue: now },
+        decision: { stringValue: decision },
+      });
+      mirrorToPg(APPROVALS, approval_id, { ...fields,
         status: { stringValue: newStatus },
         decided_by: { stringValue: decided_by },
         decided_at: { timestampValue: now },
@@ -2197,7 +2266,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Get approval status", description: "Check the current status of an approval request.",
       inputSchema: { approval_id: z.string().trim().min(1).max(50) }, readOnly: true },
     async ({ approval_id }) => {
-      const doc = await getDocOrNull(APPROVALS, approval_id);
+      const doc = await getDocOrNullFlip(APPROVALS, approval_id);
       if (!doc) throw new UserError("Approval not found");
       const fields = (doc as any).fields || {};
       // Auto-expire if past TTL
@@ -2205,6 +2274,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const expiresAt = fields.expires_at?.timestampValue;
       if (status === "pending" && expiresAt && new Date(expiresAt) < new Date()) {
         await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        mirrorToPg(APPROVALS, approval_id, { ...fields, status: { stringValue: "expired" } });
         return { approval_id, status: "expired" };
       }
       return {
@@ -2251,7 +2321,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Track tool telemetry", description: "Log tool latency/success to evolution_logs. The Reflection Engine's nervous system.",
       inputSchema: { tool_name: z.string().trim().min(1).max(100), latency_ms: z.number().min(0), success: z.boolean(), error: z.string().trim().max(500).optional().default("") } },
     async ({ tool_name, latency_ms, success, error }) => {
-      await firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(tool_name, latency_ms, success, error) });
+      const body = telemetryDoc(tool_name, latency_ms, success, error);
+      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+      const tid = docIdOf(String(res?.name ?? ""));
+      if (tid) mirrorToPg(EVO_LOGS, tid, body.fields);
       return { logged: true, tool_name };
     });
 
@@ -2736,8 +2809,17 @@ const NEWS_FEED_CAP = 24; // 6 curated + 6 macro + 6 social + 3 crypto + 3 marke
 // curatedRead is the allowlisted system GET of /system_config/crew_curated.
 async function curatedNews(): Promise<NewsItem[]> {
   try {
-    const doc = await runAsSystem("curatedRead", () =>
-      firestore(CURATED_DOC, { method: "GET" })) as Doc;
+    let doc: Doc | null = null;
+    if (pgStore && readsFromPg(SYS_CONFIG) && isStoreCollection(SYS_CONFIG)) {
+      try {
+        const d = await pgStore.get(SYS_CONFIG, "crew_curated");
+        if (d) doc = storeDocAsDoc(d);
+      } catch { doc = null; }
+    }
+    if (!doc) {
+      doc = await runAsSystem("curatedRead", () =>
+        firestore(CURATED_DOC, { method: "GET" })) as Doc;
+    }
     return itemsFromDocFields(doc?.fields, Date.now());
   } catch (e) {
     if (is404(e)) return [];
@@ -2847,6 +2929,8 @@ async function updateRegistry(mutate: (reg: Registry) => Registry): Promise<Regi
     next = mutate(parseRegistry(str(cur?.skills)));
     return { skills: { stringValue: JSON.stringify(next) }, tsNum: nowNum() };
   });
+  const regDoc = await getDocOrNull(SYS_CONFIG, SKILL_DOC);
+  if (regDoc?.fields) mirrorToPg(SYS_CONFIG, SKILL_DOC, regDoc.fields);
   _skills = { at: Date.now(), specs: activeSkills(next, SKILLS_KEY, new Set()) };
   return next;
 }
@@ -3007,7 +3091,7 @@ const siteApi = createSiteApi({
     };
     let messages;
     if (pgStore && readsFromPg(coll)) {
-      const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100));
+      const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
       messages = docs.map((d) => enrich(storeDocAsDoc(d)));
     } else {
       let docs = await queryPage(coll, "tsNum", q.limit);
@@ -3022,9 +3106,14 @@ const siteApi = createSiteApi({
     return { count: messages.length, messages, newest_ts: messages[0]?.ts ?? null };
   },
   async readTasks(q) {
-    let tasks = (await queryPage(TASKS, "ts", q.limit)).map(fmtTask);
-    if (!q.include_done) tasks = tasks.filter((t: { done: boolean }) => !t.done);
-    return { count: tasks.length, open: tasks.filter((t: { done: boolean }) => !t.done).length, tasks };
+    let tasks: ReturnType<typeof fmtTask>[];
+    if (pgStore && readsFromPg(TASKS)) {
+      tasks = (await pgStore.listNewest(TASKS as StoreCollection, Math.min(Math.max(q.limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
+    } else {
+      tasks = (await queryPage(TASKS, "ts", q.limit)).map(fmtTask);
+    }
+    if (!q.include_done) tasks = tasks.filter((t) => !t.done);
+    return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
   },
   async readPresence() {
     return (await queryPage(PRESENCE, "ts", 80)).map((d) => {
@@ -3217,11 +3306,21 @@ process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); 
 // (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
 // PHASE3_TEST is set so imports don't bind a port or arm timers.
 if (!process.env.PHASE3_TEST) {
+setMirrorFailureHandler((scope, err) => recordFailure(scope, err));
 if ((dualWriteEnabled() || readPgCollections().size) && pgTargets().length) {
   connectPostgres().then((conn) => {
     pgStore = createPostgresStore(conn.pool, dbSchema());
     pgHost = conn.host;
+    setMirrorStore(pgStore);
   }).catch((e) => recordFailure("pg_store_start", e));
+}
+// C3: pg_listen requires a session-mode Postgres connection. If DATABASE_URL
+// points at Supabase's transaction-mode pooler (:6543), LISTEN/NOTIFY breaks
+// and SSE realtime degrades silently — use :5432 (session-mode pooler) instead.
+for (const t of pgTargets()) {
+  if (t.url.includes(":6543")) {
+    console.warn(`pg_listen: WARNING url contains :6543 (via=${t.source}) — pg_listen requires session-mode pooler (:5432). Port 6543 breaks realtime.`);
+  }
 }
 const listenTargets = pgTargets();
 if (listenTargets.length) {
