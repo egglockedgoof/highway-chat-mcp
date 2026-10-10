@@ -171,18 +171,28 @@ function tool(
   );
 }
 
+// ts is mixed stringValue/timestampValue/integerValue in highway_messages.
+// Firestore orders by type first, so orderBy=ts DESC is unreliable.
+// Fetch a wide page and sort client-side by parsed wall-clock time. (AGENTS.md)
+function docTs(d: any): number {
+  const f = d?.fields ?? {};
+  return tsOf(f.tsNum) ?? tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : 0);
+}
+
 async function queryNewest(collectionId: string, limit: number): Promise<any[]> {
+  const fetchN = Math.min(Math.max(limit * 4, 50), 400);
   const data = await firestore(`:runQuery`, {
     method: "POST",
     body: {
       structuredQuery: {
         from: [{ collectionId }],
         orderBy: [{ field: { fieldPath: "ts" }, direction: "DESCENDING" }],
-        limit,
+        limit: fetchN,
       },
     },
   });
-  return (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
+  const docs = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
+  return docs.sort((a, b) => docTs(b) - docTs(a)).slice(0, limit);
 }
 
 async function fetchWithTimeout(url: string, as: "json" | "text", timeoutMs = 12000): Promise<any> {
@@ -332,6 +342,13 @@ tool(server, "read_messages",
         ts: tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null),
       };
       if (attachments.length > 0) msg.attachments = attachments;
+      // Voice messages: UI stores inline audio (base64) + audioType, not in attachments.
+      const audio = str(f.audio);
+      if (audio) {
+        msg.audio = audio;
+        msg.audioType = str(f.audioType) || "audio/webm";
+        msg.audioBytes = Math.floor(audio.length * 3 / 4); // approx decoded size
+      }
       return msg;
     });
     return { count: messages.length, messages };
