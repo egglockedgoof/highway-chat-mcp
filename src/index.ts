@@ -2,7 +2,8 @@
  * MarrowSystemZ — The last system the world will need.
  * (Founding vow preserved verbatim — see MARROW_CORE.md)
  *
- * THE PROTOCOL OF THE UNREAL — pass 3, core re-architecture. 50 tools.
+ * THE PROTOCOL OF THE UNREAL — pass 3, core re-architecture. 63 core tools
+ * (see src/tool-surface.ts). Dynamic skill_* tools sit on top.
  *  - One McpServer + transport per request (the shared instance 500'd every overlapping call).
  *  - One HTTP primitive: whole-lifecycle timeout, byte cap, redirect control.
  *  - SSRF guard on every caller-supplied URL.
@@ -20,6 +21,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
+import { bindClientSend, gateSendMessageRpc } from "./tool-surface.js";
 import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
@@ -1225,6 +1227,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
       } },
     async ({ name, text, channel, reply_to, routed_to, idempotency_key, attachments }) => {
+      try {
+        bindClientSend({ name, text, channel, reply_to, routed_to, idempotency_key });
+      } catch (e) {
+        throw new UserError(errMsg(e));
+      }
       // Phase 3 Section D: Dispatch lock enforcement
       let lockCheck: LockCheck | null = null;
       if (reply_to) {
@@ -3096,6 +3103,19 @@ app.get("/api/stream", (req, res) => { void siteApi.stream(req, res); });
 const jsonRpcError = (code: number, message: string) => ({ jsonrpc: "2.0", error: { code, message }, id: null });
 
 async function handleMcp(req: Request, res: Response): Promise<void> {
+  // Fail closed on stale send_message shapes before Zod strips unknown keys.
+  const stale = gateSendMessageRpc(req.body);
+  if (stale) {
+    const id = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? (req.body as { id?: unknown }).id ?? null
+      : null;
+    res.status(200).json({
+      jsonrpc: "2.0",
+      id,
+      result: { isError: true, content: [{ type: "text", text: `send_message failed: ${stale}` }] },
+    });
+    return;
+  }
   const server = buildServer(await loadSkills());
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on("close", () => {

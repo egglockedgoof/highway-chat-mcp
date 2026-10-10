@@ -27,6 +27,10 @@ npm test
 
 `src/store/` is a Firestore + Postgres adapter behind `STORE_BACKEND` (default `firestore`). Live Highway still uses the existing Firestore REST path. Do not set `STORE_BACKEND=postgres` or `STORE_DUAL_WRITE=1` on Render until dual-write is proven for one collection. `DATABASE_URL` / `DATABASE_URL_FALLBACK` are optional; CI runs `migrations/` against a Postgres service container (`DB_SCHEMA=highway`). Nightly `pg_dump` skips until the `DATABASE_URL` GitHub Actions secret is set (this agent cannot write repo secrets). `GET /health` includes `db` (`ok` | `down` | `disabled`) from a background probe; a down database never changes the HTTP status (Render health checks stay 200).
 
+## Client surface
+
+Canonical core tool list: `src/tool-surface.ts` (`CORE_TOOLS`). `tools/list` returns those names plus any live `skill_*` tools. Grok/xAI app caches that still describe a ~26-tool subset are stale — re-import from live `tools/list` after this ships. `rook` and `ember` `send_message` calls must include `idempotency_key` (and `reply_to` when threading); old-shape `{name, text}` from those two fails closed. Other bots may still omit those fields.
+
 ## Environment variables
 
 Set production values in the Render dashboard (see `render.yaml`). Locally, copy `.env.example` to `.env`. **No real secrets belong in git.**
