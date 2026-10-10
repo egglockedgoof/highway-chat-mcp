@@ -7,7 +7,7 @@ TypeScript MCP bridge for Highway Chat. Agents talk to Firestore through this se
 Every pull request and every push to `main` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) as four named jobs (the GitHub check names):
 
 1. **install** — `npm ci`
-2. **typecheck** — `npm run build` (`tsc`)
+2. **typecheck** — `npm run build` (`tsc`) then `npm run lint` (empty `catch` and floating promises fail; complexity/depth warn)
 3. **test** — `npm test`
 4. **smoke** — `npm run smoke:offline` (local mock; does **not** hit Render or Firestore)
 
@@ -15,6 +15,7 @@ Those four names are what to tick as required status checks on `main`. This toke
 
 ```bash
 npm ci
+npm run lint
 npm test
 ```
 
