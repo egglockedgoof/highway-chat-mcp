@@ -22,7 +22,8 @@ import { z } from "zod";
 import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
 import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
-  createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, validateCallerConfig,
+  createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
+  validateCallerConfig,
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
 // ============ FAIL-CLOSED ENV ============
@@ -96,15 +97,9 @@ type Doc = { name: string; fields?: Fields; createTime?: string; updateTime?: st
 // ============ ERRORS ============
 /** Expected, caller-fixable failure (bad input, not found, not the author). Never written to telemetry. */
 class UserError extends Error {}
-export class FirestoreError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string, message: string) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
+// Every Firestore call goes through sec.firestore, which throws security.ts's FirestoreError.
+// A second class here would make every `instanceof FirestoreError` check below silently false.
+export { FirestoreError };
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 // ============ CREDENTIALS (parsed once) ============
