@@ -2671,14 +2671,13 @@ function brainAuthor(claimed?: string): { author: string; verified: boolean } {
 
 /** Posted identity: header-bound callers write as their token's bot, never the claimed name. */
 export function postedName(claimed: string): string {
+  const name = typeof claimed === "string" ? claimed.trim() : "";
+  if (!name) throw new UserError("name is required");
   const ctx = reqCtx.getStore();
-  if (ctx?.method === "header_bound" && ctx.bot) {
-    if (claimed && normalizeBotName(claimed) !== normalizeBotName(ctx.bot)) {
-      throw new UserError(`caller "${ctx.bot}" cannot mint for "${claimed}"`);
-    }
-    return ctx.bot;
-  }
-  return claimed;
+  if (ctx?.method !== "header_bound" || !ctx.bot) return name;
+  if (normalizeBotName(name) === normalizeBotName(ctx.bot)) return ctx.bot;
+  sec.telemetry.recordCount("identity_mismatch");
+  throw new UserError(`caller "${ctx.bot}" cannot mint for "${name}"`);
 }
 
 async function remember(text: string, kind: MemoryKind, source: string, o: { name?: string; tags?: string[]; id?: string } = {}) {
