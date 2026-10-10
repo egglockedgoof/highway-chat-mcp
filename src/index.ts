@@ -2989,26 +2989,25 @@ function validateAttachment(att: { mime_type: string; size_bytes: number; storag
 }
 
 /**
- * Verify an end-user Firebase ID token (widget clients). Returns the
- * Firebase user or null. Used by POST /upload — the widget is a
- * Firebase-authenticated client, not an MCP bot.
+ * Verify a REST API bearer token (Supabase era, 2026-10-10). Accepts:
+ * - MCP_CALLERS tokens (token -> bot name, same as the MCP endpoint)
+ * - WIDGET_TOKEN (dedicated secret for the widget frontend)
+ * Returns {localId, email?} or null. Replaces verifyFirebaseIdToken —
+ * the bridge no longer calls identitytoolkit for REST auth.
  */
-async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string; email?: string } | null> {
-  try {
-    const r = await http(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) },
-      EXT_TIMEOUT);
-    if (!r.ok) return null;
-    const u = parseJson(r.body)?.users?.[0];
-    return u?.localId ? { localId: u.localId, email: u.email } : null;
-  } catch {
-    return null;
-  }
+async function verifyRestToken(token: string): Promise<{ localId: string; email?: string } | null> {
+  const bot = AUTH_CONFIG.mcpCallers[token];
+  if (bot) return { localId: `mcp:${normalizeBotName(bot)}` };
+  const widgetToken = process.env.WIDGET_TOKEN;
+  if (widgetToken && token === widgetToken) return { localId: 'widget' };
+  return null;
 }
 
-// Firebase Auth allows open email signup, so a valid ID token proves nothing about team
-// membership. Fails closed: an unset or empty UPLOAD_ALLOWED_EMAILS refuses every upload.
+// A bearer token proves nothing about team membership on its own —
+// MCP_CALLERS binds tokens to bot identities, and WIDGET_TOKEN is a secret
+// capability. Fails closed: an unset or empty UPLOAD_ALLOWED_EMAILS refuses
+// email-based uploads; the widget token bypasses the email check by design
+// (possession of the secret IS the authorization).
 // Parsed at call time so tests (and a Render env change + restart) share one function.
 export function parseUploadAllowlist(raw: string | undefined): Set<string> {
   return new Set((raw ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
@@ -3074,7 +3073,7 @@ async function uploadAttachmentData(input: {
 const siteBus = createSiteBus();
 let pgListenUp = false;
 const siteApi = createSiteApi({
-  verifyToken: verifyFirebaseIdToken,
+  verifyToken: verifyRestToken,
   async readMessages(q) {
     const coll = channelCollection(q.channel);
     const enrich = (d: Doc) => {
@@ -3172,9 +3171,11 @@ app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: R
   try {
     const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
     if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
-    const who = await verifyFirebaseIdToken(m[1]);
+    const who = await verifyRestToken(m[1]);
     if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
-    if (!uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
+    // Widget token is a capability (possession = authorization); bot tokens
+    // still gate on the email allowlist.
+    if (who.localId !== 'widget' && !uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
     const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
     const att = await uploadAttachmentData({
       filename: typeof filename === "string" ? filename : "",
@@ -3221,7 +3222,7 @@ app.post("/metrics/reads", async (req: Request, res: Response) => {
   const tab = typeof req.body?.tab === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(req.body.tab) ? req.body.tab : null;
   const counts = parseReport(req.body);
   if (!tab || !counts) { res.status(400).json({ ok: false, error: "expected { tab, counts: { source: integer } }" }); return; }
-  const who = await verifyFirebaseIdToken(m[1]);
+  const who = await verifyRestToken(m[1]);
   if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
   if (!clientMeter.record(`${who.localId}:${tab}`, counts)) { res.status(429).json({ ok: false, error: "report at most once a minute" }); return; }
   res.json({ ok: true });
