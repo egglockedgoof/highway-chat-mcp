@@ -1,26 +1,31 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // CONSOLE MIRROR — do not deploy this file over Firebase.
+    // Live rules live in the console. This copy is reconstructed: PR #19 read
+    // surface + the 1:00 AM PT 2026-10-10 console additions. Firebase CLI was
+    // not authenticated here, so the system uid is a sentinel, not the live
+    // value. Diff against the console before any publish.
+
     function signedIn() {
       return request.auth != null;
     }
-
-    // CI snapshot of READ coverage for the MCP bridge.
-    // NOT a drop-in publish over the Firebase console.
-    // Console write allowlists (email/uid on highway_messages, dispatch_locks,
-    // etc.) stay there. Do not replace live writes with this file.
-    //
-    // To fix a denied read: paste the matching `match /{collection}` block
-    // into the console WITHOUT changing existing `allow write` / `allow create`
-    // on highway_messages.
+    function signedInNonAnon() {
+      return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+    function isBridgeSystem() {
+      // Live: BOT_CREDENTIALS.system Auth uid. Paste from console before publish.
+      return signedInNonAnon() && request.auth.uid == 'PASTE_LIVE_SYSTEM_UID';
+    }
 
     match /highway_messages/{id} {
       allow read: if signedIn();
+      allow create: if signedInNonAnon();
     }
-    // FIX: no match in live rules → 403 on channel "code" (PR #4).
-    // When pasting to console, copy highway_messages WRITE as well.
+    // 1:00 AM: read + create, same as highway_messages.
     match /highway_code/{id} {
       allow read: if signedIn();
+      allow create: if signedInNonAnon();
     }
     match /highway_dm/{id} {
       allow read: if signedIn();
@@ -43,16 +48,20 @@ service cloud.firestore {
     match /jarvis_memory/{id} {
       allow read: if signedIn();
     }
+    // Includes crew_curated (curated news doc). Write allowlist stays on the console.
     match /system_config/{id} {
       allow read: if signedIn();
     }
-    // GET is required: checkDispatchLock fail-closes on permission denied,
-    // which would block every threaded reply.
+    // 1:00 AM: signed-in non-anonymous read/write.
     match /dispatch_locks/{id} {
-      allow read: if signedIn();
+      allow read, write: if signedInNonAnon();
     }
     match /approval_requests/{id} {
       allow read: if signedIn();
+    }
+    // 1:00 AM: bridge system uid only.
+    match /security_telemetry/{docId} {
+      allow read, write: if isBridgeSystem();
     }
   }
 }

@@ -14,6 +14,7 @@ export const BRIDGE_READ_COLLECTIONS = [
   "system_config",
   "dispatch_locks",
   "approval_requests",
+  "security_telemetry",
 ] as const;
 
 export type BridgeReadCollection = (typeof BRIDGE_READ_COLLECTIONS)[number];
