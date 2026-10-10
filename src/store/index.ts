@@ -11,9 +11,9 @@ export { createFirestoreStore } from "./firestore.js";
 export {
   createPostgresStore, postgresPool, connectPostgres, probeDb, currentDbHealth,
   startDbProbe, stopDbProbe, dbHostOf, pgTargets, dbSchema, POOL_MAX,
-  countCollection, listSampleDocs,
+  countCollection, listSampleDocs, stripSslMode, isSupabaseHost, pgSsl, pgClientOpts,
 } from "./postgres.js";
-export type { DbHealth, PgSource } from "./postgres.js";
+export type { DbHealth, PgSource, PgSsl } from "./postgres.js";
 export { backfillStatus, startMessagesBackfill, backfillEnabled } from "./boot-backfill.js";
 export type { BackfillPublic } from "./boot-backfill.js";
 

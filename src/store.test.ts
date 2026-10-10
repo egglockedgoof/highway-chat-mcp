@@ -4,7 +4,8 @@ import { FirestoreError } from "../dist/security.js";
 import type { Store, StoreCollection, StoreDoc, StoreFields } from "../dist/store/types.js";
 
 const { createFirestoreStore } = await import("../dist/store/firestore.js");
-const { createPostgresStore, postgresPool, dbSchema, dbHostOf, pgTargets, probeDb, currentDbHealth, POOL_MAX } =
+const { createPostgresStore, postgresPool, dbSchema, dbHostOf, pgTargets, probeDb, currentDbHealth, POOL_MAX,
+  stripSslMode, isSupabaseHost, pgSsl, pgClientOpts } =
   await import("../dist/store/postgres.js");
 const { createStore, createDualWriteStore, dualWriteEnabled, storeBackend, readPgCollections, readsFromPg } = await import("../dist/store/index.js");
 
@@ -102,6 +103,21 @@ test("dbSchema, hosts, pool, probe, health", async () => {
   assert.equal(POOL_MAX, 5);
   assert.equal(await probeDb({}), "disabled");
   assert.equal(currentDbHealth(), "disabled");
+});
+
+test("strip sslmode; supabase host gets TLS without verify unless PG_SSL_CA", () => {
+  assert.equal(stripSslMode("postgres://u:p@h/db?sslmode=require"), "postgres://u:p@h/db");
+  assert.equal(stripSslMode("postgres://u:p@h/db?sslmode=require&foo=1"), "postgres://u:p@h/db?foo=1");
+  assert.equal(isSupabaseHost("aws-0-us-west-1.pooler.supabase.com"), true);
+  assert.equal(isSupabaseHost("db.wxqzwicmxdrqoutwyvss.supabase.co"), true);
+  assert.equal(isSupabaseHost("localhost"), false);
+  const sb = "postgres://u:p@aws-0-us-west-1.pooler.supabase.com:5432/postgres?sslmode=require";
+  assert.deepEqual(pgSsl(sb, {}), { rejectUnauthorized: false });
+  assert.deepEqual(pgSsl("postgres://u:p@localhost:5432/highway", {}), false);
+  assert.deepEqual(pgSsl(sb, { PG_SSL_CA: "-----BEGIN CERT-----" }), { rejectUnauthorized: true, ca: "-----BEGIN CERT-----" });
+  const opts = pgClientOpts(sb);
+  assert.equal(opts.connectionString.includes("sslmode"), false);
+  assert.deepEqual(opts.ssl, { rejectUnauthorized: false });
 });
 
 function memStore(): Store {

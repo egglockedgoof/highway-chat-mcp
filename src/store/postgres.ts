@@ -9,12 +9,15 @@ type SqlPool = {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: DocRow[]; rowCount: number | null }>;
   end: () => Promise<void>;
 };
+export type PgSsl = false | { rejectUnauthorized: boolean; ca?: string };
+
 const { Pool } = createRequire(import.meta.url)("pg") as {
   Pool: new (opts: {
     connectionString: string;
     max?: number;
     connectionTimeoutMillis?: number;
     options?: string;
+    ssl?: PgSsl;
   }) => SqlPool;
 };
 
@@ -39,6 +42,43 @@ export function dbHostOf(url: string): string {
   }
 }
 
+/** Drop sslmode/ssl query params so they cannot override the explicit ssl object. */
+export function stripSslMode(url: string): string {
+  const q = url.indexOf("?");
+  if (q < 0) return url;
+  const params = new URLSearchParams(url.slice(q + 1));
+  params.delete("sslmode");
+  params.delete("ssl");
+  const qs = params.toString();
+  return qs ? `${url.slice(0, q)}?${qs}` : url.slice(0, q);
+}
+
+export function isSupabaseHost(host: string): boolean {
+  return /(^|\.)supabase\.(co|com)$/i.test(host);
+}
+
+/**
+ * Localhost: no TLS (CI). Supabase pooler: TLS on, verify off unless PG_SSL_CA
+ * is set (their chain trips Node: "self-signed certificate in certificate chain").
+ */
+export function pgSsl(url: string, env: NodeJS.ProcessEnv = process.env): PgSsl {
+  const host = dbHostOf(url);
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return false;
+  const ca = env.PG_SSL_CA?.trim();
+  if (ca) return { rejectUnauthorized: true, ca };
+  if (isSupabaseHost(host)) return { rejectUnauthorized: false };
+  return false;
+}
+
+export function pgClientOpts(url: string, env: NodeJS.ProcessEnv = process.env): {
+  connectionString: string;
+  ssl?: Exclude<PgSsl, false>;
+} {
+  const connectionString = stripSslMode(url);
+  const ssl = pgSsl(connectionString, env);
+  return ssl ? { connectionString, ssl } : { connectionString };
+}
+
 export function pgTargets(env: NodeJS.ProcessEnv = process.env): Array<{ source: PgSource; host: string; url: string }> {
   const out: Array<{ source: PgSource; host: string; url: string }> = [];
   const primary = env.DATABASE_URL?.trim();
@@ -53,7 +93,7 @@ export function pgTargets(env: NodeJS.ProcessEnv = process.env): Array<{ source:
 export function postgresPool(url: string, schema = DEFAULT_SCHEMA): SqlPool {
   const s = dbSchema({ DB_SCHEMA: schema });
   return new Pool({
-    connectionString: url,
+    ...pgClientOpts(url),
     max: POOL_MAX,
     connectionTimeoutMillis: 4000,
     options: `-c search_path=${s}`,

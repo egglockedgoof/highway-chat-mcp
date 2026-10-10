@@ -8,6 +8,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { pgClientOpts } from "../src/store/postgres.ts";
 
 function schemaOf(): string {
   const s = (process.env.DB_SCHEMA ?? "highway").trim() || "highway";
@@ -45,7 +46,7 @@ const files = readdirSync(dir).filter((f) => /^\d+_.*\.sql$/.test(f)).sort();
 let client: pg.Client | null = null;
 let last: unknown;
 for (const t of list) {
-  const c = new pg.Client({ connectionString: t.url, connectionTimeoutMillis: 4000 });
+  const c = new pg.Client({ ...pgClientOpts(t.url), connectionTimeoutMillis: 4000 });
   try {
     await c.connect();
     console.log(`migrate: connected host=${t.host} via=${t.source}`);

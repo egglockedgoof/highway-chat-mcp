@@ -33,7 +33,7 @@ import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createUsageMeter } from "./usage.js";
 import {
   currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema,
-  dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
+  dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg, pgClientOpts,
   backfillStatus, startMessagesBackfill,
   type Store, type StoreCollection, type StoreDoc,
 } from "./store/index.js";
@@ -3231,7 +3231,7 @@ if (listenTargets.length) {
       try {
         await startPgListen({
           url: t.url,
-          connect: (url) => new Client({ connectionString: url }),
+          connect: (url) => new Client(pgClientOpts(url)),
           onPayload: (raw) => {
             const ev = parseNotifyPayload(raw);
             if (ev) siteBus.publish(ev);
