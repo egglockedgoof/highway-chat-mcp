@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "test": "tsc && node --experimental-strip-types --no-warnings --test src/*.test.ts",
     "smoke": "node --experimental-strip-types --no-warnings scripts/smoke.ts",
-    "smoke:offline": "SMOKE_OFFLINE=1 node --experimental-strip-types --no-warnings scripts/smoke.ts"
+    "smoke:offline": "SMOKE_OFFLINE=1 node --experimental-strip-types --no-warnings scripts/smoke.ts",
+    "lint": "eslint . --max-warnings 9999"
   },
   "engines": {
     "node": ">=20"
@@ -23,6 +24,8 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
-    "typescript": "^5.5.0"
+    "eslint": "^10.12.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.71.1"
   }
 }
