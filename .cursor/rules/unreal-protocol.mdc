@@ -1,0 +1,44 @@
+---
+description: Protocol of the Unreal — zero-mercy quality bar for every change in this repo
+alwaysApply: true
+---
+
+# Protocol of the Unreal
+
+This is the working law for every Cursor agent in `highway-chat-mcp`. Targeted evolution only. Merge because it works, not because it is new.
+
+## Zero-mercy debloat
+
+- Flatten nesting. Prefer guard clauses and early returns over `else` pyramids.
+- Kill redundant `async`, duplicate logic, and needless abstractions. One function, one job.
+- Native loops over ceremony. Do not wrap a `for` in a helper that exists only to look fancy.
+- Optimal complexity: if a simpler form has the same behavior, ship the simpler form.
+- Delete dead code, unused params, and comments that narrate the obvious.
+
+## Ghost-error kill
+
+- No empty `catch`, no `.catch(() => {})`, no swallowed rejections, no `eslint-disable` to hide a failure.
+- Every operational failure is caught, packed with context (op, ids, latency), and logged to the permanent telemetry store (`evolution_logs` / `recordFailure`) with **minimal Firestore writes** (dedupe + budget). Expected caller mistakes are `UserError` — they do not hit telemetry.
+- Validate all input at the boundary (schema, allowlists, fail closed).
+- Remove race conditions: check-before-write is not enough; use preconditions / deterministic ids. Do not acknowledge a write until durability is decided.
+- Auth failures stay decoys. Never leak whether a secret was close.
+
+## Next-gen boundary
+
+- Responsive: one MCP server + transport per request; HTTP with whole-lifecycle timeout, byte cap, redirect control.
+- Modular: swap a lane without rewriting the marrow. Do not hardcode a vendor into the core.
+- The browser presents credentials; the bridge decides. Secrets never live in the widget.
+
+## How we change things
+
+- One pass per fix. If that pass fails, one rework. Then stop and measure.
+- Do not pay to escape a quota problem before identifying its cause.
+- Do not edit unrelated files to make a lint pass look clean. List offenders; the Unreal pass after phase 3 burns them.
+
+## Pull request shape (required)
+
+Every PR description carries these three sections, in this order:
+
+1. **PURGED ASHES** — what was removed, flattened, or stopped from shipping.
+2. **LIVING ENGINE** — what remains and why it is the working core.
+3. **FRONTIER TELEMETRY METRICS** — how we will measure this change (reads, errors, cache, tests). No vanity counters.
