@@ -3147,7 +3147,7 @@ if (listenTargets.length) {
       try {
         await startPgListen({
           url: t.url,
-          connect: (url) => new Client({ connectionString: url, connectionTimeoutMillis: 4000 }),
+          connect: (url) => new Client({ connectionString: url }),
           onPayload: (raw) => {
             const ev = parseNotifyPayload(raw);
             if (ev) siteBus.publish(ev);

@@ -1,8 +1,22 @@
-import pg from "pg";
+import { createRequire } from "node:module";
 import {
   type Store, type StoreCollection, type StoreDoc, type StoreFields,
   newId, tsNumOf,
 } from "./types.js";
+
+type DocRow = { id: string; fields: StoreFields; ts_num: string | number | null };
+type SqlPool = {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: DocRow[]; rowCount: number | null }>;
+  end: () => Promise<void>;
+};
+const { Pool } = createRequire(import.meta.url)("pg") as {
+  Pool: new (opts: {
+    connectionString: string;
+    max?: number;
+    connectionTimeoutMillis?: number;
+    options?: string;
+  }) => SqlPool;
+};
 
 export const POOL_MAX = 5;
 const DEFAULT_SCHEMA = "highway";
@@ -36,9 +50,9 @@ export function pgTargets(env: NodeJS.ProcessEnv = process.env): Array<{ source:
   return out;
 }
 
-export function postgresPool(url: string, schema = DEFAULT_SCHEMA): pg.Pool {
+export function postgresPool(url: string, schema = DEFAULT_SCHEMA): SqlPool {
   const s = dbSchema({ DB_SCHEMA: schema });
-  return new pg.Pool({
+  return new Pool({
     connectionString: url,
     max: POOL_MAX,
     connectionTimeoutMillis: 4000,
@@ -46,7 +60,7 @@ export function postgresPool(url: string, schema = DEFAULT_SCHEMA): pg.Pool {
   });
 }
 
-export type PgConnect = { pool: pg.Pool; host: string; source: PgSource };
+export type PgConnect = { pool: SqlPool; host: string; source: PgSource };
 
 /** Try DATABASE_URL then DATABASE_URL_FALLBACK. Logs host only. */
 export async function connectPostgres(env: NodeJS.ProcessEnv = process.env): Promise<PgConnect> {
@@ -115,14 +129,14 @@ export function stopDbProbe(): void {
   }
 }
 
-function row(collection: StoreCollection, r: { id: string; fields: StoreFields; ts_num: string | number | null }): StoreDoc {
+function row(collection: StoreCollection, r: DocRow): StoreDoc {
   const fields = r.fields ?? {};
   const tsNum = r.ts_num !== null && r.ts_num !== undefined ? Number(r.ts_num) : tsNumOf(fields);
   return { id: r.id, collection, fields, tsNum: Number.isFinite(tsNum as number) ? (tsNum as number) : null };
 }
 
 /** Plain `pg` + DATABASE_URL. Tables live in schema `highway`. No Supabase SDK. */
-export function createPostgresStore(pool: pg.Pool, schema = DEFAULT_SCHEMA): Store {
+export function createPostgresStore(pool: SqlPool, schema = DEFAULT_SCHEMA): Store {
   const docs = `${dbSchema({ DB_SCHEMA: schema })}.docs`;
   return {
     async get(collection, id) {

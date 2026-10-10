@@ -6,20 +6,13 @@ TypeScript MCP bridge for Highway Chat. Agents talk to Firestore through this se
 
 Every pull request and every push to `main` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) as three named jobs (the GitHub check names):
 
-<<<<<<< HEAD
 1. **install** — `npm ci`
 2. **typecheck** — `npm run build` (same compile as Render: emits `dist/`, not `tsc --noEmit`)
-3. **test** — `npm test`
+3. **test** — migrate against CI Postgres (`DB_SCHEMA=highway`), then `npm test`
 
 Tick those three as required status checks on `main`, and enable **Require branches to be up to date before merging**. Enable a merge queue if the repo allows it. This token is not admin, so it cannot set protection or a merge queue.
 
 `render.yaml` sets `autoDeployTrigger: checksPass` so Render deploys `highway-chat-mcp` only after Git checks pass on `main`. If the live service is not Blueprint-synced, set the same in the Render dashboard.
-=======
-1. **Install** — `npm ci`
-2. **Migrate** — `npm run migrate` against the CI Postgres service (`DB_SCHEMA=highway`)
-3. **Typecheck** — `npm run build` (`tsc`)
-4. **Test** — `npm test` (`tsc` again, then `src/*.test.ts`)
->>>>>>> 112a8bd (Qualify Postgres store on schema highway with URL fallback)
 
 That is the review gate. It does not hit live Firestore or Render.
 
