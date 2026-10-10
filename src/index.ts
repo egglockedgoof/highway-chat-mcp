@@ -35,7 +35,7 @@ import {
   currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema, probeDb,
   dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
   backfillStatus, startMessagesBackfill,
-  type Store, type StoreCollection, type StoreDoc,
+  type Store, type StoreCollection, type StoreDoc, type StoreFields,
 } from "./store/index.js";
 import { mirrorToPg, removeFromPg, setMirrorStore, setMirrorFailureHandler } from "./store/mirror.js";
 import {
@@ -804,6 +804,10 @@ function recordFailure(scope: string, err: unknown, latencyMs = 0): void {
   // REV 19: runs as the 'recordFailure' system op — works outside request context.
   runAsSystem('recordFailure', () => {
     const body = telemetryDoc(scope, latencyMs, false, msg);
+    if (pgStore && readsFromPg(EVO_LOGS)) {
+      return pgStore.create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId())
+        .catch((e: unknown) => console.error(`[fail] pg telemetry write for ${scope} failed: ${errMsg(e)}`));
+    }
     return firestore(`/${EVO_LOGS}`, { method: "POST", body })
       .then((res) => { const id = docIdOf(String(res?.name ?? "")); if (id) mirrorToPg(EVO_LOGS, id, body.fields); });
   }).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
@@ -954,14 +958,15 @@ async function mutateDoc(
   forName?: string
 ): Promise<Fields> {
   if (pgStore && readsFromPg(collectionId)) {
-    const cur = await pgStore.get(collectionId as StoreCollection, docId);
-    const patch = mutate(cur?.fields ? storeFieldsToFields(cur.fields) : null);
-    if (cur) {
+    const curDoc = await pgStore.get(collectionId as StoreCollection, docId);
+    const curFields = curDoc ? (storeDocAsDoc(curDoc).fields as Fields) : null;
+    const patch = mutate(curFields);
+    if (curDoc) {
       await pgStore.patch(collectionId as StoreCollection, docId, patch as StoreFields);
     } else {
       await pgStore.create(collectionId as StoreCollection, patch as StoreFields, docId);
     }
-    return { ...((cur?.fields ? storeFieldsToFields(cur.fields) : {}) as Fields), ...patch } as Fields;
+    return { ...(curFields ?? {}), ...patch } as Fields;
   }
   for (let attempt = 0; ; attempt++) {
     const cur = await getDocOrNull(collectionId, docId, forName);
@@ -996,6 +1001,10 @@ function encodeReactions(rx: Record<string, string[]>): unknown {
 
 async function postActivity(by: string, text: string, forName?: string): Promise<void> {
   const fields: Fields = { text: { stringValue: text }, by: { stringValue: by }, ts: nowTs() };
+  if (pgStore && readsFromPg(ACTIVITY)) {
+    await pgStore.create(ACTIVITY as StoreCollection, fields as StoreFields, generateDocId());
+    return;
+  }
   const data = await firestore(`/${ACTIVITY}`, { method: "POST", forName, body: { fields } });
   mirrorToPg(ACTIVITY, docIdOf(data.name), fields);
 }
@@ -1483,8 +1492,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, message_id }) => {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       requireAuthor(fields, name, "delete");
-      await firestore(`/${MESSAGES}/${encodeURIComponent(id)}`, { method: "DELETE", forName: name });
-      removeFromPg(MESSAGES, id);
+      if (pgStore && readsFromPg(MESSAGES)) {
+        await pgStore.remove(MESSAGES as StoreCollection, id);
+      } else {
+        await firestore(`/${MESSAGES}/${encodeURIComponent(id)}`, { method: "DELETE", forName: name });
+        removeFromPg(MESSAGES, id);
+      }
       return { ok: true, message_id: id, deleted: true };
     });
 
@@ -1563,9 +1576,15 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Set Highway presence", description: "Mark a participant as present. One doc per name, updated in place.",
       inputSchema: { name: nameSchema } },
     async ({ name }) => {
-      const docId = encodeURIComponent(name.toLowerCase().replace(/[/\s]+/g, "_"));
-      await firestore(`/${PRESENCE}/${docId}`, { method: "PATCH", forName: name,
-        body: { fields: { name: { stringValue: name }, ts: nowTs() } } });
+      const rawId = name.toLowerCase().replace(/[/\s]+/g, "_");
+      const docId = encodeURIComponent(rawId);
+      const fields = { name: { stringValue: name }, ts: nowTs() };
+      if (pgStore && readsFromPg(PRESENCE)) {
+        await pgStore.upsert(PRESENCE as StoreCollection, rawId, fields as StoreFields);
+      } else {
+        await firestore(`/${PRESENCE}/${docId}`, { method: "PATCH", forName: name,
+          body: { fields } });
+      }
       return { ok: true, name, ts: Date.now() };
     });
 
@@ -1595,9 +1614,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { text: z.string().trim().min(1).max(2000), type: z.string().optional().default("milestone") } },
     async ({ text, type }) => {
       const body = evoDoc(type || "milestone", text);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const mid = docIdOf(String(res?.name ?? ""));
-      if (mid) mirrorToPg(EVO_LOGS, mid, body.fields);
+      if (pgStore && readsFromPg(EVO_LOGS)) {
+        await pgStore.create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
+      } else {
+        const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+        const mid = docIdOf(String(res?.name ?? ""));
+        if (mid) mirrorToPg(EVO_LOGS, mid, body.fields);
+      }
       rememberQuietly(text, "milestone", "save_milestone");
       return { ok: true };
     });
@@ -1628,9 +1651,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { key: z.string().trim().min(1).max(200), value: z.string().trim().min(1).max(2000) } },
     async ({ key, value }) => {
       const body = { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } };
-      const res = await firestore(`/${JARVIS_MEM}`, { method: "POST", body });
-      const pid = docIdOf(String(res?.name ?? ""));
-      if (pid) mirrorToPg(JARVIS_MEM, pid, body.fields);
+      if (pgStore && readsFromPg(JARVIS_MEM)) {
+        await pgStore.create(JARVIS_MEM as StoreCollection, body.fields as StoreFields, generateDocId());
+      } else {
+        const res = await firestore(`/${JARVIS_MEM}`, { method: "POST", body });
+        const pid = docIdOf(String(res?.name ?? ""));
+        if (pid) mirrorToPg(JARVIS_MEM, pid, body.fields);
+      }
       rememberQuietly(`${key}: ${value}`, "preference", "store_preference");
       return { ok: true, key };
     });
@@ -1640,9 +1667,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { correction: z.string().trim().min(1).max(2000), context: z.string().trim().max(500).optional().default("") } },
     async ({ correction, context }) => {
       const body = evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const cid = docIdOf(String(res?.name ?? ""));
-      if (cid) mirrorToPg(EVO_LOGS, cid, body.fields);
+      if (pgStore && readsFromPg(EVO_LOGS)) {
+        await pgStore.create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
+      } else {
+        const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+        const cid = docIdOf(String(res?.name ?? ""));
+        if (cid) mirrorToPg(EVO_LOGS, cid, body.fields);
+      }
       rememberQuietly(context ? `${correction} (context: ${context})` : correction, "correction", "log_correction");
       return { ok: true };
     });
@@ -1885,10 +1916,17 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         text: { stringValue: text }, done: { booleanValue: false },
         createdBy: { stringValue: name }, priority: { stringValue: priority }, ts: nowTs() };
       if (assignee) fields.assignee = { stringValue: assignee };
-      const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
-      mirrorToPg(TASKS, docIdOf(data.name), fields);
+      let taskId: string;
+      if (pgStore && readsFromPg(TASKS)) {
+        taskId = generateDocId();
+        await pgStore.create(TASKS as StoreCollection, fields as StoreFields, taskId);
+      } else {
+        const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
+        taskId = docIdOf(data.name);
+        mirrorToPg(TASKS, taskId, fields);
+      }
       await notify(name, `started quest: ${text.slice(0, 200)}`, name);
-      return { ok: true, id: docIdOf(data.name), text };
+      return { ok: true, id: taskId, text };
     });
 
   tool(server, "complete_task",
@@ -1930,8 +1968,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, task_id }) => {
       const task = await getTaskOrThrow(task_id);
       const text = str(task.fields.text);
-      await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
-      removeFromPg(TASKS, task.id);
+      if (pgStore && readsFromPg(TASKS)) {
+        await pgStore.remove(TASKS as StoreCollection, task.id);
+      } else {
+        await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
+        removeFromPg(TASKS, task.id);
+      }
       await notify(name, `abandoned quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, deleted: true };
     });
@@ -2141,14 +2183,19 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         action: { stringValue: action }, value: { integerValue: String(Math.trunc(value ?? 0)) },
         status: { stringValue: "QUEUED_IN_BRAIN_STEM" },
         target: { stringValue: "LOCAL_BEAST_TUNNEL" }, tsNum: nowNum() } };
-      // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update
-      try {
-        await firestore(`/${SYS_CONFIG}`, { method: "POST", body, documentId: "hardware_relay_buffer" });
-      } catch (e) {
-        if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
-        await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
+      // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update.
+      // PG-first: single upsert covers both cases.
+      if (pgStore && readsFromPg(SYS_CONFIG)) {
+        await pgStore.upsert(SYS_CONFIG as StoreCollection, "hardware_relay_buffer", body.fields as StoreFields);
+      } else {
+        try {
+          await firestore(`/${SYS_CONFIG}`, { method: "POST", body, documentId: "hardware_relay_buffer" });
+        } catch (e) {
+          if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
+          await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
+        }
+        mirrorToPg(SYS_CONFIG, "hardware_relay_buffer", body.fields);
       }
-      mirrorToPg(SYS_CONFIG, "hardware_relay_buffer", body.fields);
       return { status: "QUEUED_IN_BRAIN_STEM", device, zone, action };
     });
 
@@ -2368,9 +2415,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { tool_name: z.string().trim().min(1).max(100), latency_ms: z.number().min(0), success: z.boolean(), error: z.string().trim().max(500).optional().default("") } },
     async ({ tool_name, latency_ms, success, error }) => {
       const body = telemetryDoc(tool_name, latency_ms, success, error);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const tid = docIdOf(String(res?.name ?? ""));
-      if (tid) mirrorToPg(EVO_LOGS, tid, body.fields);
+      if (pgStore && readsFromPg(EVO_LOGS)) {
+        await pgStore.create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
+      } else {
+        const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
+        const tid = docIdOf(String(res?.name ?? ""));
+        if (tid) mirrorToPg(EVO_LOGS, tid, body.fields);
+      }
       return { logged: true, tool_name };
     });
 
