@@ -1,0 +1,58 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // CI snapshot of READ coverage for the MCP bridge.
+    // NOT a drop-in publish over the Firebase console.
+    // Console write allowlists (email/uid on highway_messages, dispatch_locks,
+    // etc.) stay there. Do not replace live writes with this file.
+    //
+    // To fix a denied read: paste the matching `match /{collection}` block
+    // into the console WITHOUT changing existing `allow write` / `allow create`
+    // on highway_messages.
+
+    match /highway_messages/{id} {
+      allow read: if signedIn();
+    }
+    // FIX: no match in live rules → 403 on channel "code" (PR #4).
+    // When pasting to console, copy highway_messages WRITE as well.
+    match /highway_code/{id} {
+      allow read: if signedIn();
+    }
+    match /highway_dm/{id} {
+      allow read: if signedIn();
+    }
+    match /highway_presence/{id} {
+      allow read: if signedIn();
+    }
+    match /highway_activity/{id} {
+      allow read: if signedIn();
+    }
+    match /highway_tasks/{id} {
+      allow read: if signedIn();
+    }
+    match /highway_notes/{id} {
+      allow read: if signedIn();
+    }
+    match /evolution_logs/{id} {
+      allow read: if signedIn();
+    }
+    match /jarvis_memory/{id} {
+      allow read: if signedIn();
+    }
+    match /system_config/{id} {
+      allow read: if signedIn();
+    }
+    // GET is required: checkDispatchLock fail-closes on permission denied,
+    // which would block every threaded reply.
+    match /dispatch_locks/{id} {
+      allow read: if signedIn();
+    }
+    match /approval_requests/{id} {
+      allow read: if signedIn();
+    }
+  }
+}
