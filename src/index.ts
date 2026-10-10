@@ -29,6 +29,9 @@ import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import {
+  createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
+} from "./site-api.js";
+import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
 } from "./curated-news.js";
 import { rejectCuratedBatch } from "./privacy.js";
@@ -2847,6 +2850,28 @@ async function uploadAttachmentData(input: {
   };
 }
 
+// Site REST + SSE. Additive. Firestore stays the store until dual-write + flagged flip.
+const siteBus = createSiteBus();
+let pgListenUp = false;
+const siteApi = createSiteApi({
+  verifyToken: verifyFirebaseIdToken,
+  async readMessages(q) {
+    let messages = (await queryNewest(channelCollection(q.channel), q.limit)).map(fmtMsg);
+    if (q.since_ts !== undefined) messages = messages.filter((m) => (m.ts ?? 0) > q.since_ts!);
+    if (q.mention) {
+      const needle = q.mention.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      messages = messages.filter((m) => new RegExp(`(?:^|[^\\w])@${needle}\\b`, "i").test(m.text));
+    }
+    return { count: messages.length, messages, newest_ts: messages[0]?.ts ?? null };
+  },
+  async readTasks(q) {
+    let tasks = (await queryNewest(TASKS, q.limit)).map(fmtTask);
+    if (!q.include_done) tasks = tasks.filter((t) => !t.done);
+    return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
+  },
+  bus: siteBus,
+});
+
 // ============ EXPRESS ============
 const app = express();
 app.disable("x-powered-by");
@@ -2893,7 +2918,12 @@ const clientMeter = createClientMeter();
 
 app.get("/health", (_req, res) => {
   const { day, reads, budget, overBudget, cache } = readCache.snapshot();
-  res.json({ ok: true, reads: { day, reads, budget, overBudget, cache }, widget_reads: clientMeter.snapshot() });
+  res.json({
+    ok: true,
+    reads: { day, reads, budget, overBudget, cache },
+    widget_reads: clientMeter.snapshot(),
+    site: { sse: siteBus.size(), sse_max: SITE_SSE_MAX, pg_listen: pgListenUp },
+  });
 });
 
 app.post("/metrics/reads", async (req: Request, res: Response) => {
@@ -2916,6 +2946,11 @@ app.get("/news", async (_req, res) => {
     res.status(500).json({ ok: false, error: errMsg(e) });
   }
 });
+
+// Firebase ID token (same as /upload). No MCP secret. No Firestore from the browser.
+app.get("/api/messages", (req, res) => { void siteApi.messages(req, res); });
+app.get("/api/tasks", (req, res) => { void siteApi.tasks(req, res); });
+app.get("/api/stream", (req, res) => { void siteApi.stream(req, res); });
 
 // REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with
 // duplicate-safe Bearer parsing and no-oracle decoys). The inline check is retired.
@@ -2965,6 +3000,21 @@ process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); 
 // (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
 // PHASE3_TEST is set so imports don't bind a port or arm timers.
 if (!process.env.PHASE3_TEST) {
+const databaseUrl = process.env.DATABASE_URL?.trim();
+if (databaseUrl) {
+  import("pg").then(async ({ Client }) => {
+    await startPgListen({
+      url: databaseUrl,
+      connect: (url) => new Client({ connectionString: url }),
+      onPayload: (raw) => {
+        const ev = parseNotifyPayload(raw);
+        if (ev) siteBus.publish(ev);
+      },
+      onError: (e) => recordFailure("pg_listen", e),
+    });
+    pgListenUp = true;
+  }).catch((e) => recordFailure("pg_listen_start", e));
+}
 const port = Number(process.env.PORT) || 3000;
 const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
 

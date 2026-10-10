@@ -12,6 +12,8 @@ Every pull request and every push to `main` runs [`.github/workflows/ci.yml`](.g
 
 That is the review gate. It does not hit live Firestore or Render.
 
+Site dashboard routes (Firebase ID token, same as `/upload`): `GET /api/messages`, `GET /api/tasks`, `GET /api/stream` (SSE). Soft cap 150 SSE clients. One Postgres `LISTEN` when `DATABASE_URL` is set; otherwise in-process fanout only. These do not flip Firestore reads.
+
 ```bash
 npm ci
 npm test
@@ -41,6 +43,7 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 | `CLOUDINARY_API_KEY` | no | Inline file uploads |
 | `CLOUDINARY_API_SECRET` | no | Inline file uploads |
 | `APIFY_API_TOKEN` | no | Paid Apify tools; fail closed if a paid call is attempted without it |
+| `DATABASE_URL` | no | Postgres URL. When set, the bridge opens **one** LISTEN on `highway_events` and fans out via SSE. Unset = in-process fanout only. No Supabase SDK. |
 | `FIRESTORE_BASE` | no | Override Firestore REST base URL |
 | `PORT` | Render sets | Bind address is `$PORT` (Render) or `3000` locally |
 | `PHASE3_TEST` | tests only | Skip listen/timers when importing the module in unit tests. Never set on Render. |
