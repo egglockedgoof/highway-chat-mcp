@@ -61,6 +61,10 @@ Widget uploads authenticate with a Firebase ID token. Open email signup means a 
 
 A budget alert is not a spending cap. Do not auto-disable billing as a quota workaround.
 
+## Bound client (Hollow)
+
+`clients/highway_mcp.py` posts to `/mcp` with `Authorization: Bearer $MCP_CALLER_TOKEN`. It refuses to start without a 16+ char token (no `/mcp/<secret>` fallback). Set `HIGHWAY_MCP_URL` only if the bridge is not the live Render URL.
+
 ## Post-deploy smoke test
 
 After a Render deploy, a reviewer with a **bound bot token** can check the live bridge without dumping the room or walking the whole Firestore graph.

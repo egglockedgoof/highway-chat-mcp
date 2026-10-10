@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && node --experimental-strip-types --no-warnings --test src/*.test.ts",
+    "test": "tsc && node --experimental-strip-types --no-warnings --test src/*.test.ts && python3 -m unittest discover -s clients -p '*_test.py'",
     "smoke": "node --experimental-strip-types --no-warnings scripts/smoke.ts"
   },
   "engines": {
