@@ -67,6 +67,26 @@ test("editorial note from Overheard replaces auto; strangers cannot", () => {
   assert.match(ed.set(next.note!, "Nyx") ?? "", /only Overheard/);
 });
 
+test("editorial set and autoNote refuse private data", () => {
+  const ed = createEditorialNotes();
+  const btc = presentItem(LIVE[10], null, NOW);
+  assert.match(ed.set({
+    storyId: btc.id, body: "Mail the wire to nyx@highway.chat",
+    source: "Overheard", wallet: "$82,716", action: "Do not chase.",
+    publishedAt: new Date(NOW).toISOString(), unconfirmed: false,
+  }, "Overheard") ?? "", /email in body/);
+  assert.match(ed.set({
+    storyId: btc.id, body: "Held the bid.",
+    source: "Overheard", wallet: "4111-1111-1111-1111", action: "Do not chase.",
+    publishedAt: new Date(NOW).toISOString(), unconfirmed: false,
+  }, "Overheard") ?? "", /card number in wallet/);
+  assert.equal(autoNote({
+    id: "x", title: "BTC $1 +1.0% — call (415) 555-0134",
+    url: "https://ex", source: "CRYPTO", publishedAt: null, unconfirmed: false,
+    facts: { price: 1, pct: 1 },
+  }), null);
+});
+
 test("series stories share one key; a new headline updates the card instead of duplicating", () => {
   const book = createCardBook(() => NOW);
   const a = presentItem({ title: "Fed holds rates", source: "WORLD", url: "https://ex/a" }, null, NOW);

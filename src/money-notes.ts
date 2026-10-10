@@ -4,6 +4,9 @@
 // Unsourced odds and day-counts are not facts. Editorial notes from Overheard
 // or last30days replace auto notes when their storyId matches.
 
+import { EDITORS, rejectPrivate } from "./privacy.js";
+export { EDITORS };
+
 export interface StoryFacts {
   price?: number;
   pct?: number;
@@ -29,8 +32,6 @@ export interface MoneyNote {
   publishedAt: string;
   unconfirmed: boolean;
 }
-
-export const EDITORS = new Set(["overheard", "last30days"]);
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 const SERIES: Array<{ re: RegExp; key: string }> = [
@@ -134,7 +135,7 @@ export function autoNote(story: Story): MoneyNote | null {
 
   const name = title.split(/[—–-]|\s{2,}/)[0].trim().slice(0, 80);
   const body = `${name}: ${fact}, per ${story.source}. ${wallet.startsWith("deadline") ? wallet : `Wallet: ${wallet}`}.`;
-  return {
+  const note = {
     storyId: story.id,
     body: body.slice(0, 280),
     source: story.source,
@@ -143,6 +144,8 @@ export function autoNote(story: Story): MoneyNote | null {
     publishedAt: story.publishedAt || new Date().toISOString(),
     unconfirmed: story.unconfirmed,
   };
+  if (rejectPrivate({ body: note.body, wallet: note.wallet, action: note.action, title })) return null;
+  return note;
 }
 
 function money(n: number): string {
@@ -157,6 +160,8 @@ export function createEditorialNotes() {
     set(note: MoneyNote, by: string): string | null {
       if (!EDITORS.has(by.trim().toLowerCase())) return "only Overheard or last30days can replace an auto note";
       if (!note.storyId || !note.body || !note.source || !note.wallet || !note.action) return "note is missing required fields";
+      const leaked = rejectPrivate({ body: note.body, wallet: note.wallet, action: note.action });
+      if (leaked) return leaked;
       byId.set(note.storyId, { note: { ...note, storyId: note.storyId }, by });
       return null;
     },
