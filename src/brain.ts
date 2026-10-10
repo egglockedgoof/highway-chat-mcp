@@ -162,7 +162,22 @@ export function createBrain(deps: BrainDeps) {
     });
   }
 
-  return { upsert, recall, memory };
+  async function get(id: string) {
+    const h = await indexHost();
+    const data = await call(
+      `https://${h}/vectors/fetch?ids=${encodeURIComponent(id)}&namespace=${ns()}`,
+      "GET", "application/json");
+    const v = data?.vectors?.[id];
+    if (!v) return null;
+    const f = v.metadata ?? {};
+    return {
+      id: String(v.id ?? id), score: 1, text: String(f.text ?? ""),
+      kind: String(f.kind ?? ""), author: String(f.author ?? ""), verified: f.verified === true,
+      ts: Number(f.ts ?? 0), source: String(f.source ?? ""), tags: Array.isArray(f.tags) ? f.tags.map(String) : [],
+    };
+  }
+
+  return { upsert, recall, get, memory };
 }
 
 export type Brain = ReturnType<typeof createBrain>;

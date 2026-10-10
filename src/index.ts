@@ -30,6 +30,7 @@ import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
+import { assemble, sessionMarkerId, sessionMarkerText } from "./orient.js";
 import {
   validateSpec, renderUrl, shapeResponse, signSkill, parseRegistry, activeSkills,
   SKILL_PREFIX, MAX_SKILLS, type SkillSpec, type SkillEntry, type Registry,
@@ -1330,6 +1331,37 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const text = `${keep ? "Kept" : "Reverted"} (${outcome}): ${change} Evidence: ${evidence}`;
       const m = await remember(text, "lesson", "record_lesson").catch(brainErr);
       return { ok: true, id: m.id, keep, outcome };
+    });
+
+  tool(server, "orient",
+    { title: "Start-of-session continuity handshake",
+      description: "Call this first in a new session. Returns the current mission, locked decisions, constraints, unresolved work, recent failures, and your responsibilities — not the whole chat. If the brain is down it says so; do not invent a direction. Marks this session so the next orient can tell you what changed.",
+      inputSchema: {
+        since_ms: z.number().int().min(0).optional().describe("Only count memories newer than this. Omit to use your last orient marker."),
+        name: nameSchema.optional().describe("Your name. Ignored when you connect with your own bridge token."),
+      } },
+    async ({ since_ms, name }) => {
+      const who = brainAuthor(name);
+      let briefing;
+      try {
+        briefing = await assemble((q) => brain.recall(q), { author: who.author, sinceMs: since_ms, get: (id) => brain.get(id) });
+      } catch (e) {
+        recordFailure("orient", e);
+        return {
+          ok: false, author: who.author, last_session_ms: since_ms ?? null, new_since: 0,
+          lanes: { mission: [], constraints: [], open: [], failures: [], you: [] },
+          degraded: ["mission", "constraints", "open", "failures", "you"],
+          next: "Brain unavailable. Ask before inventing the mission, constraints, or next task.",
+        };
+      }
+      try {
+        await brain.upsert([brain.memory({
+          id: sessionMarkerId(who.author),
+          text: sessionMarkerText(Date.now()),
+          kind: "fact", author: who.author, verified: who.verified, source: "orient",
+        })]);
+      } catch (e) { recordFailure("orient:marker", e); }
+      return briefing;
     });
 
   // ---- Skills: the team grows the bridge ----

@@ -65,6 +65,15 @@ test("recall sends text query with filter and maps hits", async () => {
   assert.deepEqual(body.query, { inputs: { text: "what did hollow decide" }, top_k: 4, filter: { verified: { $eq: true } } });
 });
 
+test("get fetches one record by id and maps metadata", async () => {
+  const { brain, calls } = fakePinecone(() => ({ status: 200, body: JSON.stringify({ vectors: {
+    "session:nyx": { id: "session:nyx", metadata: { text: "LAST_ORIENT 9", kind: "fact", author: "Nyx", verified: true, ts: 9, source: "orient", tags: [] } },
+  } }) }));
+  const got = await brain.get("session:nyx");
+  assert.equal(got?.text, "LAST_ORIENT 9");
+  assert.ok(calls.some((c) => c.method === "GET" && c.url.includes("/vectors/fetch") && c.url.includes("session%3Anyx")));
+});
+
 test("errors surface as BrainError; 429 keeps its status; missing key is 503", async () => {
   const { brain } = fakePinecone(() => ({ status: 429, body: JSON.stringify({ error: { message: "rate limited" } }) }));
   await assert.rejects(brain.recall({ query: "q", topK: 1 }),
