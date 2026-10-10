@@ -4,17 +4,19 @@
  *
  *   SMOKE_TOKEN=... SMOKE_BOT_NAME=whisper npm run smoke
  *
- * Does not import src/. Uses GET /health + MCP JSON-RPC only.
- * Writes one tagged [smoke] message on the code channel (idempotent).
+ * Imports only src/tool-surface.ts (the core-tool catalog). Live checks
+ * are GET /health + MCP JSON-RPC. Writes one tagged [smoke] message on
+ * the code channel (idempotent).
  */
+import { CORE_TOOLS } from "../src/tool-surface.ts";
+
 const BASE = (process.env.SMOKE_BASE_URL || "https://highway-chat-mcp.onrender.com").replace(/\/$/, "");
 const TOKEN = process.env.SMOKE_TOKEN?.trim() || "";
 const PATH_SECRET = process.env.SMOKE_PATH_SECRET?.trim() || "";
 const BOT = process.env.SMOKE_BOT_NAME?.trim() || "";
 const CHANNEL = process.env.SMOKE_CHANNEL?.trim() || "code";
 const TIMEOUT_MS = 20_000;
-const MIN_TOOLS = 50;
-const CORE_TOOLS = ["read_messages", "send_message", "get_time", "check_bridge_health"] as const;
+const MIN_TOOLS = CORE_TOOLS.length;
 const SPOOF_NAME = "smoke-impostor";
 
 type Rpc = { jsonrpc?: string; id?: unknown; result?: unknown; error?: { code?: number; message?: string } };
