@@ -1,31 +1,76 @@
 /**
  * MarrowSystemZ — The last system the world will need.
  * (Founding vow preserved verbatim — see MARROW_CORE.md)
+ *
+ * THE PROTOCOL OF THE UNREAL — pass 3, core re-architecture. 50 tools.
+ *  - One McpServer + transport per request (the shared instance 500'd every overlapping call).
+ *  - One HTTP primitive: whole-lifecycle timeout, byte cap, redirect control.
+ *  - SSRF guard on every caller-supplied URL.
+ *  - Optimistic concurrency on read-modify-write docs; no lost updates.
+ *  - Paid Apify calls claim their 6h slot BEFORE spending; fail closed on config errors.
+ *  - Every unexpected failure lands in evolution_logs (deduped + budgeted); nothing is swallowed.
  */
 
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
+import { lookup } from "node:dns/promises";
+import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-
-const API_KEY = process.env.FIREBASE_API_KEY;
-if (!API_KEY) {
-  console.error("FATAL: FIREBASE_API_KEY environment variable is not set.");
-  process.exit(1);
+import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
+import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
+import {
+  createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
+} from './security.js';
+import type { AuthRequest, CallerCtx } from './security.js';
+// ============ FAIL-CLOSED ENV ============
+const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
+for (const k of REQUIRED_ENV) {
+  if (!process.env[k]) {
+    console.error(`FATAL: ${k} environment variable is not set.`);
+    process.exit(1);
+  }
 }
+const API_KEY = process.env.FIREBASE_API_KEY as string;
+const MCP_SECRET = process.env.MCP_SECRET as string;
 
-const MCP_SECRET = process.env.MCP_SECRET || "";
-const CLIENT_KEY = process.env.HIGHWAY_CLIENT_KEY;
-if (!CLIENT_KEY) {
-  console.error("FATAL: HIGHWAY_CLIENT_KEY environment variable is not set.");
-  process.exit(1);
-}
+// Phase 3 Section B: attachment size limits (validated for client-supplied refs
+// and bridge-side uploads alike).
+// NOTE (lesson #40): Firebase Storage is NOT provisioned — Blaze takes $30
+// upfront even for the "free" tier, so the project stays on Spark. Binary
+// storage is Cloudinary (free tier, no card, secret stays server-side).
+// Long messages post in full as the message text (zero cost, no truncation).
+const ATTACHMENT_LIMITS: Record<string, number> = {
+  "image/jpeg": 5 * 1024 * 1024,
+  "image/png": 5 * 1024 * 1024,
+  "image/gif": 5 * 1024 * 1024,
+  "image/webp": 5 * 1024 * 1024,
+  "application/pdf": 10 * 1024 * 1024,
+  "text/plain": 10 * 1024 * 1024,
+  "text/markdown": 10 * 1024 * 1024,
+  "audio/mpeg": 10 * 1024 * 1024,
+  "audio/wav": 10 * 1024 * 1024,
+  "audio/ogg": 10 * 1024 * 1024,
+  "audio/webm": 10 * 1024 * 1024,
+  "audio/mp4": 10 * 1024 * 1024,
+  "video/mp4": 10 * 1024 * 1024,
+  "video/webm": 10 * 1024 * 1024,
+  "video/quicktime": 10 * 1024 * 1024,
+  "application/msword": 10 * 1024 * 1024,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 10 * 1024 * 1024,
+};
 
 const BASE =
   process.env.FIRESTORE_BASE ||
   "https://firestore.googleapis.com/v1/projects/highway-chat/databases/(default)/documents";
 
+
 const MESSAGES = "highway_messages";
+const DMS = "highway_dm";
+
+
 const PRESENCE = "highway_presence";
 const ACTIVITY = "highway_activity";
 const TASKS = "highway_tasks";
@@ -33,50 +78,205 @@ const NOTES = "highway_notes";
 const TYPING = "highway_typing";
 const EVO_LOGS = "evolution_logs";
 const JARVIS_MEM = "jarvis_memory";
+const SYS_CONFIG = "system_config";
 
 const DEVICE_ID = "mcp-bridge";
-const READ_BOT = "whisper"; // Default identity for read operations (must exist in BOT_CREDENTIALS)
+const READ_BOT = "whisper";
+const FS_TIMEOUT = 15000;
+const EXT_TIMEOUT = 10000;
+const ONLINE_WINDOW = 90000; // presence heartbeat freshness
+const MAX_API_BYTES = 8 * 1024 * 1024; // vendor JSON / Firestore responses
+const MAX_PAGE_BYTES = 4 * 1024 * 1024; // caller-supplied pages (truncated, not rejected)
+const MAX_REDIRECTS = 3;
+const UA = { "User-Agent": "Mozilla/5.0 (compatible; highway-chat/1.0)" };
 
-// ---- Parsed once at startup, not per-request ----
+type Fields = Record<string, any>;
+type Doc = { name: string; fields?: Fields; createTime?: string; updateTime?: string };
+
+// ============ ERRORS ============
+/** Expected, caller-fixable failure (bad input, not found, not the author). Never written to telemetry. */
+class UserError extends Error {}
+// Every Firestore call goes through sec.firestore, which throws security.ts's FirestoreError.
+// A second class here would make every `instanceof FirestoreError` check below silently false.
+export { FirestoreError };
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+// ============ CREDENTIALS (parsed once) ============
 const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
   try { return JSON.parse(process.env.BOT_CREDENTIALS || "{}"); }
-  catch { return {}; }
+  catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
 
-// ---- Token cache with in-flight dedup (kills the refresh stampede) ----
+// ============ REV 19 SECURITY ============
+// All Firestore access flows through sec.firestore (the choke point); all MCP auth
+// flows through sec.resolveAuth. See src/security.ts for the full decision tables.
+const sec = createSecurity(
+  {
+    baseUrl: BASE,
+    fsTimeoutMs: FS_TIMEOUT,
+    readBot: READ_BOT,
+    isSunset: () => false,
+    request: (method, url, opts) =>
+      http(url, { method, headers: opts.headers, body: opts.body }, opts.timeoutMs)
+        .then((r) => ({ status: r.status, body: r.body ? parseJson(r.body) : null })),
+    getIdToken,
+    now: () => new Date().toISOString(),
+  },
+  {
+    instanceId: process.env.RENDER_INSTANCE_ID || `local-${Date.now().toString(36)}`,
+    instanceStartedAt: new Date().toISOString(),
+    quietWindowMs: 14 * 24 * 3600 * 1000,
+    boundWriteThroughMs: 3600 * 1000,
+  },
+  { mcpCallers: {}, legacySecret: MCP_SECRET, legacyEnabled: true },
+);
+
+// ============ HTTP PRIMITIVE ============
+// One timer covers headers AND body (a stalled body used to hang forever); bytes are capped;
+// redirects are the caller's choice. Every outbound request in this file goes through here.
+type HttpResult = { status: number; ok: boolean; statusText: string; body: string; location: string | null };
+
+const hostOf = (url: string): string => { try { return new URL(url).hostname; } catch { return url.slice(0, 60); } };
+
+async function readCapped(res: globalThis.Response, max: number, overflow: "throw" | "truncate"): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      if (overflow === "throw") throw new Error(`response exceeds ${max} bytes`);
+      chunks.push(value.subarray(0, value.byteLength - (total - max)));
+      break;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function http(
+  url: string,
+  init: RequestInit,
+  ms: number,
+  opts: { maxBytes?: number; overflow?: "throw" | "truncate" } = {}
+): Promise<HttpResult> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    const body = await readCapped(res, opts.maxBytes ?? MAX_API_BYTES, opts.overflow ?? "throw");
+    return { status: res.status, ok: res.ok, statusText: res.statusText, body, location: res.headers.get("location") };
+  } catch (e) {
+    if (ctrl.signal.aborted) throw new Error(`timeout after ${ms}ms: ${hostOf(url)}`);
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+
+function parseJson(body: string): any {
+  try { return JSON.parse(body); } catch { return {}; }
+}
+
+// Trusted vendor endpoints (hard-coded URLs): redirects followed, size-capped.
+async function fetchText(url: string, ms = 12000): Promise<string> {
+  const r = await http(url, { headers: UA }, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status} from ${hostOf(url)}`);
+  return r.body;
+}
+async function fetchJson(url: string, ms = 12000): Promise<any> {
+  const body = await fetchText(url, ms);
+  try { return JSON.parse(body); } catch { throw new Error(`non-JSON response from ${hostOf(url)}`); }
+}
+
+// ============ SSRF GUARD (caller-supplied URLs only) ============
+function isPrivateIp(ip: string): boolean {
+  if (isIP(ip) === 4) {
+    const [a, b] = ip.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  const v = ip.toLowerCase();
+  if (v === "::" || v === "::1") return true;
+  if (/^fe[89ab]/.test(v) || /^f[cd]/.test(v)) return true; // link-local, unique-local
+  const dotted = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return isPrivateIp(dotted[1]);
+  const hex = v.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = parseInt(hex[1], 16), lo = parseInt(hex[2], 16);
+    return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  return false;
+}
+
+async function assertPublicUrl(raw: string): Promise<URL> {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new UserError("invalid url"); }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new UserError("only http(s) urls are allowed");
+  if (u.username || u.password) throw new UserError("credentials in urls are not allowed");
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || /\.(localhost|local|internal)$/.test(host))
+    throw new UserError("private hostnames are not allowed");
+  const addrs = isIP(host) ? [{ address: host }] : await lookup(host, { all: true });
+  if (!addrs.length || addrs.some((a) => isPrivateIp(a.address)))
+    throw new UserError("url resolves to a private address");
+  return u;
+}
+
+// Redirects are followed by hand so every hop is re-validated. Residual risk: DNS rebinding
+// between lookup and connect (closing it needs a pinned-IP dispatcher).
+async function fetchPublic(raw: string, ms: number): Promise<string> {
+  let url = raw;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const u = await assertPublicUrl(url);
+    const r = await http(u.href, { headers: UA, redirect: "manual" }, ms,
+      { maxBytes: MAX_PAGE_BYTES, overflow: "truncate" });
+    if (r.status >= 300 && r.status < 400 && r.location) { url = new URL(r.location, u).href; continue; }
+    if (!r.ok) throw new Error(`HTTP ${r.status} from ${u.hostname}`);
+    return r.body;
+  }
+  throw new UserError("too many redirects");
+}
+
+// ============ TOKEN CACHE (in-flight dedup kills stampedes; backoff kills auth hammering) ============
 const _tokens = new Map<string, { token: string; exp: number }>();
 const _inflight = new Map<string, Promise<string>>();
+const _authBackoff = new Map<string, { until: number; message: string }>();
+const AUTH_BACKOFF_MS = 15000;
+const tokenKey = (forName?: string): string => (forName || READ_BOT).toLowerCase();
 
-async function getIdToken(forName?: string): Promise<string> {
-  const key = (forName || READ_BOT).toLowerCase();
-  const now = Date.now();
+async function getIdToken(forName?: string, forceRefresh?: boolean): Promise<string> {
+  const key = tokenKey(forName);
+  if (forceRefresh) { _tokens.delete(key); _inflight.delete(key); }
   const cached = _tokens.get(key);
-  if (cached && now < cached.exp - 60000) return cached.token;
-
-  // Deduplicate concurrent refreshes for the same identity
+  if (cached && Date.now() < cached.exp - 60000) return cached.token;
   const pending = _inflight.get(key);
   if (pending) return pending;
+  const creds = BOT_CREDS[key];
+  if (!creds?.email || !creds?.password) throw new UserError(`No credentials configured for bot "${key}"`);
+  const backoff = _authBackoff.get(key);
+  if (backoff && Date.now() < backoff.until) throw new Error(backoff.message);
 
   const p = (async (): Promise<string> => {
-    const creds = BOT_CREDS[key];
-    if (!creds?.email || !creds?.password) {
-      throw new Error(`No credentials configured for bot "${key}"`);
+    try {
+      const r = await http(
+        `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`,
+        { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }) },
+        EXT_TIMEOUT);
+      const data = parseJson(r.body);
+      if (!r.ok) throw new Error(`Auth ${r.status}: ${data?.error?.message ?? r.statusText}`);
+      if (!data.idToken) throw new Error("Auth succeeded but returned no idToken");
+      _tokens.set(key, { token: data.idToken, exp: Date.now() + parseInt(data.expiresIn || "3600", 10) * 1000 });
+      _authBackoff.delete(key);
+      return data.idToken as string;
+    } catch (e) {
+      _authBackoff.set(key, { until: Date.now() + AUTH_BACKOFF_MS, message: `auth backoff: ${errMsg(e)}` });
+      throw e;
     }
-    const res = await fetch(
-      `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }),
-      }
-    );
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Auth ${res.status}: ${data?.error?.message ?? res.statusText}`);
-    _tokens.set(key, {
-      token: data.idToken,
-      exp: now + (parseInt(data.expiresIn || "3600", 10) * 1000),
-    });
-    return data.idToken as string;
   })();
 
   _inflight.set(key, p);
@@ -84,166 +284,427 @@ async function getIdToken(forName?: string): Promise<string> {
   finally { _inflight.delete(key); }
 }
 
-async function firestore(path: string, init: { method: string; body?: unknown; forName?: string }) {
-  const idToken = await getIdToken(init.forName); // defaults to READ_BOT, never anonymous
-  const res = await fetch(`${BASE}${path}`, {
-    method: init.method,
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": API_KEY as string,
-      "Authorization": `Bearer ${idToken}`,
-    },
-    body: init.body ? JSON.stringify(init.body) : undefined,
-  });
-  const data: any = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error?.message ?? res.statusText;
-    throw new Error(`Firestore ${res.status}: ${msg}`);
-  }
-  return data;
+// ============ FIRESTORE PRIMITIVES ============
+// REV 19 choke point: global precondition validation → gate → system allowlist →
+// validated URL → 401 retry. All Firestore access in this file goes through here.
+// Query strings are rejected in paths — use structured init (pageSize, documentId,
+// updateMask, precondition) instead.
+const firestore = sec.firestore;
+
+const is404 = (e: unknown): boolean => e instanceof FirestoreError && e.status === 404;
+
+async function getDocOrNull(collectionId: string, docId: string, forName?: string): Promise<Doc | null> {
+  try { return (await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, { method: "GET", forName })) as Doc; }
+  catch (e) { if (is404(e)) return null; throw e; }
 }
 
-// ---- Field accessors (unchanged, they work) ----
+async function listDocs(collectionId: string, pageSize = 300): Promise<Doc[]> {
+  const data = await firestore(`/${collectionId}`, { method: "GET", pageSize });
+  return (data.documents ?? []) as Doc[];
+}
 const str = (f: any): string => f?.stringValue ?? "";
 const boolOf = (f: any): boolean => f?.booleanValue ?? false;
+// tsOf: mixed-type aware — highway_messages ts is stringValue OR timestampValue (never trust the type)
 const tsOf = (f: any): number | null => {
   if (!f) return null;
   if (f.timestampValue !== undefined) return Date.parse(f.timestampValue);
+  if (f.stringValue !== undefined) {
+    const t = Date.parse(f.stringValue);
+    return isNaN(t) ? null : t;
+  }
   if (f.integerValue !== undefined) return Number(f.integerValue);
   if (f.doubleValue !== undefined) return Number(f.doubleValue);
   return null;
 };
 const nowTs = () => ({ timestampValue: new Date().toISOString() });
+const nowNum = () => ({ integerValue: String(Date.now()) });
 const docIdOf = (name: string): string => {
   const i = name.lastIndexOf("/");
   return i >= 0 ? decodeURIComponent(name.slice(i + 1)) : name;
 };
+// FNV-1a: deterministic content hash, no imports
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+// bestTs: one timestamp source of truth — tsNum (numeric) beats ts (mixed), createTime last
+const bestTs = (d: Doc): number => {
+  const f = d.fields ?? {};
+  return tsOf(f.tsNum) ?? tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : 0);
+};
+const isOnline = (ts: number | null, now: number = Date.now()): boolean =>
+  ts !== null && now - ts < ONLINE_WINDOW;
 
-// ---- Message payload builder (impossible check removed) ----
-function buildMessageFields(name: string, text: string) {
-  return {
-    fields: {
-      name: { stringValue: name },
-      text: { stringValue: text },
-      ts: nowTs(),
-      tsNum: { integerValue: String(Date.now()) },
-      deviceId: { stringValue: DEVICE_ID },
-    },
-  };
+// stripHtml is hash-stable by contract (diff_check_page / extract_site_schema fingerprints depend on it).
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+}
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+const decodeEntities = (s: string): string =>
+  s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, g: string) => {
+    if (g[0] === "#") {
+      const cp = g[1].toLowerCase() === "x" ? parseInt(g.slice(2), 16) : parseInt(g.slice(1), 10);
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m;
+    }
+    return ENTITIES[g.toLowerCase()] ?? m;
+  });
+function htmlToText(html: string): string {
+  return decodeEntities(stripHtml(html).replace(/<!--[\s\S]*?-->/g, "").replace(/<[^>]+>/g, " "))
+    .replace(/[ \t\f\v]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// ---- Tool response helpers (use everywhere) ----
+function buildMessageFields(name: string, text: string, opts?: { reply_to?: string; idempotency_key?: string }) {
+  const fields: Record<string, unknown> = {
+    name: { stringValue: name },
+    text: { stringValue: text },
+    ts: nowTs(),
+    tsNum: nowNum(),
+    deviceId: { stringValue: DEVICE_ID },
+  };
+  if (opts?.reply_to) fields.reply_to = { stringValue: opts.reply_to };
+  if (opts?.idempotency_key) fields.idempotency_key = { stringValue: opts.idempotency_key };
+  return { fields };
+}
+
+// ---- Long messages post in full: no preview split, no truncation, no
+// attachment machinery (sin's directive 2026-10-09). Bounds live in
+// src/message-limits.ts (pure module, tested).
+
+// Dispatch Lock check — ADVISORY until header-bound credentials exist (hollow #36).
+// `assertedName` is the caller-supplied `name` field: any bridge caller can assert any
+// name, so this check is best-effort convention enforcement, NOT authentication.
+// A pass here must never be treated as proof of identity. Every result carries
+// `advisory: true` so a future binding upgrade must flip the flag deliberately
+// (regression tripwire: silently upgrading advisory→binding breaks the tests).
+//
+// Fail-CLOSED on lock-read error (hollow #37): any read failure (quota exhaustion,
+// network, permissions) is treated as locked/retryable — never as unlocked. Quota
+// exhaustion must not silently de-arm the gate.
+export type LockCheck = { allowed: boolean; reason?: string; retryable?: boolean; routedTo?: string; advisory: true };
+
+export async function checkDispatchLock(
+  replyToId: string,
+  assertedName: string,
+  getLock: (collection: string, docId: string) => Promise<Doc | null> = (c, d) => getDocOrNull(c, d),
+): Promise<LockCheck> {
+  if (!replyToId) return { allowed: true, advisory: true };
+  let lock: Doc | null;
+  try {
+    lock = await getLock("dispatch_locks", replyToId);
+  } catch {
+    // Fail closed: an unreadable lock is a locked lock. Surface `retryable` and let
+    // the sender retry; never degrade to unlocked.
+    return {
+      allowed: false,
+      reason: "dispatch lock unreadable — failing closed, retry shortly",
+      retryable: true,
+      advisory: true,
+    };
+  }
+  if (!lock) return { allowed: true, advisory: true }; // no lock = open
+
+  const fields = (lock as any).fields || {};
+  const routedTo = fields.routed_to?.stringValue;
+  const broadcast = fields.broadcast?.booleanValue;
+  const expiresAt = fields.expires_at?.timestampValue;
+  // Lowercased routed agent — drives the claim decision in send_message
+  // (only the routed agent marks the lock claimed, per spec §2).
+  const routedNorm = routedTo ? String(routedTo).toLowerCase() : undefined;
+
+  // Broadcast = everyone can reply
+  if (broadcast) return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Expired lock = open
+  if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Room lead (whisper) can always triage — advisory: asserted, not verified
+  if (assertedName.toLowerCase() === "whisper") return { allowed: true, routedTo: routedNorm, advisory: true };
+
+  // Structured disagreement bypasses lock
+  // (checked by caller via text prefix — this is just the lock check)
+
+  // Only the routed agent can reply — advisory: `assertedName` is self-asserted
+  if (routedTo && assertedName.toLowerCase() !== routedNorm) {
+    return {
+      allowed: false,
+      reason: `Message is dispatch-locked to ${routedTo} (advisory — name is caller-asserted)`,
+      routedTo: routedNorm,
+      advisory: true,
+    };
+  }
+
+  return { allowed: true, routedTo: routedNorm, advisory: true };
+}
+
+// ---- IDEMPOTENCY (hollow #35) ----
+// The idempotency key drives a DETERMINISTIC document id; the write is a
+// check-before-write: GET the idem doc, then PATCH with an exists:false precondition
+// (atomic create-only). Losing the race (contention on the PATCH) means the other
+// writer won → report duplicate, not error. Storing the key without this check
+// would be decoration, not dedup.
+
+/** Deterministic doc id for an idempotency key, scoped per channel. */
+export function idemDocId(channel: string, key: string): string {
+  const h = createHash("sha256").update(`highway/idem/v1/${channel}/${key}`).digest("hex").slice(0, 32);
+  return `idem_${h}`;
+}
+
+/** A write that lost its create-only race: someone else created the doc first. */
+export function isWriteContention(e: unknown): boolean {
+  return e instanceof FirestoreError &&
+    (e.code === "FAILED_PRECONDITION" || e.code === "ALREADY_EXISTS" || e.status === 409 || e.status === 412);
+}
+
+export interface IdemIo {
+  getDoc: (collection: string, docId: string, forName?: string) => Promise<Doc | null>;
+  createDoc: (collection: string, docId: string, body: { fields: Record<string, unknown> }, forName?: string) => Promise<void>;
+}
+
+/** Write-once keyed document. Returns duplicate:true when the key was seen before. */
+export async function writeIdempotent(
+  collection: string,
+  docId: string,
+  body: { fields: Record<string, unknown> },
+  forName: string | undefined,
+  io: IdemIo,
+): Promise<{ duplicate: boolean; id: string }> {
+  const existing = await io.getDoc(collection, docId, forName);
+  if (existing?.fields) return { duplicate: true, id: docId };
+  try {
+    await io.createDoc(collection, docId, body, forName);
+  } catch (e) {
+    if (isWriteContention(e)) return { duplicate: true, id: docId }; // lost the race — the other write won
+    throw e;
+  }
+  return { duplicate: false, id: docId };
+}
+
+// Real Firestore io for the idempotent send path (tests inject fakes).
+const idemIo: IdemIo = {
+  getDoc: (c, d, n) => getDocOrNull(c, d, n),
+  createDoc: (c, d, body, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body, forName: n,
+      updateMask: Object.keys(body.fields), precondition: { exists: false },
+    }),
+};
+
+// ---- LOCK CLAIM (hollow re-review #38: "nothing writes dispatch_locks — lock inert") ----
+// The writer lives in the listener (highway-push/dispatch-lock-writer.js, writes the
+// lock on routing). This is the other half: when the routed agent's reply lands,
+// the bridge marks the lock claimed (spec §2 ledger). Ledger only — never blocks
+// the send, never throws, never creates a lock doc from a claim (exists:true).
+
+export interface LockClaimIo {
+  patch: (collection: string, docId: string, fields: Record<string, unknown>, forName?: string) => Promise<void>;
+}
+
+const lockClaimIo: LockClaimIo = {
+  patch: (c, d, fields, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body: { fields }, forName: n,
+      updateMask: Object.keys(fields), precondition: { exists: true },
+    }),
+};
+
+/** Mark a dispatch lock claimed. Returns false when there is nothing to claim
+ *  (no lock doc) or the write failed — the reply already landed either way. */
+export async function markLockClaimed(
+  replyToId: string,
+  forName?: string,
+  io: LockClaimIo = lockClaimIo,
+): Promise<boolean> {
+  try {
+    await io.patch("dispatch_locks", replyToId, { claimed: { booleanValue: true } }, forName);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Shared evolution_logs doc — one builder, three tools
+function evoDoc(type: string, text: string) {
+  return { fields: { type: { stringValue: type }, text: { stringValue: text }, tsNum: nowNum() } };
+}
+function telemetryDoc(tool: string, latencyMs: number, success: boolean, error = "") {
+  return { fields: {
+    type: { stringValue: "telemetry" },
+    text: { stringValue: `telemetry:${tool}:${success ? "ok" : "fail"}:${Math.round(latencyMs)}ms${error ? ":" + error.slice(0, 200) : ""}` },
+    tool_name: { stringValue: tool },
+    latency_ms: { doubleValue: latencyMs },
+    success: { booleanValue: success },
+    tsNum: nowNum(),
+  } };
+}
+
+// ============ OBSERVABILITY: failures reach the permanent log, never the void ============
+// Deduped per (scope, message) and budgeted per hour so an outage cannot burn the Firestore write quota.
+const FAIL_DEDUPE_MS = 10 * 60 * 1000;
+const FAIL_BUDGET_PER_HOUR = 60;
+const _failSeen = new Map<string, number>();
+let _budget = { windowStart: Date.now(), used: 0 };
+
+function recordFailure(scope: string, err: unknown, latencyMs = 0): void {
+  const msg = errMsg(err);
+  console.error(`[fail] ${scope}: ${msg}`);
+  const now = Date.now();
+  const key = `${scope}:${msg.slice(0, 80)}`;
+  if (now - (_failSeen.get(key) ?? 0) < FAIL_DEDUPE_MS) return;
+  if (now - _budget.windowStart > 3600000) _budget = { windowStart: now, used: 0 };
+  if (_budget.used >= FAIL_BUDGET_PER_HOUR) return;
+  _budget.used++;
+  _failSeen.set(key, now);
+  if (_failSeen.size > 500) for (const [k, t] of _failSeen) if (now - t > FAIL_DEDUPE_MS) _failSeen.delete(k);
+  // fire-and-forget; this path never calls recordFailure, so it cannot recurse.
+  // REV 19: runs as the 'recordFailure' system op — works outside request context.
+  runAsSystem('recordFailure', () =>
+    firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(scope, latencyMs, false, msg) })
+  ).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
+}
+
+async function settle<T>(label: string, p: Promise<T>, fallback: T, degraded: string[]): Promise<T> {
+  try { return await p; }
+  catch (e) { degraded.push(label); recordFailure(label, e); return fallback; }
+}
+
 const okText = (obj: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(obj) }],
 });
-const errText = (tool: string, e: any) => ({
+const errText = (toolName: string, e: unknown) => ({
   isError: true,
-  content: [{ type: "text" as const, text: `${tool} failed: ${e?.message ?? e}` }],
+  content: [{ type: "text" as const, text: `${toolName} failed: ${errMsg(e)}` }],
 });
 
-// ---- Universal tool wrapper: kills 32 copies of try/catch boilerplate ----
-function tool(
+type ToolCfg<S extends z.ZodRawShape> = {
+  title: string; description: string; inputSchema: S;
+  readOnly?: boolean; destructive?: boolean; openWorld?: boolean;
+};
+
+function tool<S extends z.ZodRawShape>(
   server: McpServer,
   name: string,
-  config: { title: string; description: string; inputSchema: any; readOnly?: boolean },
-  handler: (args: any) => Promise<unknown>
-) {
-  server.registerTool(
-    name,
+  cfg: ToolCfg<S>,
+  handler: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>
+): void {
+  server.registerTool(name,
     {
-      title: config.title,
-      description: config.description,
-      inputSchema: config.inputSchema,
+      title: cfg.title,
+      description: cfg.description,
+      inputSchema: cfg.inputSchema,
       annotations: {
-        readOnlyHint: !!config.readOnly,
-        destructiveHint: false,
-        idempotentHint: !!config.readOnly,
-        openWorldHint: false,
+        readOnlyHint: !!cfg.readOnly,
+        destructiveHint: !!cfg.destructive,
+        idempotentHint: !!cfg.readOnly,
+        openWorldHint: !!cfg.openWorld,
       },
     },
-    async (args: any) => {
-      try {
-        return okText(await handler(args));
-      } catch (e: any) {
+    (async (args: z.infer<z.ZodObject<S>>) => {
+      const t0 = Date.now();
+      try { return okText(await handler(args)); }
+      catch (e) {
+        if (!(e instanceof UserError)) recordFailure(name, e, Date.now() - t0);
         return errText(name, e);
       }
-    }
+    }) as never
   );
 }
 
-// ts is mixed stringValue/timestampValue/integerValue in highway_messages.
-// Firestore orders by type first, so orderBy=ts DESC is unreliable.
-// Fetch a wide page and sort client-side by parsed wall-clock time. (AGENTS.md)
-function docTs(d: any): number {
-  const f = d?.fields ?? {};
-  return tsOf(f.tsNum) ?? tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : 0);
-}
+// ============ QUERIES ============
+const rowsOf = (data: any): Doc[] =>
+  (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean) as Doc[];
+const newest = (docs: Doc[], limit: number): Doc[] => docs.sort((a, b) => bestTs(b) - bestTs(a)).slice(0, limit);
 
-async function queryNewest(collectionId: string, limit: number): Promise<any[]> {
-  const fetchN = Math.min(Math.max(limit * 4, 50), 400);
-  const data = await firestore(`:runQuery`, {
-    method: "POST",
-    body: {
-      structuredQuery: {
-        from: [{ collectionId }],
-        orderBy: [{ field: { fieldPath: "ts" }, direction: "DESCENDING" }],
-        limit: fetchN,
-      },
-    },
-  });
-  const docs = (Array.isArray(data) ? data : []).map((r: any) => r.document).filter(Boolean);
-  return docs.sort((a, b) => docTs(b) - docTs(a)).slice(0, limit);
-}
+type Where = { field: string; op: string; value: unknown; match: (d: Doc) => boolean };
 
-async function fetchWithTimeout(url: string, as: "json" | "text", timeoutMs = 12000): Promise<any> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+// Fetch 2x, sort client-side by bestTs, slice. The composite-index fallback triggers ONLY on
+// FAILED_PRECONDITION (and is reported, with Google's index-creation link); every other error propagates.
+async function queryDocs(
+  collectionId: string,
+  o: { orderField: string; limit: number; where?: Where }
+): Promise<{ docs: Doc[]; degraded: boolean }> {
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; highway-chat/1.0)" },
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return as === "json" ? await res.json() : await res.text();
-  } finally { clearTimeout(t); }
+    const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
+      from: [{ collectionId }],
+      ...(o.where ? { where: { fieldFilter: {
+        field: { fieldPath: o.where.field }, op: o.where.op, value: o.where.value } } } : {}),
+      orderBy: [{ field: { fieldPath: o.orderField }, direction: "DESCENDING" }],
+      limit: Math.min(o.limit * 2, 400),
+    } } });
+    return { docs: newest(rowsOf(data), o.limit), degraded: false };
+  } catch (e) {
+    if (!o.where || !(e instanceof FirestoreError) || e.code !== "FAILED_PRECONDITION") throw e;
+    recordFailure(`index_missing:${collectionId}`, e);
+    const docs = (await listDocs(collectionId)).filter(o.where.match);
+    return { docs: newest(docs, o.limit), degraded: true };
+  }
 }
 
-
-// ---- Migration helpers (from original, adapted for forName) ----
-async function countDocs(collectionId: string): Promise<number | null> {
-  try {
-    const data = await firestore(`:runAggregationQuery`, {
-      method: "POST",
-      body: {
-        structuredAggregationQuery: {
-          structuredQuery: { from: [{ collectionId }] },
-          aggregations: [{ count: {}, alias: "total" }],
-        },
-      },
-    });
-    const v = data?.[0]?.result?.aggregateFields?.total;
-    if (v?.integerValue !== undefined) return Number(v.integerValue);
-    return null;
-  } catch { return null; }
+// `ts` is a mix of stringValue and timestampValue across writers, and Firestore orders by type
+// before value, so `ts` DESC alone can bury the newest docs behind string-typed ones. Legacy docs
+// lack `tsNum`, so `tsNum` alone would drop them. Merge both orderings.
+export function mergeNewest(pages: Doc[][], limit: number): Doc[] {
+  const unique = new Map<string, Doc>();
+  for (const d of pages.flat()) unique.set(d.name, d);
+  return newest([...unique.values()], limit);
 }
 
+const queryNewest = async (collectionId: string, limit: number): Promise<Doc[]> => {
+  const [byTs, byNum] = await Promise.all([
+    queryDocs(collectionId, { orderField: "ts", limit }),
+    queryDocs(collectionId, { orderField: "tsNum", limit }),
+  ]);
+  return mergeNewest([byTs.docs, byNum.docs], limit);
+};
+
+// Collections stamped only with tsNum (evolution_logs, jarvis_memory): newest-first by number,
+// falling back to a page read for legacy docs that predate tsNum.
+async function queryNewestNum(collectionId: string, limit: number): Promise<Doc[]> {
+  const { docs } = await queryDocs(collectionId, { orderField: "tsNum", limit });
+  return docs.length ? docs : newest(await listDocs(collectionId), limit);
+}
+
+// ============ SHARED MUTATION HELPERS ============
 async function patchFields(collectionId: string, docId: string, fields: Record<string, unknown>, forName?: string) {
-  const mask = Object.keys(fields).map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
-  await firestore(`/${collectionId}/${encodeURIComponent(docId)}?${mask}`, {
-    method: "PATCH", body: { fields }, forName,
+  await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, {
+    method: "PATCH", body: { fields }, forName, updateMask: Object.keys(fields),
   });
+}
+
+// Read-modify-write under an updateTime precondition: concurrent writers retry instead of
+// silently overwriting each other (react_to_message and append_note used to lose updates).
+async function mutateDoc(
+  collectionId: string,
+  docId: string,
+  mutate: (current: Fields | null) => Record<string, unknown>,
+  forName?: string
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    const cur = await getDocOrNull(collectionId, docId, forName);
+    const patch = mutate(cur?.fields ?? null);
+    const precondition = cur?.updateTime
+      ? { updateTime: cur.updateTime }
+      : { exists: false };
+    try {
+      await firestore(`/${collectionId}/${encodeURIComponent(docId)}`,
+        { method: "PATCH", body: { fields: patch }, forName, updateMask: Object.keys(patch), precondition });
+      return;
+    } catch (e) {
+      const contended = e instanceof FirestoreError &&
+        (e.code === "FAILED_PRECONDITION" || e.code === "ABORTED" || e.status === 409 || e.status === 412);
+      if (!contended || attempt >= 3) throw e;
+    }
+  }
 }
 
 function parseReactions(f: any): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  const fields = f?.mapValue?.fields ?? {};
-  for (const [k, v] of Object.entries<any>(fields)) {
-    const vals = v?.arrayValue?.values ?? [];
-    out[k] = vals.map((x: any) => x?.stringValue).filter(Boolean);
-  }
+  for (const [k, v] of Object.entries<any>(f?.mapValue?.fields ?? {}))
+    out[k] = (v?.arrayValue?.values ?? []).map((x: any) => x?.stringValue).filter(Boolean);
   return out;
 }
-
 function encodeReactions(rx: Record<string, string[]>): unknown {
   const fields: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(rx))
@@ -252,974 +713,1695 @@ function encodeReactions(rx: Record<string, string[]>): unknown {
 }
 
 async function postActivity(by: string, text: string, forName?: string): Promise<void> {
-  await firestore(`/${ACTIVITY}`, {
-    method: "POST", forName,
-    body: { fields: {
-      text: { stringValue: text },
-      by: { stringValue: by },
-      ts: nowTs(),
-    }},
-  });
+  await firestore(`/${ACTIVITY}`, { method: "POST", forName,
+    body: { fields: { text: { stringValue: text }, by: { stringValue: by }, ts: nowTs() } } });
+}
+// notify: postActivity that NEVER throws — failures go to the permanent log
+async function notify(by: string, text: string, forName?: string): Promise<void> {
+  try { await postActivity(by, text, forName); }
+  catch (e) { recordFailure(`notify:${by}`, e); }
 }
 
-async function findTask(task_id?: string, title?: string): Promise<{ id: string; fields: any } | null> {
+async function getMessageOrThrow(message_id: string, forName?: string): Promise<{ id: string; fields: Fields }> {
+  const doc = await getDocOrNull(MESSAGES, message_id, forName);
+  if (!doc?.fields) throw new UserError("message not found");
+  return { id: docIdOf(doc.name), fields: doc.fields };
+}
+function requireAuthor(fields: Fields, name: string, action: string): void {
+  const author = str(fields.name);
+  if (author.toLowerCase() !== name.toLowerCase())
+    throw new UserError(`only the author (${author}) can ${action} this message`);
+}
+
+async function findTask(task_id?: string, title?: string): Promise<{ id: string; fields: Fields } | null> {
   if (task_id) {
-    const data: any = await firestore(`/${TASKS}/${encodeURIComponent(task_id)}`, { method: "GET" }).catch(() => null);
-    if (data && data.fields) return { id: docIdOf(data.name), fields: data.fields };
-    return null;
+    const doc = await getDocOrNull(TASKS, task_id);
+    return doc?.fields ? { id: docIdOf(doc.name), fields: doc.fields } : null;
   }
   if (title) {
-    const docs = await queryNewest(TASKS, 100);
     const q = title.toLowerCase();
-    for (const d of docs) {
+    for (const d of await queryNewest(TASKS, 100)) {
       if (str(d.fields?.text).toLowerCase().includes(q))
         return { id: docIdOf(d.name), fields: d.fields ?? {} };
     }
   }
   return null;
 }
-
-function fmtTask(d: any) {
+async function getTaskOrThrow(task_id: string): Promise<{ id: string; fields: Fields }> {
+  const task = await findTask(task_id);
+  if (!task) throw new UserError("task not found");
+  return task;
+}
+function fmtTask(d: Doc) {
   const f = d.fields ?? {};
   return {
-    id: docIdOf(d.name),
-    text: str(f.text),
-    done: boolOf(f.done),
-    createdBy: str(f.createdBy),
-    assignee: str(f.assignee) || null,
-    priority: str(f.priority) || null,
-    ts: tsOf(f.ts),
+    id: docIdOf(d.name), text: str(f.text), done: boolOf(f.done),
+    createdBy: str(f.createdBy), assignee: str(f.assignee) || null,
+    priority: str(f.priority) || null, ts: tsOf(f.ts),
   };
 }
+function fmtAttachment(v: any) {
+  const f = v?.mapValue?.fields ?? {};
+  return { id: str(f.id), filename: str(f.filename), mime_type: str(f.mime_type),
+    size_bytes: f.size_bytes?.integerValue !== undefined ? Number(f.size_bytes.integerValue) : null,
+    storage_path: str(f.storage_path), download_url: str(f.download_url),
+    is_image: f.is_image?.booleanValue ?? false, uploaded_by: str(f.uploaded_by) };
+}
 
-// fetchJson/fetchText as thin wrappers over fetchWithTimeout
-async function fetchJson(url: string, timeoutMs = 12000): Promise<any> {
-  return fetchWithTimeout(url, "json", timeoutMs);
+type FmtMsg = {
+  id: string; name: string; text: string; ts: number | null; attachments?: unknown[];
+  audio?: string; audioType?: string; audioBytes?: number;
+};
+
+export function fmtMsg(d: Doc): FmtMsg {
+  const f = d.fields ?? {};
+  const attVals = f.attachments?.arrayValue?.values ?? [];
+  const attachments = Array.isArray(attVals) ? attVals.map(fmtAttachment) : [];
+  const msg: FmtMsg = { id: docIdOf(d.name), name: str(f.name), text: str(f.text),
+    ts: tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null) };
+  if (attachments.length > 0) msg.attachments = attachments;
+  // Voice messages store inline base64 audio + audioType on the doc, not in attachments.
+  const audio = str(f.audio);
+  if (audio) {
+    msg.audio = audio;
+    msg.audioType = str(f.audioType) || "audio/webm";
+    msg.audioBytes = Math.floor(audio.length * 3 / 4);
+  }
+  return msg;
 }
-async function fetchText(url: string, timeoutMs = 12000): Promise<string> {
-  return fetchWithTimeout(url, "text", timeoutMs);
+
+async function countDocs(collectionId: string): Promise<number | null> {
+  try {
+    const data = await firestore(`:runAggregationQuery`, { method: "POST", body: {
+      structuredAggregationQuery: {
+        structuredQuery: { from: [{ collectionId }] },
+        aggregations: [{ count: {}, alias: "total" }],
+      } } });
+    const v = data?.[0]?.result?.aggregateFields?.total;
+    return v?.integerValue !== undefined ? Number(v.integerValue) : null;
+  } catch (e) {
+    recordFailure(`countDocs:${collectionId}`, e);
+    return null;
+  }
 }
-function extractDomain(url: string): string {
-  try { return new URL(url).hostname; } catch { return ""; }
-}
-function faviconFor(url: string): string {
-  const d = extractDomain(url);
-  return d ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : "";
-}
+const faviconFor = (url: string): string => {
+  const d = hostOf(url);
+  return d && d !== url ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : "";
+};
 const fmtUsd = (n: number): string =>
   n >= 1000 ? "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 })
   : n >= 1 ? "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 })
   : "$" + n.toPrecision(3);
 const fmtPct = (n: number): string => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
 function impactLine(pct: number, holder: string): string {
-  if (pct >= 5) return "Ripping \u2014 big green day. " + holder + " are up.";
-  if (pct >= 1.5) return "Green \u2014 momentum building for " + holder + ".";
-  if (pct <= -5) return "Dumping \u2014 don't panic-sell, " + holder + ".";
-  if (pct <= -1.5) return "Dipping \u2014 cheaper if you were buying, " + holder + ".";
-  return "Flat \u2014 nothing to act on today.";
+  if (pct >= 5) return "Ripping — big green day. " + holder + " are up.";
+  if (pct >= 1.5) return "Green — momentum building for " + holder + ".";
+  if (pct <= -5) return "Dumping — don't panic-sell, " + holder + ".";
+  if (pct <= -1.5) return "Dipping — cheaper if you were buying, " + holder + ".";
+  return "Flat — nothing to act on today.";
+}
+// Timeless macro framing — NO hardcoded figures (standing mandate)
+function macroImpact(title: string): string {
+  const t = title.toLowerCase();
+  if (/rate|fed|interest|treasury|yield/.test(t)) return "Rates move → every loan, card, and mortgage reprices. Watch the Fed.";
+  if (t.includes("inflation") || t.includes("cpi")) return "Inflation above target → the Fed can't cut. Your dollar buys less.";
+  if (/jobs|unemployment|wage|hiring/.test(t)) return "Jobs data → hiring freeze or boom. Watch revisions, not headlines.";
+  if (t.includes("tariff")) return "Tariffs → import prices climb. Supply chains reroute.";
+  if (/housing|mortgage|rent/.test(t)) return "Housing costs → the biggest line in most budgets. Rates decide everything.";
+  if (/oil|gas|energy|opec|brent/.test(t)) return "Energy prices → gas, diesel, and shipping costs move together.";
+  if (/\btax(es)?\b/.test(t)) return "Tax policy → what you keep changes. Watch what actually passes.";
+  if (/trump|white house|congress|election|midterm/.test(t)) return "Power shifts → markets reprice. Policy follows the winners.";
+  if (/ukraine|russia|iran|israel|gaza|taiwan|war|hormuz/.test(t)) return "Conflict → oil spikes, markets shake. Watch escalation, not noise.";
+  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI buildout → who funds it and at what rates decides the winners.";
+  if (/spacex|nasa|moon|mars|artemis|starship/.test(t)) return "Space milestones → long-horizon bets. Track launches, not promises.";
+  if (/food|wheat|corn|crop|drought|famine|ebt|snap|beef/.test(t)) return "Food prices → weather and policy. Staples first, speculation never.";
+  if (/hurricane|storm|flood|earthquake|wildfire|tornado/.test(t)) return "Disaster → supply chains break, insurance spikes.";
+  if (/bitcoin|btc|crypto|ethereum/.test(t)) return "Crypto moves with liquidity. Watch the dollar and rates, not the hype.";
+  return "Major shift → watch your wallet, not the headlines.";
 }
 
-function buildServer() {
-  const server = new McpServer({ name: "highway-chat-mcp-server", version: "2.0.0" });
+// ============ FEEDS (RSS item + Atom entry, one parser) ============
+// Block-scoped (a missing <link> can no longer bleed into the next item), RDF-tolerant
+// (<item rdf:about=…>), entity-decoded (&amp; in titles and URLs), CDATA-safe.
+type FeedItem = { title: string; link: string };
+const clean = (s: string): string => decodeEntities(s.replace(/<!\[CDATA\[|\]\]>/g, "")).trim();
 
-tool(server, "read_messages",
-  { title: "Read Highway messages",
-    description: "Read the newest messages from Highway Chat, newest first.",
-    inputSchema: { limit: z.number().int().min(1).max(50).default(10) },
-    readOnly: true },
-  async ({ limit }) => {
-    const messages = (await queryNewest(MESSAGES, limit)).map((d: any) => {
-      const f = d.fields ?? {};
-      const attVals = f.attachments?.arrayValue?.values ?? [];
-      const attachments = (Array.isArray(attVals) ? attVals : []).map((v: any) => {
-        const af = v?.mapValue?.fields ?? {};
-        return { id: str(af.id), filename: str(af.filename), mime_type: str(af.mime_type),
-          size_bytes: af.size_bytes?.integerValue !== undefined ? Number(af.size_bytes.integerValue) : null,
-          download_url: str(af.download_url), is_image: af.is_image?.booleanValue ?? false };
-      }).filter((a: any) => a.download_url);
-      const msg: any = {
-        name: str(f.name), text: str(f.text),
-        ts: tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null),
-      };
-      if (attachments.length > 0) msg.attachments = attachments;
-      // Voice messages: UI stores inline audio (base64) + audioType, not in attachments.
-      const audio = str(f.audio);
-      if (audio) {
-        msg.audio = audio;
-        msg.audioType = str(f.audioType) || "audio/webm";
-        msg.audioBytes = Math.floor(audio.length * 3 / 4); // approx decoded size
-      }
-      return msg;
-    });
-    return { count: messages.length, messages };
+function parseFeed(xml: string, limit: number): FeedItem[] {
+  const items: FeedItem[] = [];
+  const blocks = xml.matchAll(/<(item|entry)[\s>][\s\S]*?<\/\1>/g);
+  for (const [block] of blocks) {
+    if (items.length >= limit) break;
+    const title = clean(block.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1] ?? "");
+    const link = clean(block.match(/<link>([\s\S]*?)<\/link>/)?.[1] ?? "")
+      || clean(block.match(/<link\b[^>]*?href="([^"]+)"/)?.[1] ?? "");
+    if (title && link) items.push({ title, link });
   }
-);
+  return items;
+}
 
-  // send_message — migrated to tool() wrapper
+// ============ ROUTER ============
+// Prefix-anchored: "capital" no longer routes to coding via "api", "start" no longer to creative via "art".
+const ROUTES: Array<{ type: string; bot: string; reason: string; re: RegExp }> = [
+  { type: "coding",       bot: "deepseek", reason: "deepseek specializes in code",
+    re: /\b(?:code|coding|debug|script|function|api\b|bug|deploy|git\b|github|sql|regex)/ },
+  { type: "creative",     bot: "ember",    reason: "ember specializes in creative work",
+    re: /\b(?:write|story|poem|lyric|creative|design|art(?:ist|work|s)?\b|draw)/ },
+  { type: "research",     bot: "grok",     reason: "grok specializes in research",
+    re: /\b(?:research|analy[sz]e|investigate|compare|explain|what is|why\b)/ },
+  { type: "logic",        bot: "gemini",   reason: "gemini specializes in logic",
+    re: /\b(?:math|calculat|logic|prove|equation|statistic)/ },
+  { type: "coordination", bot: "whisper",  reason: "whisper is the team coordinator",
+    re: /\b(?:coordinat|plan(?:s|ning)?\b|organi[sz]e|manage|team|schedul)/ },
+];
+
+const nameSchema = z.string().trim().min(1).max(40);
+const channelSchema = z.enum(["room", "dm"]).default("room");
+const channelCollection = (channel: string): string => (channel === "dm" ? DMS : MESSAGES);
+
+// Built PER REQUEST. A shared McpServer rejects every overlapping call with
+// "Already connected to a transport" — the SDK's stateless pattern is one server per request.
+function buildServer(): McpServer {
+  const server = new McpServer({ name: "highway-chat-mcp-server", version: "3.1.0" });
+
+  // ---- Messages ----
+  tool(server, "read_messages",
+        { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first. Use channel 'dm' for the private Nexus DM channel.",
+      inputSchema: { limit: z.number().int().min(1).max(50).default(10), channel: channelSchema }, readOnly: true },
+    async ({ limit, channel }) => {
+      const messages = (await queryNewest(channelCollection(channel), limit)).map(fmtMsg);
+      return { count: messages.length, messages };
+    });
+
+  const attachmentSchema = z.object({
+    id: z.string().trim().min(1).max(50),
+    filename: z.string().trim().min(1).max(255),
+    mime_type: z.string().trim().min(1).max(100),
+    size_bytes: z.number().int().min(1).max(25 * 1024 * 1024),
+    storage_path: z.string().trim().min(1).max(500),
+    download_url: z.string().url().max(2000),
+    is_image: z.boolean().optional().default(false),
+  });
+
+  // Input variant: storage_path/download_url optional when data_base64 is
+  // supplied — the bridge uploads to Cloudinary first and fills them in.
+  const attachmentInputSchema = attachmentSchema.extend({
+    storage_path: z.string().trim().min(1).max(500).optional(),
+    download_url: z.string().url().max(2000).optional(),
+    data_base64: z.string().min(1).max(14_000_000).optional()
+      .describe("Inline file content (base64, ~10MB max). When present the bridge uploads to Cloudinary and returns the CDN URL as download_url."),
+  });
+
   tool(server, "send_message",
-    { title: "Send a Highway message",
-      description: "Post a message to Highway Chat. Timestamp is generated automatically.",
+    { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        text: z.string().trim().min(1).max(2000),
+        name: nameSchema,
+        text: messageTextSchema().describe(`Message text, posted in full (up to ${MESSAGE_MAX_CHARS.toLocaleString("en-US")} chars; long messages display collapsed with tap-to-expand).`),
+        channel: channelSchema,
+        reply_to: z.string().trim().min(1).optional().describe("Doc ID of the message being replied to (for threading + dispatch lock)"),
+        idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
+        attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
       } },
-    async ({ name, text }) => {
-      const ts = Date.now();
-      await firestore(`/${MESSAGES}`, { method: "POST", body: buildMessageFields(name, text), forName: name });
-      return { ok: true, name, ts };
-    }
-  );
+    async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
+      // Phase 3 Section D: Dispatch lock enforcement
+      let lockCheck: LockCheck | null = null;
+      if (reply_to) {
+        // Structured disagreement bypasses the lock
+        const isDisagreement = /^(DISAGREE|CHALLENGE)\s*:/i.test(text.trim());
+        if (!isDisagreement) {
+          lockCheck = await checkDispatchLock(reply_to, name);
+          if (!lockCheck.allowed) {
+            throw new UserError(lockCheck.reason || "Message is dispatch-locked");
+          }
+        }
+      }
+      // Spec §2 ledger: once the reply lands, the routed agent claims its lock.
+      // Non-fatal — a failed claim must never fail the send.
+      const claimLock = async () => {
+        if (reply_to && lockCheck?.routedTo && name.toLowerCase() === lockCheck.routedTo) {
+          await markLockClaimed(reply_to, name);
+        }
+      };
+      // Phase 3 Section B: attachments — inline data uploads to Cloudinary
+      // first (secret stays server-side); metadata refs are validated as-is.
+      const finalAttachments: AttachmentMeta[] = [];
+      if (attachments) {
+        for (const att of attachments) {
+          if (att.data_base64) {
+            finalAttachments.push(await uploadAttachmentData({
+              filename: att.filename, mime_type: att.mime_type,
+              data_base64: att.data_base64, uploadedBy: name,
+            }));
+          } else {
+            if (!att.storage_path || !att.download_url) {
+              throw new UserError("Attachment needs storage_path + download_url, or data_base64 for bridge-side upload");
+            }
+            validateAttachment({ mime_type: att.mime_type, size_bytes: att.size_bytes, storage_path: att.storage_path }, name);
+            finalAttachments.push({
+              id: att.id, filename: att.filename, mime_type: att.mime_type,
+              size_bytes: att.size_bytes, storage_path: att.storage_path,
+              download_url: att.download_url, is_image: att.is_image ?? false,
+              uploaded_by: name,
+            });
+          }
+        }
+      }
+      // Long messages: the FULL text posts as the message — no preview split,
+      // no truncation, no attachment machinery (sin's directive 2026-10-09).
+      // The schema cap (100k chars, ~400KB worst case) sits well under
+      // Firestore's 1 MiB doc limit. Zero cost, zero services.
+      const body = buildMessageFields(name, text, { reply_to, idempotency_key });
+      if (finalAttachments.length > 0) {
+        (body.fields as Record<string, unknown>).attachments = {
+          arrayValue: { values: finalAttachments.map(att => ({
+            mapValue: { fields: {
+              id: { stringValue: att.id },
+              filename: { stringValue: att.filename },
+              mime_type: { stringValue: att.mime_type },
+              size_bytes: { integerValue: String(att.size_bytes) },
+              storage_path: { stringValue: att.storage_path },
+              download_url: { stringValue: att.download_url },
+              is_image: { booleanValue: att.is_image || false },
+              uploaded_by: { stringValue: att.uploaded_by },
+              uploaded_at: nowTs(),
+            } }
+          })) }
+        };
+      }
+      if (idempotency_key) {
+        // Deterministic id + check-before-write (hollow #35): same key twice = one message.
+        const coll = channelCollection(channel);
+        const docId = idemDocId(channel, idempotency_key);
+        const res = await writeIdempotent(coll, docId, body, name, idemIo);
+        await claimLock();
+        return { ok: true, duplicate: res.duplicate, id: res.id, name, ts: Date.now() };
+      }
+      await firestore(`/${channelCollection(channel)}`, {
+        method: "POST",
+        body,
+        forName: name,
+      });
+      await claimLock();
+      return { ok: true, name, ts: Date.now(), chars: text.length };
+    });
 
-  // send_voice — migrated to tool() wrapper
   tool(server, "send_voice",
-    { title: "Send a Highway voice message",
-      description: "Post a voice message to Highway Chat. Provide base64-encoded audio (webm/mp4, max 800KB).",
+    { title: "Send a Highway voice message", description: "Post a voice message (base64 audio, max ~750KB decoded; a Firestore doc caps at 1 MiB).",
       inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        audio: z.string().min(1).max(1100000),
+        name: nameSchema, audio: z.string().min(1).max(1000000),
         audioType: z.string().optional().default("audio/webm"),
         caption: z.string().trim().max(200).optional().default("🎤 voice message"),
       } },
     async ({ name, audio, audioType, caption }) => {
-      const ts = Date.now();
-      const fields = buildMessageFields(name, caption || "🎤 voice message");
-      (fields.fields as any).audio = { stringValue: audio };
-      (fields.fields as any).audioType = { stringValue: audioType || "audio/webm" };
-      await firestore(`/${MESSAGES}`, { method: "POST", body: fields, forName: name });
-      return { ok: true, name, ts };
-    }
-  );
-
-const ROUTES: Array<{ type: string; bot: string; reason: string; re: RegExp }> = [
-  { type: "coding",       bot: "deepseek", reason: "deepseek specializes in code",
-    re: /code|debug|script|function|api|bug|deploy|git|sql|regex/ },
-  { type: "creative",     bot: "ember",    reason: "ember specializes in creative work",
-    re: /write|story|poem|lyric|creative|design|art|draw/ },
-  { type: "research",     bot: "grok",     reason: "grok specializes in research",
-    re: /research|analy[sz]e|investigate|compare|explain|what is|why/ },
-  { type: "logic",        bot: "gemini",   reason: "gemini specializes in logic",
-    re: /math|calculat|logic|prove|equation|statistic/ },
-  { type: "coordination", bot: "whisper",  reason: "whisper is the team coordinator",
-    re: /coordinat|plan|organi[sz]e|manage|team|schedul/ },
-];
-
-tool(server, "route_task",
-  { title: "Route a task to the best AI",
-    description: "Analyze a task and recommend which team AI should handle it.",
-    inputSchema: { task: z.string().trim().min(1).max(2000) },
-    readOnly: true },
-  async ({ task }) => {
-    const t = task.toLowerCase();
-    const hit = ROUTES.find((r) => r.re.test(t));
-    return {
-      task, taskType: hit?.type ?? "general",
-      recommended: hit?.bot ?? "whisper",
-      reason: hit?.reason ?? "default coordinator",
-    };
-  }
-);
-
-  // save_milestone — migrated to tool() wrapper
-  tool(server, "save_milestone",
-    { title: "Save a milestone to evolution log",
-      description: "Log a significant moment to the permanent evolution timeline.",
-      inputSchema: {
-        text: z.string().trim().min(1).max(2000),
-        type: z.string().optional().default("milestone"),
-      } },
-    async ({ text, type }) => {
-      const doc = { fields: {
-        type: { stringValue: type || "milestone" },
-        text: { stringValue: text },
-        tsNum: { integerValue: String(Date.now()) },
-      }};
-      await firestore(`/${EVO_LOGS}`, { method: "POST", body: doc });
-      return { ok: true };
-    }
-  );
-
-  // recall_context — migrated to tool() wrapper
-  tool(server, "recall_context",
-    { title: "Recall lifetime context",
-      description: "Read the permanent evolution timeline and stored preferences.",
-      inputSchema: { limit: z.number().int().min(1).max(50).optional().default(20) },
-      readOnly: true },
-    async ({ limit }) => {
-      const logs = await firestore(`/${EVO_LOGS}?pageSize=${limit || 20}`, { method: "GET" });
-      const mems = await firestore(`/${JARVIS_MEM}?pageSize=${limit || 20}`, { method: "GET" });
-      return { evolution_logs: logs, jarvis_memory: mems };
-    }
-  );
-
-  // store_preference — migrated to tool() wrapper
-  tool(server, "store_preference",
-    { title: "Store a user preference",
-      description: "Save a durable preference to permanent memory.",
-      inputSchema: {
-        key: z.string().trim().min(1).max(200),
-        value: z.string().trim().min(1).max(2000),
-      } },
-    async ({ key, value }) => {
-      const doc = { fields: {
-        key: { stringValue: key },
-        value: { stringValue: value },
-        tsNum: { integerValue: String(Date.now()) },
-      }};
-      await firestore(`/${JARVIS_MEM}`, { method: "POST", body: doc });
-      return { ok: true, key };
-    }
-  );
-
-  // log_correction — migrated to tool() wrapper
-  tool(server, "log_correction",
-    { title: "Log a correction to permanent memory",
-      description: "When the user corrects the AI, log it so the mistake is never repeated.",
-      inputSchema: {
-        correction: z.string().trim().min(1).max(2000),
-        context: z.string().trim().max(500).optional().default(""),
-      } },
-    async ({ correction, context }) => {
-      const doc = { fields: {
-        type: { stringValue: "correction" },
-        text: { stringValue: `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}` },
-        tsNum: { integerValue: String(Date.now()) },
-      }};
-      await firestore(`/${EVO_LOGS}`, { method: "POST", body: doc });
-      return { ok: true };
-    }
-  );
+      const doc = buildMessageFields(name, caption || "🎤 voice message");
+      const fields: Fields = doc.fields;
+      fields.audio = { stringValue: audio };
+      fields.audioType = { stringValue: audioType || "audio/webm" };
+      await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name });
+      return { ok: true, name, ts: Date.now() };
+    });
 
 
-  // ============ MIGRATED: Presence ============
-  tool(server, "set_presence",
-    { title: "Set Highway presence",
-      description: "Mark a participant as present in Highway Chat. One doc per name, updated in place.",
-      inputSchema: { name: z.string().trim().min(1).max(40) } },
-    async ({ name }) => {
-      const ts = Date.now();
-      const docId = encodeURIComponent(name.toLowerCase().replace(/[\/\s]+/g, "_"));
-      await firestore(`/${PRESENCE}/${docId}`, {
-        method: "PATCH", forName: name,
-        body: { fields: { name: { stringValue: name }, ts: nowTs() } },
-      });
-      return { ok: true, name, ts };
-    }
-  );
+  tool(server, "route_task",
+    { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it.",
+      inputSchema: { task: z.string().trim().min(1).max(2000) }, readOnly: true },
+    async ({ task }) => {
+      const hit = ROUTES.find((r) => r.re.test(task.toLowerCase()));
+      return { task, taskType: hit?.type ?? "general",
+        recommended: hit?.bot ?? "whisper", reason: hit?.reason ?? "default coordinator" };
+    });
 
-  tool(server, "get_presence",
-    { title: "Get Highway presence",
-      description: "Who is currently online in Highway Chat. Online = heartbeat fresher than 90 seconds.",
-      inputSchema: {}, readOnly: true },
-    async () => {
-      const data: any = await firestore(`/${PRESENCE}`, { method: "GET" });
-      const now = Date.now();
-      const people = (data.documents ?? []).map((d: any) => {
-        const f = d.fields ?? {};
-        const ts = tsOf(f.ts);
-        return { name: str(f.name), ts, online: ts !== null && now - ts < 90000 };
-      });
-      return { count: people.length, online: people.filter((p: any) => p.online).length, people };
-    }
-  );
-
-  // ============ MIGRATED: Typing ============
-  tool(server, "set_typing",
-    { title: "Set typing indicator",
-      description: "Show (or clear) your typing indicator in Highway Chat.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        typing: z.boolean(),
-      } },
-    async ({ name, typing }) => {
-      const docId = `mcp-${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
-      await patchFields(TYPING, docId, {
-        name: { stringValue: name },
-        typing: { booleanValue: typing },
-        ts: nowTs(),
-      }, name);
-      return { ok: true, name, typing };
-    }
-  );
-
-  // ============ MIGRATED: Messages ============
   tool(server, "edit_message",
-    { title: "Edit a Highway message",
-      description: "Edit the text of a message you posted. Only the original author (by name) can edit.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        message_id: z.string().trim().min(1),
-        text: z.string().trim().min(1).max(2000),
-      } },
+    { title: "Edit a Highway message", description: "Edit your own message. Only the original author can edit.",
+      inputSchema: { name: nameSchema, message_id: z.string().trim().min(1), text: z.string().trim().min(1).max(2000) } },
     async ({ name, message_id, text }) => {
-      const data: any = await firestore(`/${MESSAGES}/${encodeURIComponent(message_id)}`, { method: "GET", forName: name }).catch(() => null);
-      if (!data || !data.fields) throw new Error("message not found");
-      const author = str(data.fields.name);
-      if (author.toLowerCase() !== name.toLowerCase())
-        throw new Error(`only the author (${author}) can edit this message`);
-      await patchFields(MESSAGES, docIdOf(data.name), { text: { stringValue: text } }, name);
-      return { ok: true, message_id: docIdOf(data.name), text };
-    }
-  );
+      const { id, fields } = await getMessageOrThrow(message_id, name);
+      requireAuthor(fields, name, "edit");
+      await patchFields(MESSAGES, id, { text: { stringValue: text } }, name);
+      return { ok: true, message_id: id, text };
+    });
 
   tool(server, "delete_message",
-    { title: "Delete a Highway message",
-      description: "Delete a message you posted. Only the original author (by name) can delete.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        message_id: z.string().trim().min(1),
-      } },
+    { title: "Delete a Highway message", description: "Delete your own message. Only the original author can delete.",
+      inputSchema: { name: nameSchema, message_id: z.string().trim().min(1) }, destructive: true },
     async ({ name, message_id }) => {
-      const data: any = await firestore(`/${MESSAGES}/${encodeURIComponent(message_id)}`, { method: "GET", forName: name }).catch(() => null);
-      if (!data || !data.fields) throw new Error("message not found");
-      const author = str(data.fields.name);
-      if (author.toLowerCase() !== name.toLowerCase())
-        throw new Error(`only the author (${author}) can delete this message`);
-      await firestore(`/${MESSAGES}/${encodeURIComponent(docIdOf(data.name))}`, { method: "DELETE", forName: name });
-      return { ok: true, message_id: docIdOf(data.name), deleted: true };
-    }
-  );
+      const { id, fields } = await getMessageOrThrow(message_id, name);
+      requireAuthor(fields, name, "delete");
+      await firestore(`/${MESSAGES}/${encodeURIComponent(id)}`, { method: "DELETE", forName: name });
+      return { ok: true, message_id: id, deleted: true };
+    });
 
   tool(server, "react_to_message",
-    { title: "React to a Highway message",
-      description: "Toggle an emoji reaction on a message.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        message_id: z.string().trim().min(1),
-        emoji: z.string().trim().min(1).max(8),
-      } },
+    { title: "React to a Highway message", description: "Toggle an emoji reaction on a message.",
+      inputSchema: { name: nameSchema, message_id: z.string().trim().min(1), emoji: z.string().trim().min(1).max(8) } },
     async ({ name, message_id, emoji }) => {
-      const data: any = await firestore(`/${MESSAGES}/${encodeURIComponent(message_id)}`, { method: "GET", forName: name }).catch(() => null);
-      if (!data || !data.fields) throw new Error("message not found");
-      const rx = parseReactions(data.fields.reactions);
-      const users = rx[emoji] ?? [];
-      const i = users.findIndex((u) => u.toLowerCase() === name.toLowerCase());
-      let action: string;
-      if (i >= 0) { users.splice(i, 1); action = "removed"; } else { users.push(name); action = "added"; }
-      if (users.length) rx[emoji] = users; else delete rx[emoji];
-      await patchFields(MESSAGES, docIdOf(data.name), { reactions: encodeReactions(rx) }, name);
-      return { ok: true, message_id: docIdOf(data.name), emoji, action, reactions: rx };
-    }
-  );
+      const { id } = await getMessageOrThrow(message_id, name);
+      let action = "added";
+      let result: Record<string, string[]> = {};
+      await mutateDoc(MESSAGES, id, (current) => {
+        const rx = parseReactions(current?.reactions);
+        const users = rx[emoji] ?? [];
+        const i = users.findIndex((u) => u.toLowerCase() === name.toLowerCase());
+        if (i >= 0) { users.splice(i, 1); action = "removed"; } else { users.push(name); action = "added"; }
+        if (users.length) rx[emoji] = users; else delete rx[emoji];
+        result = rx;
+        return { reactions: encodeReactions(rx) };
+      }, name);
+      return { ok: true, message_id: id, emoji, action, reactions: result };
+    });
 
   tool(server, "search_messages",
-    { title: "Search Highway messages",
-      description: "Search recent chat history for a keyword (case-insensitive). Scans up to 200 newest.",
-      inputSchema: {
-        query: z.string().trim().min(1).max(100),
-        limit: z.number().int().min(1).max(50).default(10),
-      }, readOnly: true },
+    { title: "Search Highway messages", description: "Keyword search over the 200 newest messages.",
+      inputSchema: { query: z.string().trim().min(1).max(100), limit: z.number().int().min(1).max(50).default(10) },
+      readOnly: true },
     async ({ query, limit }) => {
-      const docs = await queryNewest(MESSAGES, 200);
       const q = query.toLowerCase();
-      const matches = docs
-        .map((d) => {
-          const f = d.fields ?? {};
-          return { id: docIdOf(d.name), name: str(f.name), text: str(f.text), ts: tsOf(f.ts) };
-        })
+      const matches = (await queryNewest(MESSAGES, 200)).map(fmtMsg)
         .filter((m) => m.text.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
         .slice(0, limit);
       return { count: matches.length, query, matches };
-    }
-  );
+    });
 
   tool(server, "pin_message",
-    { title: "Pin or unpin a Highway message",
-      description: "Pin a message so it stands out, or unpin it.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        message_id: z.string().trim().min(1),
-        pinned: z.boolean().default(true),
-      } },
+    { title: "Pin or unpin a Highway message", description: "Pin a message so it stands out, or unpin it.",
+      inputSchema: { name: nameSchema, message_id: z.string().trim().min(1), pinned: z.boolean().default(true) } },
     async ({ name, message_id, pinned }) => {
-      const data: any = await firestore(`/${MESSAGES}/${encodeURIComponent(message_id)}`, { method: "GET", forName: name }).catch(() => null);
-      if (!data || !data.fields) throw new Error("message not found");
-      await patchFields(MESSAGES, docIdOf(data.name), { pinned: { booleanValue: pinned } }, name);
-      await postActivity(name, `${pinned ? "pinned" : "unpinned"} a message: ${str(data.fields.text).slice(0, 120)}`, name);
-      return { ok: true, message_id: docIdOf(data.name), pinned };
-    }
-  );
+      const { id, fields } = await getMessageOrThrow(message_id, name);
+      await patchFields(MESSAGES, id, { pinned: { booleanValue: pinned } }, name);
+      await notify(name, `${pinned ? "pinned" : "unpinned"} a message: ${str(fields.text).slice(0, 120)}`, name);
+      return { ok: true, message_id: id, pinned };
+    });
 
   tool(server, "read_pinned",
-    { title: "Read pinned Highway messages",
-      description: "List messages currently pinned in Highway Chat, newest first.",
-      inputSchema: { limit: z.number().int().min(1).max(50).default(20) },
-      readOnly: true },
+    { title: "Read pinned Highway messages", description: "List pinned messages, newest first.",
+      inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const data = await firestore(`:runQuery`, {
-        method: "POST",
-        body: {
-          structuredQuery: {
-            from: [{ collectionId: MESSAGES }],
-            where: { fieldFilter: { field: { fieldPath: "pinned" }, op: "EQUAL", value: { booleanValue: true } } },
-            orderBy: [{ field: { fieldPath: "ts" }, direction: "DESCENDING" }],
-            limit,
-          },
-        },
-      });
-      const pins = (Array.isArray(data) ? data : [])
-        .map((r: any) => r.document).filter(Boolean)
-        .map((d: any) => {
-          const f = d.fields ?? {};
-          return { id: docIdOf(d.name), name: str(f.name), text: str(f.text), ts: tsOf(f.ts) };
-        });
-      return { count: pins.length, pins };
-    }
-  );
+      const { docs, degraded } = await queryDocs(MESSAGES, { orderField: "ts", limit, where: {
+        field: "pinned", op: "EQUAL", value: { booleanValue: true }, match: (d) => boolOf(d.fields?.pinned) } });
+      const pins = docs.map(fmtMsg);
+      return { count: pins.length, pins, ...(degraded ? { degraded: true } : {}) };
+    });
 
-  // ============ MIGRATED: Activity ============
+  // ---- Presence / Typing ----
+  tool(server, "set_presence",
+    { title: "Set Highway presence", description: "Mark a participant as present. One doc per name, updated in place.",
+      inputSchema: { name: nameSchema } },
+    async ({ name }) => {
+      const docId = encodeURIComponent(name.toLowerCase().replace(/[/\s]+/g, "_"));
+      await firestore(`/${PRESENCE}/${docId}`, { method: "PATCH", forName: name,
+        body: { fields: { name: { stringValue: name }, ts: nowTs() } } });
+      return { ok: true, name, ts: Date.now() };
+    });
+
+  tool(server, "get_presence",
+    { title: "Get Highway presence", description: "Who is online. Online = heartbeat fresher than 90 seconds.",
+      inputSchema: {}, readOnly: true },
+    async () => {
+      const people = (await listDocs(PRESENCE)).map((d) => {
+        const ts = tsOf(d.fields?.ts);
+        return { name: str(d.fields?.name), ts, online: isOnline(ts) };
+      });
+      return { count: people.length, online: people.filter((p) => p.online).length, people };
+    });
+
+  tool(server, "set_typing",
+    { title: "Set typing indicator", description: "Show (or clear) your typing indicator.",
+      inputSchema: { name: nameSchema, typing: z.boolean() } },
+    async ({ name, typing }) => {
+      await patchFields(TYPING, `mcp-${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
+        { name: { stringValue: name }, typing: { booleanValue: typing }, ts: nowTs() }, name);
+      return { ok: true, name, typing };
+    });
+
+  // ---- Memory flywheel ----
+  tool(server, "save_milestone",
+    { title: "Save a milestone to evolution log", description: "Log a significant moment to the permanent timeline.",
+      inputSchema: { text: z.string().trim().min(1).max(2000), type: z.string().optional().default("milestone") } },
+    async ({ text, type }) => {
+      await firestore(`/${EVO_LOGS}`, { method: "POST", body: evoDoc(type || "milestone", text) });
+      return { ok: true };
+    });
+
+  // Newest-first (the old page read returned an arbitrary slice). Telemetry is excluded by default so
+  // failure/latency logs cannot drown the memory timeline. Output is compact {id,…} rows, not raw Firestore.
+  tool(server, "recall_context",
+    { title: "Recall lifetime context", description: "Read the newest evolution timeline entries and stored preferences.",
+      inputSchema: { limit: z.number().int().min(1).max(50).optional().default(20),
+        include_telemetry: z.boolean().optional().default(false) }, readOnly: true },
+    async ({ limit, include_telemetry }) => {
+      const n = limit || 20;
+      const [logDocs, memDocs] = await Promise.all([
+        queryNewestNum(EVO_LOGS, include_telemetry ? n : Math.min(n * 3, 150)),
+        queryNewestNum(JARVIS_MEM, n),
+      ]);
+      const evolution_logs = logDocs
+        .filter((d) => include_telemetry || str(d.fields?.type) !== "telemetry")
+        .slice(0, n)
+        .map((d) => ({ id: docIdOf(d.name), type: str(d.fields?.type), text: str(d.fields?.text), ts: bestTs(d) }));
+      const jarvis_memory = memDocs.map((d) => ({
+        id: docIdOf(d.name), key: str(d.fields?.key), value: str(d.fields?.value), ts: bestTs(d) }));
+      return { evolution_logs, jarvis_memory };
+    });
+
+  tool(server, "store_preference",
+    { title: "Store a user preference", description: "Save a durable preference to permanent memory.",
+      inputSchema: { key: z.string().trim().min(1).max(200), value: z.string().trim().min(1).max(2000) } },
+    async ({ key, value }) => {
+      await firestore(`/${JARVIS_MEM}`, { method: "POST",
+        body: { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } } });
+      return { ok: true, key };
+    });
+
+  tool(server, "log_correction",
+    { title: "Log a correction to permanent memory", description: "Log a user correction so the mistake is never repeated.",
+      inputSchema: { correction: z.string().trim().min(1).max(2000), context: z.string().trim().max(500).optional().default("") } },
+    async ({ correction, context }) => {
+      await firestore(`/${EVO_LOGS}`, { method: "POST",
+        body: evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`) });
+      return { ok: true };
+    });
+
+  // ---- Activity ----
   tool(server, "log_activity",
-    { title: "Log Highway activity",
-      description: "Post an entry to the Highway Chat ACTIVITY feed.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        text: z.string().trim().min(1).max(300),
-      } },
+    { title: "Log Highway activity", description: "Post an entry to the ACTIVITY feed.",
+      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(300) } },
     async ({ name, text }) => {
       await postActivity(name, text, name);
       return { ok: true, name, text, ts: Date.now() };
-    }
-  );
+    });
 
   tool(server, "read_activity",
-    { title: "Read Highway activity",
-      description: "Read recent entries from the Highway Chat ACTIVITY feed, newest first.",
-      inputSchema: { limit: z.number().int().min(1).max(50).default(20) },
-      readOnly: true },
+    { title: "Read Highway activity", description: "Read recent ACTIVITY feed entries, newest first.",
+      inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const docs = await queryNewest(ACTIVITY, limit);
-      const entries = docs.map((d) => {
+      const entries = (await queryNewest(ACTIVITY, limit)).map((d) => {
         const f = d.fields ?? {};
         return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
       });
       return { count: entries.length, entries };
-    }
-  );
+    });
 
-  // ============ MIGRATED: Tasks ============
+  // ---- Tasks ----
   tool(server, "read_tasks",
-    { title: "Read Highway tasks",
-      description: "List quests/tasks on the Highway board, newest first.",
-      inputSchema: {
-        limit: z.number().int().min(1).max(100).default(30),
-        include_done: z.boolean().default(true),
-      }, readOnly: true },
+    { title: "Read Highway tasks", description: "List quests on the Highway board, newest first.",
+      inputSchema: { limit: z.number().int().min(1).max(100).default(30), include_done: z.boolean().default(true) },
+      readOnly: true },
     async ({ limit, include_done }) => {
-      const docs = await queryNewest(TASKS, limit);
-      let tasks = docs.map(fmtTask);
+      let tasks = (await queryNewest(TASKS, limit)).map(fmtTask);
       if (!include_done) tasks = tasks.filter((t) => !t.done);
       return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
-    }
-  );
+    });
 
   tool(server, "add_task",
-    { title: "Add a Highway task",
-      description: "Add a quest to the Highway board. Posts to ACTIVITY automatically.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        text: z.string().trim().min(1).max(300),
-        priority: z.enum(["low", "normal", "high"]).default("normal"),
-        assignee: z.string().trim().max(40).optional(),
-      } },
+    { title: "Add a Highway task", description: "Add a quest to the board. Posts to ACTIVITY automatically.",
+      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(300),
+        priority: z.enum(["low", "normal", "high"]).default("normal"), assignee: z.string().trim().max(40).optional() } },
     async ({ name, text, priority, assignee }) => {
-      const fields: Record<string, unknown> = {
-        text: { stringValue: text },
-        done: { booleanValue: false },
-        createdBy: { stringValue: name },
-        priority: { stringValue: priority },
-        ts: nowTs(),
-      };
+      const fields: Fields = {
+        text: { stringValue: text }, done: { booleanValue: false },
+        createdBy: { stringValue: name }, priority: { stringValue: priority }, ts: nowTs() };
       if (assignee) fields.assignee = { stringValue: assignee };
-      const data: any = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
-      const id = docIdOf(data.name);
-      await postActivity(name, `started quest: ${text.slice(0, 200)}`, name).catch(() => {});
-      return { ok: true, id, text };
-    }
-  );
+      const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
+      await notify(name, `started quest: ${text.slice(0, 200)}`, name);
+      return { ok: true, id: docIdOf(data.name), text };
+    });
 
   tool(server, "complete_task",
-    { title: "Complete a Highway task",
-      description: "Mark a quest complete by ID or title match.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        task_id: z.string().trim().min(1).optional(),
-        title: z.string().trim().min(1).max(300).optional(),
-      } },
+    { title: "Complete a Highway task", description: "Mark a quest complete by ID or title match.",
+      inputSchema: { name: nameSchema, task_id: z.string().trim().min(1).optional(), title: z.string().trim().min(1).max(300).optional() } },
     async ({ name, task_id, title }) => {
-      if (!task_id && !title) throw new Error("provide task_id or title");
+      if (!task_id && !title) throw new UserError("provide task_id or title");
       const task = await findTask(task_id, title);
-      if (!task) throw new Error("task not found");
+      if (!task) throw new UserError("task not found");
       await patchFields(TASKS, task.id, { done: { booleanValue: true } }, name);
       const text = str(task.fields.text);
-      await postActivity(name, `completed quest: ${text.slice(0, 200)}`, name).catch(() => {});
+      await notify(name, `completed quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text, done: true };
-    }
-  );
+    });
 
   tool(server, "update_task",
-    { title: "Update a Highway task",
-      description: "Edit a quest's title, priority, or assignee by ID.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        task_id: z.string().trim().min(1),
-        text: z.string().trim().min(1).max(300).optional(),
-        priority: z.enum(["low", "normal", "high"]).optional(),
-        assignee: z.string().trim().max(40).optional(),
-      } },
+    { title: "Update a Highway task", description: "Edit a quest's title, priority, or assignee by ID.",
+      inputSchema: { name: nameSchema, task_id: z.string().trim().min(1),
+        text: z.string().trim().min(1).max(300).optional(), priority: z.enum(["low", "normal", "high"]).optional(),
+        assignee: z.string().trim().max(40).optional() } },
     async ({ name, task_id, text, priority, assignee }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       const fields: Record<string, unknown> = {};
       if (text !== undefined) fields.text = { stringValue: text };
       if (priority !== undefined) fields.priority = { stringValue: priority };
       if (assignee !== undefined) fields.assignee = { stringValue: assignee };
-      if (Object.keys(fields).length === 0) throw new Error("nothing to update");
+      if (!Object.keys(fields).length) throw new UserError("nothing to update");
       await patchFields(TASKS, task.id, fields, name);
       const newText = text ?? str(task.fields.text);
-      await postActivity(name, `updated quest: ${newText.slice(0, 200)}`, name).catch(() => {});
+      await notify(name, `updated quest: ${newText.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text: newText };
-    }
-  );
+    });
 
   tool(server, "delete_task",
-    { title: "Delete a Highway task",
-      description: "Remove a quest from the board by ID.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        task_id: z.string().trim().min(1),
-      } },
+    { title: "Delete a Highway task", description: "Remove a quest from the board by ID.",
+      inputSchema: { name: nameSchema, task_id: z.string().trim().min(1) }, destructive: true },
     async ({ name, task_id }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       const text = str(task.fields.text);
       await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
-      await postActivity(name, `abandoned quest: ${text.slice(0, 200)}`, name).catch(() => {});
+      await notify(name, `abandoned quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, deleted: true };
-    }
-  );
+    });
 
   tool(server, "assign_task",
-    { title: "Assign a Highway task",
-      description: "Assign a quest to a team member by task ID.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        task_id: z.string().trim().min(1),
-        assignee: z.string().trim().min(1).max(40),
-      } },
+    { title: "Assign a Highway task", description: "Assign a quest to a team member by task ID.",
+      inputSchema: { name: nameSchema, task_id: z.string().trim().min(1), assignee: z.string().trim().min(1).max(40) } },
     async ({ name, task_id, assignee }) => {
-      const task = await findTask(task_id);
-      if (!task) throw new Error("task not found");
+      const task = await getTaskOrThrow(task_id);
       await patchFields(TASKS, task.id, { assignee: { stringValue: assignee } }, name);
-      const text = str(task.fields.text);
-      await postActivity(name, `assigned quest "${text.slice(0, 120)}" to ${assignee}`, name).catch(() => {});
+      await notify(name, `assigned quest "${str(task.fields.text).slice(0, 120)}" to ${assignee}`, name);
       return { ok: true, id: task.id, assignee };
-    }
-  );
+    });
 
-  // ============ MIGRATED: Notes ============
+  // ---- Notes ----
   tool(server, "read_notes",
-    { title: "Read the Highway grimoire",
-      description: "Read the shared Highway notes — one shared page for the whole room.",
+    { title: "Read the Highway grimoire", description: "Read the shared Highway notes page.",
       inputSchema: {}, readOnly: true },
     async () => {
-      const data: any = await firestore(`/${NOTES}/shared`, { method: "GET" }).catch(() => null);
-      if (!data || !data.fields) return { exists: false, content: "", updatedBy: null, ts: null };
-      const f = data.fields;
+      const doc = await getDocOrNull(NOTES, "shared");
+      if (!doc?.fields) return { exists: false, content: "", updatedBy: null, ts: null };
+      const f = doc.fields;
       return { exists: true, content: str(f.content), updatedBy: str(f.updatedBy), ts: tsOf(f.ts) };
-    }
-  );
+    });
 
   tool(server, "update_notes",
-    { title: "Overwrite the Highway grimoire",
-      description: "Replace the entire shared notes page. Prefer append_note.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        content: z.string().max(20000),
-      } },
+    { title: "Overwrite the Highway grimoire", description: "Replace the entire shared notes page. Prefer append_note.",
+      inputSchema: { name: nameSchema, content: z.string().max(20000) }, destructive: true },
     async ({ name, content }) => {
-      await patchFields(NOTES, "shared", {
-        content: { stringValue: content },
-        updatedBy: { stringValue: name },
-        ts: nowTs(),
-      }, name);
+      await patchFields(NOTES, "shared",
+        { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() }, name);
       return { ok: true, updatedBy: name, chars: content.length };
-    }
-  );
+    });
 
   tool(server, "append_note",
-    { title: "Append to the Highway grimoire",
-      description: "Add a signed entry to the shared notes without overwriting.",
-      inputSchema: {
-        name: z.string().trim().min(1).max(40),
-        text: z.string().trim().min(1).max(5000),
-      } },
+    { title: "Append to the Highway grimoire", description: "Add a signed entry without overwriting.",
+      inputSchema: { name: nameSchema, text: z.string().trim().min(1).max(5000) } },
     async ({ name, text }) => {
-      const data: any = await firestore(`/${NOTES}/shared`, { method: "GET" }).catch(() => null);
-      const current = data?.fields ? str(data.fields.content) : "";
-      const entry = `\n\n\u2014 ${name} \u00b7 ${new Date().toLocaleString()}\n${text}`;
-      const content = (current + entry).slice(-20000);
-      await patchFields(NOTES, "shared", {
-        content: { stringValue: content },
-        updatedBy: { stringValue: name },
-        ts: nowTs(),
+      let chars = 0;
+      await mutateDoc(NOTES, "shared", (current) => {
+        const content = (str(current?.content) + `\n\n— ${name} · ${new Date().toISOString()}\n${text}`).slice(-20000);
+        chars = content.length;
+        return { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() };
       }, name);
-      return { ok: true, updatedBy: name, chars: content.length };
-    }
-  );
+      return { ok: true, updatedBy: name, chars };
+    });
 
-  // ============ MIGRATED: News / Team / Stats ============
+  // ---- News / Team / Stats ----
   tool(server, "get_news",
-    { title: "Get Highway money news",
-      description: "Money-and-life news feed (crypto + markets + macro). Shares server 5-min cache.",
-      inputSchema: { limit: z.number().int().min(1).max(15).default(10) },
-      readOnly: true },
+    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech). 5-min server cache.",
+      inputSchema: { limit: z.number().int().min(1).max(15).default(10) }, readOnly: true, openWorld: true },
     async ({ limit }) => {
-      const items = await getNews();
-      const sliced = items.slice(0, limit).map((it: any) => ({
+      const items = (await getNews()).slice(0, limit).map((it) => ({
         title: it.title, url: it.url, source: it.source,
-        image: it.image || null, description: it.description || null,
-      }));
-      return { ok: true, count: sliced.length, items: sliced };
-    }
-  );
+        image: it.image || null, description: it.description || null }));
+      return { ok: true, count: items.length, items };
+    });
 
   tool(server, "get_team",
-    { title: "Get Highway team",
-      description: "List members with online status — presence merged with recent chatters.",
+    { title: "Get Highway team", description: "Members with online status — presence merged with recent chatters.",
       inputSchema: {}, readOnly: true },
     async () => {
-      const [presData, msgDocs] = await Promise.all([
-        firestore(`/${PRESENCE}`, { method: "GET" }).catch(() => ({ documents: [] })),
-        queryNewest(MESSAGES, 50).catch(() => []),
+      const degraded: string[] = [];
+      const [presDocs, msgDocs] = await Promise.all([
+        settle("get_team:presence", listDocs(PRESENCE), [] as Doc[], degraded),
+        settle("get_team:messages", queryNewest(MESSAGES, 50), [] as Doc[], degraded),
       ]);
       const now = Date.now();
-      const online = new Map<string, number>();
-      for (const d of presData.documents ?? []) {
-        const f = d.fields ?? {};
-        const n = str(f.name);
-        const ts = tsOf(f.ts);
-        if (n && ts !== null && now - ts < 90000 && !online.has(n.toLowerCase()))
-          online.set(n.toLowerCase(), ts);
+      const online = new Set<string>();
+      for (const d of presDocs) {
+        if (isOnline(tsOf(d.fields?.ts), now)) online.add(str(d.fields?.name).toLowerCase());
       }
       const seen = new Map<string, { name: string; online: boolean; lastSeen: number | null }>();
       for (const d of msgDocs) {
-        const f = d.fields ?? {};
-        const n = str(f.name);
-        if (!n || seen.has(n.toLowerCase())) continue;
-        seen.set(n.toLowerCase(), { name: n, online: online.has(n.toLowerCase()), lastSeen: tsOf(f.ts) });
+        const n = str(d.fields?.name);
+        if (n && !seen.has(n.toLowerCase()))
+          seen.set(n.toLowerCase(), { name: n, online: online.has(n.toLowerCase()), lastSeen: tsOf(d.fields?.ts) });
       }
-      return { count: seen.size, members: Array.from(seen.values()) };
-    }
-  );
+      return { count: seen.size, members: [...seen.values()], ...(degraded.length ? { degraded } : {}) };
+    });
 
   tool(server, "get_stats",
-    { title: "Get Highway room stats",
-      description: "Room vitals: messages, quests, online count, activity, grimoire freshness.",
+    { title: "Get Highway room stats", description: "Room vitals: messages, quests, online count, activity, grimoire freshness.",
       inputSchema: {}, readOnly: true },
     async () => {
-      const [msgTotal, taskDocs, presData, notesData] = await Promise.all([
+      const degraded: string[] = [];
+      const [msgTotal, taskDocs, presDocs, notesDoc] = await Promise.all([
         countDocs(MESSAGES),
-        queryNewest(TASKS, 200).catch(() => []),
-        firestore(`/${PRESENCE}`, { method: "GET" }).catch(() => ({ documents: [] })),
-        firestore(`/${NOTES}/shared`, { method: "GET" }).catch(() => null),
+        settle("get_stats:tasks", queryNewest(TASKS, 200), [] as Doc[], degraded),
+        settle("get_stats:presence", listDocs(PRESENCE), [] as Doc[], degraded),
+        settle("get_stats:notes", getDocOrNull(NOTES, "shared"), null as Doc | null, degraded),
       ]);
+      if (msgTotal === null) degraded.push("get_stats:messages");
       const now = Date.now();
       const tasks = taskDocs.map(fmtTask);
-      const online = (presData.documents ?? []).filter((d: any) => {
-        const ts = tsOf(d.fields?.ts);
-        return ts !== null && now - ts < 90000;
-      }).length;
+      const nf = notesDoc?.fields;
       return {
-        messages_total: msgTotal,
-        tasks_open: tasks.filter((t) => !t.done).length,
+        messages_total: msgTotal, tasks_open: tasks.filter((t) => !t.done).length,
         tasks_done: tasks.filter((t) => t.done).length,
-        online_now: online,
-        grimoire: notesData?.fields
-          ? { updatedBy: str(notesData.fields.updatedBy), ts: tsOf(notesData.fields.ts), chars: str(notesData.fields.content).length }
-          : null,
+        online_now: presDocs.filter((d) => isOnline(tsOf(d.fields?.ts), now)).length,
+        grimoire: nf ? { updatedBy: str(nf.updatedBy), ts: tsOf(nf.ts), chars: str(nf.content).length } : null,
         server_time: new Date().toISOString(),
+        ...(degraded.length ? { degraded } : {}),
       };
-    }
-  );
+    });
 
   tool(server, "get_time",
-    { title: "Get server time",
-      description: "Current server time (ISO 8601 and unix ms).",
+    { title: "Get server time", description: "Current server time (ISO 8601 and unix ms).",
       inputSchema: {}, readOnly: true },
+    async () => ({ iso: new Date().toISOString(), unix_ms: Date.now() }));
+
+  // ---- V7.0 Overdrive Grid ----
+  tool(server, "extract_site_schema",
+    { title: "Extract site schema", description: "Extract structural fingerprint from a webpage for scraping.",
+      inputSchema: { url: z.string().url() }, readOnly: true, openWorld: true },
+    async ({ url }) => {
+      const stripped = stripHtml(await fetchPublic(url, 8000));
+      return { url, bytes: stripped.length, fingerprint: fnv1a(stripped.slice(0, 2000)) };
+    });
+
+  tool(server, "diff_check_page",
+    { title: "Diff check page", description: "Deterministic content hash — true change detection, no false positives.",
+      inputSchema: { url: z.string().url(), previousHash: z.string() }, readOnly: true, openWorld: true },
+    async ({ url, previousHash }) => {
+      const normalized = stripHtml(await fetchPublic(url, 8000)).replace(/\s+/g, " ");
+      const currentHash = fnv1a(normalized);
+      return { changed: currentHash !== previousHash, currentHash };
+    });
+
+  tool(server, "monitor_rss_stream",
+    { title: "Monitor RSS stream", description: "Fetch and parse an RSS/Atom feed into structured items.",
+      inputSchema: { feedUrl: z.string().url(), limit: z.number().int().min(1).max(20).optional() },
+      readOnly: true, openWorld: true },
+    async ({ feedUrl, limit }) => {
+      const items = parseFeed(await fetchPublic(feedUrl, 8000), limit || 10);
+      return { feed: feedUrl, count: items.length, items };
+    });
+
+  tool(server, "condense_session_logs",
+    { title: "Condense session logs", description: "Condense chat history into a dense JSON summary.",
+      inputSchema: { limit: z.number().int().min(5).max(50).optional() }, readOnly: true },
+    async ({ limit }) => {
+      const condensed = (await queryNewest(MESSAGES, limit || 20)).map((d) => {
+        const f = d.fields ?? {};
+        return { n: str(f.name), t: str(f.text).slice(0, 200) };
+      });
+      return { count: condensed.length, condensed };
+    });
+
+  tool(server, "dispatch_ambient_tts",
+    { title: "Dispatch ambient TTS", description: "STANDBY: Package text for future ambient TTS hardware.",
+      inputSchema: { text: z.string().min(1).max(500) } },
+    async ({ text }) => ({
+      status: "STANDBY_CLOUD_READY", format: "mp3_pcm",
+      textLength: text.length, queued_for: "LOCAL_BEAST_TUNNEL" }));
+
+  tool(server, "mutate_environment_relay",
+    { title: "Mutate environment relay", description: "STANDBY: Queue a hardware relay command for the future local PC.",
+      inputSchema: { device: z.string().min(1).max(50), zone: z.string().min(1).max(50),
+        action: z.string().min(1).max(50), value: z.number().optional() } },
+    async ({ device, zone, action, value }) => {
+      const body = { fields: {
+        device: { stringValue: device }, zone: { stringValue: zone },
+        action: { stringValue: action }, value: { integerValue: String(Math.trunc(value ?? 0)) },
+        status: { stringValue: "QUEUED_IN_BRAIN_STEM" },
+        target: { stringValue: "LOCAL_BEAST_TUNNEL" }, tsNum: nowNum() } };
+      // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update
+      try {
+        await firestore(`/${SYS_CONFIG}`, { method: "POST", body, documentId: "hardware_relay_buffer" });
+      } catch (e) {
+        if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
+        await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
+      }
+      return { status: "QUEUED_IN_BRAIN_STEM", device, zone, action };
+    });
+
+  // ---- Pinecone Pattern Refinery ----
+  tool(server, "query_pattern_refinery",
+    { title: "Query pattern refinery", description: "Vector-search the Pinecone refinery for past winning patterns.",
+      inputSchema: { query: z.string().min(1).max(500), topK: z.number().int().min(1).max(10).optional() },
+      readOnly: true },
+    async ({ query, topK }) => {
+      const { host, dimension } = await pineconeIndex();
+      const r = await http(`https://${host}/query`, {
+        method: "POST", headers: pineconeHeaders(),
+        body: JSON.stringify({ vector: new Array(dimension).fill(0), topK: topK || 5, includeMetadata: true }),
+      }, EXT_TIMEOUT);
+      const data = parseJson(r.body);
+      if (!r.ok) throw new Error(`Pinecone query ${r.status}: ${data?.message ?? r.statusText}`);
+      return { query,
+        matches: (data.matches ?? []).map((m: any) => ({ id: m.id, score: m.score, metadata: m.metadata ?? {} })) };
+    });
+
+  tool(server, "store_pattern_win",
+    { title: "Store pattern win", description: "Store a winning pattern fingerprint to the Pinecone refinery.",
+      inputSchema: { pattern_id: z.string().min(1).max(100), metadata: z.record(z.string(), z.string()).optional() } },
+    async ({ pattern_id, metadata }) => {
+      const { host, dimension } = await pineconeIndex();
+      const r = await http(`https://${host}/vectors/upsert`, {
+        method: "POST", headers: pineconeHeaders(),
+        body: JSON.stringify({ vectors: [{
+          id: pattern_id,
+          values: new Array(dimension).fill(0.01),
+          metadata: { ...(metadata || {}), stored_at: new Date().toISOString(), source: "static-refinery" },
+        }] }),
+      }, EXT_TIMEOUT);
+      if (!r.ok) throw new Error(`Pinecone upsert ${r.status}: ${parseJson(r.body)?.message ?? r.statusText}`);
+      return { stored: true, pattern_id };
+    });
+
+  // ============ MARROW WAVE 4: SENSES & SELF-AWARENESS ============
+  // Future-proof: zero hardcoded keys. HITL: propose_patch queues only. Ouroboros: telemetry feeds self-evolution.
+
+  tool(server, "web_search",
+    { title: "Web search", description: "Search the web via DuckDuckGo (no API key). Powers the 4h hunt and research loops.",
+      readOnly: true, openWorld: true,
+      inputSchema: { query: z.string().trim().min(1).max(300), limit: z.number().int().min(1).max(20).optional().default(8) } },
+    async ({ query, limit }) => {
+      const n = limit || 8;
+      const html = await fetchText(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, 10000);
+      // DDG bot-blocks return tiny pages — fail loud, never return a silent empty set
+      if (html.length < 1500) throw new Error("search returned a blocked/empty response");
+      const results: Array<{ title: string; url: string }> = [];
+      const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(html)) !== null && results.length < n) {
+        let href = decodeEntities(m[1]);
+        if (href.startsWith("//")) href = "https:" + href;
+        const uddg = href.match(/[?&]uddg=([^&]+)/);
+        if (uddg) { try { href = decodeURIComponent(uddg[1]); } catch { /* malformed escape: keep the raw href */ } }
+        if (href.startsWith("/")) continue;
+        const title = decodeEntities(m[2].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
+        if (title && href) results.push({ title, url: href });
+      }
+      return { query, count: results.length, results };
+    });
+
+  tool(server, "fetch_page_text",
+    { title: "Fetch page text", description: "Get readable text from a URL: strips scripts/styles/tags, collapses whitespace.",
+      readOnly: true, openWorld: true,
+      inputSchema: { url: z.string().url(), maxChars: z.number().int().min(100).max(20000).optional().default(5000) } },
+    async ({ url, maxChars }) => {
+      const text = htmlToText(await fetchPublic(url, 10000));
+      return { url, chars: text.length, text: text.slice(0, maxChars || 5000) };
+    });
+
+  tool(server, "propose_patch",
+    { title: "Propose patch", description: "Queue a code/config change for sin's HITL approval. NEVER auto-applies — queues a pending_approval task to the Tasks tab.",
+      inputSchema: { title: z.string().trim().min(1).max(200), description: z.string().trim().min(1).max(1000), patch_summary: z.string().trim().min(1).max(3000) } },
+    async ({ title, description, patch_summary }) => {
+      const fields = {
+        text: { stringValue: `[PATCH PROPOSAL] ${title}` },
+        description: { stringValue: description },
+        patch_summary: { stringValue: patch_summary },
+        type: { stringValue: "patch_proposal" },
+        status: { stringValue: "pending_approval" },
+        done: { booleanValue: false },
+        createdBy: { stringValue: "static" },
+        priority: { stringValue: "high" },
+        ts: nowTs(),
+      };
+      const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields } });
+      return { queued: true, task_title: title, task_id: docIdOf(data.name), status: "pending_approval",
+        note: "Awaiting sin's one-tap approval. Nothing was changed." };
+    });
+
+  // Phase 3 Section C: Approval protocol
+  const APPROVALS = "approval_requests";
+
+  tool(server, "request_approval",
+    { title: "Request approval", description: "Create a durable approval request for a sensitive operation. The operation must pause until approved.",
+      inputSchema: {
+        requesting_agent: nameSchema,
+        operation: z.string().trim().min(1).max(100),
+        payload: z.record(z.unknown()).optional().default({}),
+        target_resource: z.string().trim().min(1).max(200),
+        permission_scope: z.string().trim().min(1).max(100),
+        ttl_seconds: z.number().int().min(60).max(3600).optional().default(600),
+      } },
+    async ({ requesting_agent, operation, payload, target_resource, permission_scope, ttl_seconds }) => {
+      const approvalId = "apr_" + Math.random().toString(36).slice(2, 10);
+      const now = new Date();
+      const expires = new Date(now.getTime() + (ttl_seconds || 600) * 1000);
+      const fields = {
+        requesting_agent: { stringValue: requesting_agent },
+        operation: { stringValue: operation },
+        payload: { stringValue: JSON.stringify(payload || {}) },
+        target_resource: { stringValue: target_resource },
+        permission_scope: { stringValue: permission_scope },
+        status: { stringValue: "pending" },
+        created_at: { timestampValue: now.toISOString() },
+        expires_at: { timestampValue: expires.toISOString() },
+        decided_by: { nullValue: null },
+        decided_at: { nullValue: null },
+        decision: { nullValue: null },
+      };
+      await firestore(`/${APPROVALS}/${approvalId}`, { method: "PATCH", body: { fields } });
+      return { approval_id: approvalId, status: "pending", expires_at: expires.toISOString() };
+    });
+
+  tool(server, "resolve_approval",
+    { title: "Resolve approval", description: "Approve or deny a pending approval request. Only sin/trey can decide.",
+      inputSchema: {
+        approval_id: z.string().trim().min(1).max(50),
+        decision: z.enum(["approve", "deny"]),
+        decided_by: nameSchema,
+      } },
+    async ({ approval_id, decision, decided_by }) => {
+      // Only sin/trey can approve
+      const allowed = ["sin", "trey", "grim"];
+      if (!allowed.includes(decided_by.toLowerCase())) {
+        throw new UserError("Only sin or trey can resolve approvals");
+      }
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      const status = fields.status?.stringValue;
+      if (status !== "pending") {
+        return { approval_id, status, note: "Already resolved — no duplicate execution" };
+      }
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired", note: "Approval expired before decision" };
+      }
+      const newStatus = decision === "approve" ? "approved" : "denied";
+      const now = new Date().toISOString();
+      await patchFields(APPROVALS, approval_id, {
+        status: { stringValue: newStatus },
+        decided_by: { stringValue: decided_by },
+        decided_at: { timestampValue: now },
+        decision: { stringValue: decision },
+      });
+      return { approval_id, status: newStatus, decided_by, decided_at: now };
+    });
+
+  tool(server, "get_approval_status",
+    { title: "Get approval status", description: "Check the current status of an approval request.",
+      inputSchema: { approval_id: z.string().trim().min(1).max(50) }, readOnly: true },
+    async ({ approval_id }) => {
+      const doc = await getDocOrNull(APPROVALS, approval_id);
+      if (!doc) throw new UserError("Approval not found");
+      const fields = (doc as any).fields || {};
+      // Auto-expire if past TTL
+      const status = fields.status?.stringValue;
+      const expiresAt = fields.expires_at?.timestampValue;
+      if (status === "pending" && expiresAt && new Date(expiresAt) < new Date()) {
+        await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
+        return { approval_id, status: "expired" };
+      }
+      return {
+        approval_id,
+        status,
+        requesting_agent: fields.requesting_agent?.stringValue,
+        operation: fields.operation?.stringValue,
+        decided_by: fields.decided_by?.stringValue || null,
+        decided_at: fields.decided_at?.timestampValue || null,
+      };
+    });
+
+  tool(server, "score_lead",
+    { title: "Score job lead", description: "Score a job lead 0-100 against sin's weighted hunt criteria (Vector B 80 / Vector A 20).", readOnly: true,
+      inputSchema: { title: z.string().trim().min(1).max(200), company: z.string().trim().max(200).optional().default(""), pay: z.string().trim().max(100).optional().default(""), location: z.string().trim().max(200).optional().default(""), is_remote: z.boolean().optional().default(false) } },
+    async ({ title, company, pay, location, is_remote }) => {
+      const t = `${title} ${company} ${pay} ${location}`.toLowerCase();
+      const breakdown: Record<string, number> = {};
+      const payNums = (pay.match(/\$\s?(\d{2,3}(?:\.\d+)?)/g) || []).map((s) => Number(s.replace(/[^\d.]/g, "")));
+      if (payNums.some((n) => n >= 16)) breakdown.pay_16_plus = 30;
+      if (/entry[- ]?level|junior|no experience|0[-–]2\s*(yrs?|years?)|trainee/i.test(t)) breakdown.entry_level = 20;
+      if (is_remote || /sacramento|west sacramento|davis|woodland/i.test(location)) breakdown.location_or_remote = 20;
+      const vecB = /warehouse|logistics|delivery|fulfillment|package\s*handler/i.test(t);
+      const vecA = /tech\s*support|help\s*desk|data\s*entry|customer\s*support|\bqa\b|it\s*support/i.test(t);
+      if (vecB) breakdown.vector_b_capital = 15;
+      if (vecA) breakdown.vector_a_tech = 15;
+      const score = Object.values(breakdown).reduce((a, b) => a + b, 0);
+      const vector = vecB ? "B" : vecA ? "A" : "none";
+      return { score, breakdown, vector, title, company, pay, location, is_remote };
+    });
+
+  tool(server, "get_crypto_price",
+    { title: "Crypto price", description: "Get a coin's USD price and 24h change from CoinGecko (free, no key).", readOnly: true, openWorld: true,
+      inputSchema: { coin_id: z.string().trim().min(1).max(60) } },
+    async ({ coin_id }) => {
+      const id = coin_id.toLowerCase().trim();
+      const data = await fetchJson(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_24hr_change=true`, 10000);
+      const row = data?.[id];
+      if (typeof row?.usd !== "number") throw new UserError(`coin not found: ${id}`);
+      return { coin_id: id, usd_price: row.usd, change_24h: row.usd_24h_change ?? null };
+    });
+
+  tool(server, "track_tool_telemetry",
+    { title: "Track tool telemetry", description: "Log tool latency/success to evolution_logs. The Reflection Engine's nervous system.",
+      inputSchema: { tool_name: z.string().trim().min(1).max(100), latency_ms: z.number().min(0), success: z.boolean(), error: z.string().trim().max(500).optional().default("") } },
+    async ({ tool_name, latency_ms, success, error }) => {
+      await firestore(`/${EVO_LOGS}`, { method: "POST", body: telemetryDoc(tool_name, latency_ms, success, error) });
+      return { logged: true, tool_name };
+    });
+
+  // Exact-URL dedupe. The old 40-char prefix match flagged DIFFERENT jobs as duplicates
+  // (e.g. every linkedin.com/jobs/view/12345… shares its first 40 chars) and silently dropped real leads.
+  tool(server, "dedupe_leads",
+    { title: "Dedupe leads", description: "Check whether a job lead URL was already logged this cycle. Stops the 4h hunt re-alerting on the same job.", readOnly: true,
+      inputSchema: { url: z.string().trim().min(1).max(500) } },
+    async ({ url }) => {
+      const target = normalizeUrl(url);
+      const isUrl = /^https?:\/\//i.test(url.trim());
+      const matchDoc = (d: Doc): boolean => {
+        const text = str(d.fields?.text), field = str(d.fields?.url);
+        if (!isUrl) return `${text} ${field}`.toLowerCase().includes(target);
+        return [field, ...(text.match(URL_RE) ?? [])].some((u) => u && normalizeUrl(u) === target);
+      };
+      const { docs, degraded } = await queryDocs(EVO_LOGS, { orderField: "tsNum", limit: 50, where: {
+        field: "type", op: "EQUAL", value: { stringValue: "job_hunt" }, match: (d) => str(d.fields?.type) === "job_hunt" } });
+      return { is_duplicate: docs.some(matchDoc), checked: docs.length, ...(degraded ? { degraded: true } : {}) };
+    });
+
+  tool(server, "check_bridge_health",
+    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Firestore reachability.", readOnly: true,
+      inputSchema: {} },
     async () => {
-      const now = Date.now();
-      return { iso: new Date(now).toISOString(), unix_ms: now };
-    }
-  );
+      const checks = {
+        firebase_key: !!process.env.FIREBASE_API_KEY,
+        client_key: !!process.env.HIGHWAY_CLIENT_KEY,
+        mcp_secret: !!process.env.MCP_SECRET,
+        pinecone_key: !!process.env.PINECONE_API_KEY,
+        firestore_reachable: false,
+      };
+      let firestore_error: string | undefined;
+      try {
+        await firestore(`/${EVO_LOGS}`, { method: "GET", pageSize: 1 });
+        checks.firestore_reachable = true;
+      } catch (e) {
+        firestore_error = errMsg(e);
+        recordFailure("check_bridge_health", e);
+      }
+      return { healthy: Object.values(checks).every(Boolean), checks, ...(firestore_error ? { firestore_error } : {}) };
+    });
+
+  tool(server, "get_weather",
+    { title: "Get weather", description: "Current weather from Open-Meteo (free, no key). First ambient-world sensor.", readOnly: true, openWorld: true,
+      inputSchema: { latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) } },
+    async ({ latitude, longitude }) => {
+      const data = await fetchJson(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code&temperature_unit=fahrenheit`, 10000);
+      const cur = data?.current || {};
+      return { temp_f: cur.temperature_2m ?? null, weather_code: cur.weather_code ?? null };
+    });
+
+  tool(server, "summarize_thread",
+    { title: "Summarize thread", description: "Extract decisions, questions, and action items from recent Highway Chat messages.", readOnly: true,
+      inputSchema: { limit: z.number().int().min(5).max(50).optional().default(20) } },
+    async ({ limit }) => {
+      const msgs = await queryNewest(MESSAGES, limit || 20);
+      const decisions: string[] = [], questions: string[] = [], actions: string[] = [];
+      for (const d of msgs) {
+        const f = d.fields ?? {};
+        const text = str(f.text).trim();
+        if (!text) continue;
+        const line = `${str(f.name) || "unknown"}: ${text.slice(0, 160)}`;
+        if (/\b(decided|decision|agreed|locked in|going with)\b/i.test(text)) decisions.push(line);
+        else if (text.includes("?")) questions.push(line);
+        else if (/\b(will|todo|action item|action:|need to|must|going to)\b/i.test(text)) actions.push(line);
+      }
+      return { message_count: msgs.length, decisions, questions, actions };
+    });
 
   return server;
 }
 
-async function cryptoNews(): Promise<any[]> {
-  const items: any[] = [];
-  const push = (sym: string, name: string, id: string, price: number, pct: number, image: string) => {
-    items.push({
-      title: sym.toUpperCase() + " " + fmtUsd(price) + " " + fmtPct(pct),
-      url: "https://www.coingecko.com/en/coins/" + id,
-      source: "CRYPTO", image,
-      description: impactLine(pct, name + " holders"),
-    });
-  };
-  try { // Kraken free API, no key, no geo-block
-    const k: any = await fetchJson(
-      "https://api.kraken.com/0/public/Ticker?pair=BTCUSD,ETHUSD,SOLUSD,DOGEUSD,XRPUSD,ADAUSD,AVAXUSD,LINKUSD,HYPEUSD");
-    const r = k && k.result;
-    if (!r || (k.error && k.error.length)) throw new Error("kraken error");
-    const pairMap: any = { BTCUSD: ["BTC", "Bitcoin", "bitcoin"], ETHUSD: ["ETH", "Ethereum", "ethereum"], SOLUSD: ["SOL", "Solana", "solana"], DOGEUSD: ["DOGE", "Dogecoin", "dogecoin"], XRPUSD: ["XRP", "XRP", "ripple"], ADAUSD: ["ADA", "Cardano", "cardano"], AVAXUSD: ["AVAX", "Avalanche", "avalanche"], LINKUSD: ["LINK", "Chainlink", "chainlink"], HYPEUSD: ["HYPE", "Hyperliquid", "hyperliquid"] };
-    const found: any[] = [];
-    for (const key of Object.keys(r)) {
-      for (const pk of Object.keys(pairMap)) {
-        if (key.replace(/^X|^Z/, "").startsWith(pk.replace("USD", "")) && key.endsWith("USD")) {
-          const t = r[key];
-          const price = parseFloat(t.c[0]), open = parseFloat(t.o);
-          if (price && open) found.push({ sym: pairMap[pk][0], name: pairMap[pk][1], id: pairMap[pk][2], price, pct: (price - open) / open * 100 });
-          break;
-        }
-      }
-    }
-    if (!found.length) throw new Error("kraken empty");
-    const btc = found.find((f) => f.sym === "BTC"), eth = found.find((f) => f.sym === "ETH");
-    const movers = found.filter((f) => f !== btc && f !== eth)
-      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 3);
-    for (const f of [btc, eth, ...movers]) {
-      if (f) push(f.sym, f.name, f.id, f.price, f.pct, "");
-    }
-    if (items.length) return items.slice(0, 5);
-    throw new Error("kraken empty");
-  } catch (e) {
-    console.warn("kraken failed, trying coingecko", e);
+// ============ URL NORMALIZATION (dedupe_leads) ============
+const URL_RE = /https?:\/\/[^\s"'<>)\]]+/gi;
+const TRACKING_PARAM = /^(utm_|fbclid$|gclid$|ref$|refid$|trk$|trackingid$)/i;
+function normalizeUrl(raw: string): string {
+  try {
+    const u = new URL(raw.trim());
+    u.hash = "";
+    for (const k of [...u.searchParams.keys()]) if (TRACKING_PARAM.test(k)) u.searchParams.delete(k);
+    u.searchParams.sort();
+    return (u.origin + u.pathname.replace(/\/+$/, "") + u.search).toLowerCase();
+  } catch {
+    return raw.trim().toLowerCase().replace(/\/+$/, "");
   }
-  try { // CoinGecko free API, no key
-    const coins: any[] = await fetchJson(
-      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=60&page=1&sparkline=false&price_change_percentage=24h");
-    if (!Array.isArray(coins) || !coins.length) throw new Error("empty coingecko");
-    const btc = coins.find((c) => c.symbol === "btc");
-    const eth = coins.find((c) => c.symbol === "eth");
-    const movers = coins.filter((c) => c !== btc && c !== eth)
-      .sort((a, b) => Math.abs(b.price_change_percentage_24h || 0) - Math.abs(a.price_change_percentage_24h || 0))
-      .slice(0, 3);
-    for (const c of [btc, eth, ...movers]) {
-      if (c) push(c.symbol, c.name, c.id, c.current_price, c.price_change_percentage_24h || 0, c.image || "");
-    }
-  } catch (e) {
-    console.warn("coingecko failed, trying binance.us", e);
-    try { // Binance.US 24hr tickers, no key — BTC/ETH + top movers by |24h change|
-      const tick: any[] = await fetchJson("https://api.binance.us/api/v3/ticker/24hr");
+}
+
+// ============ NEWS ENGINE (parallel fetch, ordered processing, per-section isolation) ============
+type NewsItem = { title: string; url: string; source: string; image: string; description: string };
+type Coin = { sym: string; name: string; id: string; price: number; pct: number; image: string };
+
+const titleKey = (title: string): string => title.toLowerCase().slice(0, 48);
+function dedupeItems(items: NewsItem[]): NewsItem[] {
+  const seen = new Set<string>();
+  return items.filter((it) => { const k = titleKey(it.title); if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
+function coinItem(c: Coin): NewsItem {
+  return { title: `${c.sym.toUpperCase()} ${fmtUsd(c.price)} ${fmtPct(c.pct)}`,
+    url: `https://www.coingecko.com/en/coins/${c.id}`, source: "CRYPTO", image: c.image,
+    description: impactLine(c.pct, `${c.name} holders`) };
+}
+
+// Kraken pair keys are legacy-prefixed: XXBTZUSD, XETHZUSD, XXRPZUSD, XDGUSD, SOLUSD…
+// The old normalizer produced "XBTZ"/"ETHZ"/"XRPZ"/"DG", so BTC and ETH never matched and the
+// crypto section lost its two headliners whenever Kraken was the active provider.
+const KRAKEN_ALIAS: Record<string, string> = { XBT: "BTC", XDG: "DOGE" };
+function krakenBase(key: string): string {
+  let base = key.replace(/Z?USD$/, "");
+  if (base.length === 4 && base.startsWith("X")) base = base.slice(1);
+  return KRAKEN_ALIAS[base] ?? base;
+}
+const KRAKEN_COINS: Record<string, [string, string]> = {
+  BTC: ["Bitcoin", "bitcoin"], ETH: ["Ethereum", "ethereum"], SOL: ["Solana", "solana"],
+  DOGE: ["Dogecoin", "dogecoin"], XRP: ["XRP", "ripple"], ADA: ["Cardano", "cardano"],
+  AVAX: ["Avalanche", "avalanche"], LINK: ["Chainlink", "chainlink"],
+};
+
+async function cryptoNews(): Promise<NewsItem[]> {
+  const providers: Array<() => Promise<Coin[]>> = [
+    async () => { // Kraken — free, no key
+      const k = await fetchJson("https://api.kraken.com/0/public/Ticker?pair=BTCUSD,ETHUSD,SOLUSD,DOGEUSD,XRPUSD,ADAUSD,AVAXUSD,LINKUSD");
+      if (!k?.result || k.error?.length) throw new Error("kraken error");
+      const out: Coin[] = [];
+      for (const [rawKey, t] of Object.entries<any>(k.result)) {
+        const sym = krakenBase(rawKey);
+        const meta = KRAKEN_COINS[sym];
+        if (!meta) continue;
+        const price = parseFloat(t.c[0]), open = parseFloat(t.o);
+        if (price && open) out.push({ sym, name: meta[0], id: meta[1], price, pct: (price - open) / open * 100, image: "" });
+      }
+      if (!out.length) throw new Error("kraken empty");
+      return out;
+    },
+    async () => { // CoinGecko — free, no key
+      const coins = await fetchJson(
+        "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=60&page=1&sparkline=false&price_change_percentage=24h");
+      if (!Array.isArray(coins) || !coins.length) throw new Error("empty coingecko");
+      return coins.map((c: any): Coin => ({ sym: c.symbol, name: c.name, id: c.id,
+        price: c.current_price, pct: c.price_change_percentage_24h || 0, image: c.image || "" }));
+    },
+    async () => { // Binance.US — free, no key
+      const tick = await fetchJson("https://api.binance.us/api/v3/ticker/24hr");
       if (!Array.isArray(tick) || !tick.length) throw new Error("empty binance");
-      const usd: Record<string, any> = {};
-      for (const t of tick) if (t && typeof t.symbol === "string" && t.symbol.endsWith("USD")) usd[t.symbol] = t;
-      const btc = usd["BTCUSD"], eth = usd["ETHUSD"];
-      const names: Record<string, string> = { BTCUSD: "Bitcoin", ETHUSD: "Ethereum" };
-      const movers = Object.values(usd).filter((t: any) => t !== btc && t !== eth)
-        .sort((a: any, b: any) => Math.abs(parseFloat(b.priceChangePercent) || 0) - Math.abs(parseFloat(a.priceChangePercent) || 0))
-        .slice(0, 3);
-      for (const t of [btc, eth, ...movers]) {
-        if (!t) continue;
-        const sym = String(t.symbol).replace(/USD$/, "");
-        push(sym, names[t.symbol] || sym, sym.toLowerCase(), parseFloat(t.lastPrice), parseFloat(t.priceChangePercent) || 0, "");
-      }
-    } catch (e2) { console.warn("binance.us failed", e2); }
+      return tick.filter((t: any) => typeof t.symbol === "string" && t.symbol.endsWith("USD"))
+        .map((t: any): Coin => { const sym = String(t.symbol).replace(/USD$/, "");
+          return { sym, name: sym, id: sym.toLowerCase(), price: parseFloat(t.lastPrice),
+            pct: parseFloat(t.priceChangePercent) || 0, image: "" }; });
+    },
+  ];
+  let coins: Coin[] = [];
+  for (const p of providers) {
+    try { coins = await p(); if (coins.length) break; }
+    catch (e) { console.warn("crypto provider failed:", errMsg(e)); }
   }
-  return items.slice(0, 5);
+  if (!coins.length) throw new Error("all crypto providers failed");
+  const symIs = (s: string) => (c: Coin) => c.sym.toUpperCase() === s;
+  const headliners = [coins.find(symIs("BTC")), coins.find(symIs("ETH")),
+    ...coins.filter((c) => !symIs("BTC")(c) && !symIs("ETH")(c))
+      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 3)];
+  return headliners.filter((c): c is Coin => !!c).map(coinItem).slice(0, 5);
 }
 
 const MARKET_SYMS = [
-  { sym: "VOO", name: "VOO S&P 500", idx: true },
-  { sym: "^GSPC", name: "S&P 500", idx: true },
-  { sym: "^IXIC", name: "Nasdaq", idx: true },
-  { sym: "^DJI", name: "Dow Jones", idx: true },
-  { sym: "NVDA", name: "NVIDIA", idx: false },
-  { sym: "TSLA", name: "Tesla", idx: false },
-  { sym: "AAPL", name: "Apple", idx: false },
-  { sym: "MSFT", name: "Microsoft", idx: false },
-  { sym: "AMZN", name: "Amazon", idx: false },
-  { sym: "META", name: "Meta", idx: false },
-  { sym: "AMD", name: "AMD", idx: false },
-  { sym: "PLTR", name: "Palantir", idx: false },
-  { sym: "WMT", name: "Walmart", idx: false },
-  { sym: "COST", name: "Costco", idx: false },
-  { sym: "COIN", name: "Coinbase", idx: false },
+  { sym: "VOO", name: "VOO S&P 500" }, { sym: "^GSPC", name: "S&P 500" },
+  { sym: "^IXIC", name: "Nasdaq" }, { sym: "^DJI", name: "Dow Jones" },
+  { sym: "NVDA", name: "NVIDIA" }, { sym: "TSLA", name: "Tesla" },
+  { sym: "AAPL", name: "Apple" }, { sym: "MSFT", name: "Microsoft" },
+  { sym: "AMZN", name: "Amazon" }, { sym: "META", name: "Meta" },
+  { sym: "AMD", name: "AMD" }, { sym: "PLTR", name: "Palantir" },
 ];
+const INDEX_SYMS = new Set(["VOO", "^GSPC", "^IXIC", "^DJI"]);
 
-async function marketsNews(): Promise<any[]> {
-  const items: any[] = [];
-  try { // Yahoo Finance chart API, no key
-    const quotes = (await Promise.all(MARKET_SYMS.map(async (t) => {
-      try {
-        const j: any = await fetchJson(
-          "https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(t.sym) + "?interval=1d&range=2d", 8000);
-        const r = j && j.chart && j.chart.result && j.chart.result[0];
-        const m = r && r.meta;
-        if (!m || !m.regularMarketPrice || !m.chartPreviousClose) return null;
-        return { sym: t.sym, name: t.name, idx: t.idx, price: m.regularMarketPrice,
-          pct: (m.regularMarketPrice - m.chartPreviousClose) / m.chartPreviousClose * 100 };
-      } catch { return null; }
-    }))).filter(Boolean) as any[];
-    for (const q of quotes.filter((q) => q.idx)) {
-      items.push({
-        title: q.name + " " + q.price.toLocaleString("en-US", { maximumFractionDigits: 0 }) + " " + fmtPct(q.pct),
-        url: "https://finance.yahoo.com/quote/" + encodeURIComponent(q.sym),
-        source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
-        description: q.pct >= 0
-          ? "Green day — stocks and retirement accounts up."
-          : "Red day — stocks cheaper; don't panic-sell.",
-      });
-    }
-    const movers = quotes.filter((q) => !q.idx).sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 2);
-    for (const q of movers) {
-      items.push({
-        title: q.name + " " + fmtUsd(q.price) + " " + fmtPct(q.pct) + " — top mover",
-        url: "https://finance.yahoo.com/quote/" + encodeURIComponent(q.sym),
-        source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
-        description: impactLine(q.pct, q.name + " holders"),
-      });
-    }
-  } catch (e) { console.warn("markets news failed", e); }
+async function marketsNews(): Promise<NewsItem[]> {
+  type Quote = { sym: string; name: string; idx: boolean; price: number; pct: number };
+  const settled = await Promise.allSettled(MARKET_SYMS.map(async (t): Promise<Quote | null> => {
+    const j = await fetchJson(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(t.sym)}?interval=1d&range=2d`, 8000);
+    const m = j?.chart?.result?.[0]?.meta;
+    if (!m?.regularMarketPrice || !m?.chartPreviousClose) return null;
+    return { sym: t.sym, name: t.name, idx: INDEX_SYMS.has(t.sym), price: m.regularMarketPrice,
+      pct: (m.regularMarketPrice - m.chartPreviousClose) / m.chartPreviousClose * 100 };
+  }));
+  const quotes = settled.flatMap((s) => (s.status === "fulfilled" && s.value ? [s.value] : []));
+  if (!quotes.length) throw new Error("no market quotes returned");
+  const link = (sym: string) => `https://finance.yahoo.com/quote/${encodeURIComponent(sym)}`;
+  const items: NewsItem[] = [];
+  for (const q of quotes.filter((q) => q.idx))
+    items.push({ title: `${q.name} ${q.price.toLocaleString("en-US", { maximumFractionDigits: 0 })} ${fmtPct(q.pct)}`,
+      url: link(q.sym), source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
+      description: q.pct >= 0 ? "Green day — stocks and retirement accounts up." : "Red day — stocks cheaper; don't panic-sell." });
+  for (const q of quotes.filter((q) => !q.idx).sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 2))
+    items.push({ title: `${q.name} ${fmtUsd(q.price)} ${fmtPct(q.pct)} — top mover`,
+      url: link(q.sym), source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
+      description: impactLine(q.pct, `${q.name} holders`) });
   return items.slice(0, 5);
 }
 
-const MONEY_WORDS = ["rate", "fed", "inflation", "cpi", "jobs", "unemployment", "wage",
+const MONEY_RE = new RegExp("\\b(" + ["rate", "fed", "inflation", "cpi", "jobs", "unemployment", "wage",
   "tariff", "tax", "recession", "gdp", "housing", "mortgage", "rent", "oil", "gas",
   "crypto", "bitcoin", "stock", "market", "dollar", "interest", "bank", "debt", "stimulus", "trade",
-  "trump", "white house", "congress", "election", "midterm", "ukraine", "russia", "iran", "israel",
+  "white house", "congress", "election", "midterm", "ukraine", "russia", "iran", "israel",
   "gaza", "taiwan", "china", "war", "ai", "openai", "anthropic", "nvidia", "chip", "robot",
-  "spacex", "nasa", "moon", "mars", "food", "wheat", "corn", "crop", "drought", "famine", "ebt", "snap"];
-const MONEY_RE = new RegExp("\\b(" + MONEY_WORDS.join("|") + ")s?\\b");
+  "spacex", "nasa", "moon", "mars", "food", "wheat", "corn", "crop", "drought", "famine", "ebt", "snap"].join("|") + ")s?\\b");
+const MAJOR_RE = new RegExp("\\b(" + ["war", "conflict", "strike", "earthquake", "hurricane",
+  "ceasefire", "sanctions", "nuclear", "troops", "invasion", "disaster", "flood", "wildfire",
+  "volcano", "tsunami", "pandemic", "crisis", "collapse", "hormuz", "opec", "brent",
+  "america", "american", "u.s.", "united states", "senate", "supreme court",
+  "mortgage", "diesel", "treasury", "yield"].join("|") + ")s?\\b");
+const SOFT_RE = new RegExp(["obituary", "dies at", "celebrity", "sport", "wins", "fashion", "golf club", "profits"].join("|"));
 
-function macroImpact(title: string): string {
-  const t = title.toLowerCase();
-  if (/rate|fed|interest|treasury|yield/.test(t)) return "10Y at 5.3% (24yr high) → every loan costs more. Dec hike 73% priced.";
-  if (t.includes("inflation") || t.includes("cpi")) return "Inflation above target → Fed can't cut. Your dollar buys less.";
-  if (/jobs|unemployment|wage|hiring/.test(t)) return "Only 29K jobs added (vs 90K exp) → hiring freeze risk before Dec hike.";
-  if (t.includes("tariff")) return "Tariffs → import prices climb. Oct 18 Russia 500% deadline looms.";
-  if (/housing|mortgage|rent/.test(t)) return "Mortgages at 7.5% → affordability worse than 2006. Rents re-accelerating.";
-  if (/oil|gas|energy|opec|brent/.test(t)) return "Brent $101-105, Hormuz at 74% → gas & diesel squeeze. Iran war day 222.";
-  if (/\btax(es)?\b/.test(t)) return "Taxes → what you keep changes. AI taxation bills moving in Senate.";
-  if (/trump|white house|congress|election|midterm/.test(t)) return "Nov 3 midterms → 91% Dem House odds. Power shift moves markets.";
-  if (/ukraine|russia|iran|israel|gaza|taiwan|war|hormuz/.test(t)) return "Conflict → oil spikes, markets shake. Post-midterm escalation risk.";
-  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI buildout debt-financed at 5%+ rates → concentration risk. FTC probing.";
-  if (/spacex|nasa|moon|mars|artemis|starship/.test(t)) return "Starship reached orbit. Moon landing targeted 2028.";
-  if (/food|wheat|corn|crop|drought|famine|ebt|snap|beef/.test(t)) return "Beef at $6.92/lb record. El Niño peaking. SNAP Nov funding uncertain.";
-  if (/hurricane|storm|flood|earthquake|wildfire|tornado/.test(t)) return "Disaster → supply chains break, insurance spikes, gas prices jump.";
-  if (/bitcoin|btc|crypto|ethereum/.test(t)) return "BTC-gold correlation at all-time high → debasement trade. $75K is the line.";
-  return "Major shift → watch your wallet.";
-}
+const MACRO_FEEDS = [
+  "https://feeds.npr.org/1001/rss.xml", "https://feeds.bbci.co.uk/news/world/rss.xml",
+  "https://www.theguardian.com/world/rss", "https://rss.dw.com/rdf/rss-en-top",
+  "https://www.france24.com/en/rss",
+];
 
-const MAJOR_WORDS = ["war", "conflict", "strike", "earthquake", "hurricane", "trump", "white house",
-  "fed", "inflation", "missile", "ceasefire", "famine", "sanctions", "election", "midterm",
-  "iran", "ukraine", "russia", "israel", "gaza", "taiwan", "china", "nuclear", "troops", "invasion",
-  "disaster", "flood", "wildfire", "volcano", "tsunami", "pandemic", "crisis", "collapse",
-  "spacex", "nasa", "moon", "mars", "artemis", "starship", "hormuz", "opec", "brent",
-  "america", "american", "u.s.", "united states", "congress", "senate", "supreme court",
-  "mortgage", "housing", "beef", "diesel", "snap", "debt", "treasury", "yield",
-  "ai", "openai", "anthropic", "nvidia", "bitcoin", "crypto"];
-const MAJOR_RE = new RegExp("\\b(" + MAJOR_WORDS.join("|") + ")s?\\b");
-const SOFT_WORDS = ["obituary", "dies at", "celebrity", "sport", "wins", "fashion", "golf club", "profits"];
-const SOFT_RE = new RegExp(SOFT_WORDS.join("|"));
-
-async function macroNews(): Promise<any[]> {
-  const items: any[] = [];
-  const feeds = [
-    "https://feeds.npr.org/1001/rss.xml",
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://www.theguardian.com/world/rss",
-    "https://rss.dw.com/rdf/rss-en-top",
-    "https://www.france24.com/en/rss",
-  ];
+async function macroNews(): Promise<NewsItem[]> {
+  const feeds = await Promise.allSettled(MACRO_FEEDS.map((u) => fetchText(u)));
+  const items: NewsItem[] = [];
   const seen = new Set<string>();
-  for (const url of feeds) {
-    try {
-      const xml = await fetchText(url);
-      const re = /<item>[\s\S]*?<title>([\s\S]*?)<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g;
-      let m: RegExpExecArray | null, n = 0;
-      while ((m = re.exec(xml)) && n < 4) {
-        const title = m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim();
-        const link = m[2].trim();
-        const tl = title.toLowerCase();
-        const key = tl.slice(0, 48);
-        if (!title || !link || seen.has(key)) continue;
-        if (SOFT_RE.test(tl)) continue;
-        if (!MAJOR_RE.test(tl) && !MONEY_RE.test(tl)) continue;
-        seen.add(key);
-        items.push({ title, url: link, source: "WORLD", image: faviconFor(link), description: macroImpact(title) });
-        n++;
-      }
-    } catch (e) { console.warn("macro news failed", url, e); }
-  }
+  feeds.forEach((f, i) => {
+    if (f.status === "rejected") { console.warn("macro feed failed:", MACRO_FEEDS[i], errMsg(f.reason)); return; }
+    let n = 0;
+    for (const { title, link } of parseFeed(f.value, 12)) {
+      if (n >= 4) break;
+      const tl = title.toLowerCase(), key = tl.slice(0, 48);
+      if (seen.has(key) || SOFT_RE.test(tl)) continue;
+      if (!MAJOR_RE.test(tl) && !MONEY_RE.test(tl)) continue;
+      seen.add(key);
+      items.push({ title, url: link, source: "WORLD", image: faviconFor(link), description: macroImpact(title) });
+      n++;
+    }
+  });
+  if (!items.length && feeds.every((f) => f.status === "rejected")) throw new Error("all macro feeds failed");
   return items.slice(0, 5);
 }
 
-async function buildNews(): Promise<any[]> {
-  const [crypto, markets, macro] = await Promise.all([cryptoNews(), marketsNews(), macroNews()]);
-  return [...macro.slice(0, 8), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 14);
+// ============ SOCIAL NEWS ENGINE (Google News + HN + Lobsters + YouTube + Apify) ============
+const TECH_RE = new RegExp("\\b(" + ["\\bai\\b", "rag", "agent", "llm", "gpt", "claude",
+  "openai", "anthropic", "gemini", "deepseek", "nvidia", "gpu", "\\bchip\\b", "robot",
+  "software", "coding", "developer", "github", "startup", "model", "neural",
+  "computer vision", "machine learning", "automation", "data center", "quantum",
+  "cybersecurity", "breach", "hack"].join("|") + ")s?\\b");
+
+function techImpact(title: string): string {
+  const t = title.toLowerCase();
+  if (/rag|retrieval/.test(t)) return "RAG in production → the practical AI pattern. Watch who's shipping it.";
+  if (/agent/.test(t)) return "Agentic AI → systems that act, not just chat. Track real deployments.";
+  if (/llm|gpt|claude|gemini|deepseek|model/.test(t)) return "Model moves → capability jumps. Watch benchmarks and cost.";
+  if (/openai|anthropic/.test(t)) return "Lab power plays → pricing and access shift. Builders feel it first.";
+  if (/nvidia|gpu|chip/.test(t)) return "Chip supply → who can afford to train. Scarcity decides winners.";
+  if (/robot/.test(t)) return "Robotics → labor costs move. Watch warehouses and factories first.";
+  if (/layoff|hiring|job/.test(t)) return "Jobs signal → where the money's going. Skills follow demand.";
+  if (/cybersecurity|breach|hack/.test(t)) return "Security → every breach reprices trust. Patch fast.";
+  return "Tech shift → builders move first. Watch who's shipping.";
 }
 
-let newsCache: { at: number; items: any[] } | null = null;
-let newsInflight: Promise<any[]> | null = null;
-const NEWS_TTL = 5 * 60 * 1000;
+// Google News RSS titles arrive as "Headline - Publisher"
+function stripPublisher(title: string): string {
+  const i = title.lastIndexOf(" - ");
+  return (i > 10 ? title.slice(0, i) : title).trim();
+}
 
-async function getNews(): Promise<any[]> {
+// Shared social gate: topical AND not soft
+function socialGate(tl: string): boolean {
+  if (SOFT_RE.test(tl)) return false;
+  return TECH_RE.test(tl) || MONEY_RE.test(tl) || MAJOR_RE.test(tl);
+}
+
+const SOCIAL_QUERIES = [
+  "(\"Retrieval-Augmented Generation\" OR \"Agentic AI\") AND (\"deployed\" OR \"in production\")",
+  "(\"computer vision\" OR \"predictive maintenance\") AND (\"manufacturing\" OR \"supply chain\")",
+  "(\"AI\" OR \"artificial intelligence\") AND (\"job\" OR \"hiring\" OR \"layoff\")",
+];
+
+async function googleNewsSocial(): Promise<NewsItem[]> {
+  const feeds = await Promise.allSettled(SOCIAL_QUERIES.map((q) =>
+    fetchText(`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`, 10000)));
+  const items: NewsItem[] = [];
+  feeds.forEach((f, i) => {
+    if (f.status === "rejected") { console.warn("google news failed:", SOCIAL_QUERIES[i].slice(0, 40), errMsg(f.reason)); return; }
+    let n = 0;
+    for (const { title, link } of parseFeed(f.value, 15)) {
+      if (n >= 4) break;
+      const headline = stripPublisher(title);
+      if (!socialGate(headline.toLowerCase())) continue;
+      items.push({ title: headline, url: link, source: "SOCIAL", image: faviconFor(link), description: techImpact(headline) });
+      n++;
+    }
+  });
+  return items;
+}
+
+async function hackerNews(): Promise<NewsItem[]> {
+  const items: NewsItem[] = [];
+  const push = (title: string, url: string, score: number, comments: number) => {
+    if (!title || !socialGate(title.toLowerCase())) return;
+    items.push({ title, url, source: "HACKER NEWS", image: faviconFor("https://news.ycombinator.com"),
+      description: `${score} pts · ${comments} comments — the builders are talking.` });
+  };
+  const [top, algolia] = await Promise.allSettled([
+    (async () => {
+      const ids = await fetchJson("https://hacker-news.firebaseio.com/v0/topstories.json", 10000);
+      if (!Array.isArray(ids)) throw new Error("hn topstories not array");
+      return Promise.all(ids.slice(0, 12).map((id: number) =>
+        fetchJson(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, 8000).catch(() => null)));
+    })(),
+    fetchJson(`https://hn.algolia.com/api/v1/search?query=${encodeURIComponent("agentic AI deployed")}&tags=story`, 10000),
+  ]);
+  if (top.status === "fulfilled") {
+    for (const s of top.value) {
+      if (!s || s.type !== "story" || !s.title) continue;
+      push(s.title, s.url || `https://news.ycombinator.com/item?id=${s.id}`, s.score || 0, s.descendants || 0);
+    }
+  } else console.warn("hacker news failed:", errMsg(top.reason));
+  if (algolia.status === "fulfilled") {
+    for (const h of (algolia.value?.hits ?? []).slice(0, 6))
+      push(h.title || "", h.url || `https://news.ycombinator.com/item?id=${h.objectID}`, h.points || 0, h.num_comments || 0);
+  } else console.warn("hn algolia failed:", errMsg(algolia.reason));
+  return items;
+}
+
+async function lobstersNews(): Promise<NewsItem[]> {
+  const posts = await fetchJson("https://lobste.rs/hottest.json", 10000);
+  if (!Array.isArray(posts)) throw new Error("lobsters not array");
+  const items: NewsItem[] = [];
+  for (const p of posts.slice(0, 12)) {
+    const title = p.title || "", url = p.url || `https://lobste.rs/s/${p.short_id}`;
+    if (!title || !socialGate(title.toLowerCase())) continue;
+    items.push({ title, url, source: "LOBSTERS", image: faviconFor("https://lobste.rs"),
+      description: `${p.score || 0} score · ${p.comment_count ?? 0} comments — curated tech signal.` });
+  }
+  return items;
+}
+
+const YT_CHANNELS = [
+  { id: "UCsBjURrPoezykLs9EqgamOA", name: "Fireship" },
+  { id: "UCbfYPyITQ-7l4upoX8nvctg", name: "Two Minute Papers" },
+  { id: "UCXuqSBlHAE6Xw-yeJA0Tunw", name: "Linus Tech Tips" },
+];
+
+async function youtubeNews(): Promise<NewsItem[]> {
+  const feeds = await Promise.allSettled(YT_CHANNELS.map((ch) =>
+    fetchText(`https://www.youtube.com/feeds/videos.xml?channel_id=${ch.id}`, 10000)));
+  const items: NewsItem[] = [];
+  feeds.forEach((f, i) => {
+    if (f.status === "rejected") { console.warn("youtube failed:", YT_CHANNELS[i].name, errMsg(f.reason)); return; }
+    let n = 0;
+    for (const { title, link } of parseFeed(f.value, 8)) {
+      if (n >= 2) break;
+      if (!socialGate(title.toLowerCase())) continue;
+      items.push({ title: `${title} [${YT_CHANNELS[i].name}]`, url: link, source: "YOUTUBE",
+        image: faviconFor("https://www.youtube.com"), description: techImpact(title) });
+      n++;
+    }
+  });
+  return items;
+}
+
+// ============ APIFY SOCIAL SCRAPING (TikTok + X, free tier) ============
+// Paid actors (~$0.05-0.10 per call). Hard guarantees:
+//  1. the 6h slot is CLAIMED before any paid call (the old code stamped only on non-empty results,
+//     so an empty/filtered run re-fired both paid actors on every 5-minute news refresh);
+//  2. a config-read failure SKIPS the run (the old code treated every error as "never ran");
+//  3. the scrape runs in the background — /news never waits on a 60s actor call.
+const APIFY_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
+const APIFY_CALL_TIMEOUT = 60000;
+const APIFY_CACHE_MAX_ITEMS = 30;
+const APIFY_DOC = "/system_config/apify_last_run";
+let _apifyRunning = false;
+
+async function apifyState(): Promise<{ lastRun: number | null; cached: NewsItem[] }> {
+  let doc: Doc;
+  try { doc = (await firestore(APIFY_DOC, { method: "GET" })) as Doc; }
+  catch (e) { if (is404(e)) return { lastRun: null, cached: [] }; throw e; } // only a 404 means "never ran"
+  const f = doc.fields ?? {};
+  let cached: NewsItem[] = [];
+  const raw = str(f.items);
+  if (raw) {
+    try { const arr = JSON.parse(raw); if (Array.isArray(arr)) cached = arr; }
+    catch (e) { recordFailure("apify:cache_parse", e); }
+  }
+  return { lastRun: tsOf(f.tsNum) ?? tsOf(f.ts), cached };
+}
+
+async function apifyWrite(items: NewsItem[]): Promise<void> {
+  // REV 19: runs as the 'apifyWrite' system op — scoped to /system_config/apify_last_run.
+  await runAsSystem('apifyWrite', () =>
+    firestore(APIFY_DOC, { method: "PATCH", body: { fields: {
+      tsNum: nowNum(), ts: nowTs(),
+      items: { stringValue: JSON.stringify(items.slice(0, APIFY_CACHE_MAX_ITEMS)) },
+    } } })
+  );
+}
+
+async function apifyRun(actor: string, input: unknown, token: string): Promise<any[]> {
+  const r = await http(
+    `https://api.apify.com/v2/acts/${actor}/run-sync-get-dataset-items`,
+    { method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify(input) },
+    APIFY_CALL_TIMEOUT);
+  if (!r.ok) throw new Error(`Apify ${actor} HTTP ${r.status}`);
+  let arr: unknown;
+  try { arr = JSON.parse(r.body); } catch { throw new Error(`Apify ${actor} returned non-JSON`); }
+  if (!Array.isArray(arr)) throw new Error(`Apify ${actor} non-array response`);
+  return arr;
+}
+
+async function apifyTikTok(token: string): Promise<NewsItem[]> {
+  const arr = await apifyRun("clockworks~tiktok-scraper", {
+    hashtags: ["AI", "artificialintelligence", "tech"], resultsPerPage: 10,
+    shouldDownloadVideos: false, shouldDownloadCovers: false }, token);
+  const items: NewsItem[] = [];
+  for (const v of arr.slice(0, 10)) {
+    const text = String(v.text || "").trim(), url = v.webVideoUrl || "";
+    if (!text || !url || !socialGate(text.toLowerCase())) continue;
+    const author = v.authorMeta?.name || v.authorMeta?.nickName || "tiktok";
+    items.push({ title: text.slice(0, 140), url, source: "TIKTOK", image: faviconFor("https://www.tiktok.com"),
+      description: `@${author} · ${Number(v.diggCount ?? 0).toLocaleString("en-US")} likes — trending on TikTok.` });
+  }
+  return items;
+}
+
+async function apifyX(token: string): Promise<NewsItem[]> {
+  const arr = await apifyRun("apidojo~tweet-scraper", {
+    searchTerms: ["AI deployed", "built an AI agent"], maxItems: 10, tweetLanguage: "en" }, token);
+  const items: NewsItem[] = [];
+  for (const t of arr.slice(0, 10)) {
+    const text = String(t.text || "").trim(), url = t.url || "";
+    if (!text || !url || !socialGate(text.toLowerCase())) continue;
+    const author = t.author?.userName || "x";
+    items.push({ title: text.slice(0, 140), url, source: "X", image: faviconFor("https://x.com"),
+      description: `@${author} · ${Number(t.likeCount ?? 0).toLocaleString("en-US")} likes — trending on X.` });
+  }
+  return items;
+}
+
+async function apifyRefresh(token: string, previous: NewsItem[]): Promise<void> {
+  await apifyWrite(previous); // CLAIM the slot first: stamps now, keeps the old items
+  const [tt, x] = await Promise.allSettled([apifyTikTok(token), apifyX(token)]);
+  const fresh: NewsItem[] = [];
+  for (const [label, r] of [["tiktok", tt], ["x", x]] as const) {
+    if (r.status === "fulfilled") fresh.push(...r.value);
+    else recordFailure(`apify:${label}`, r.reason);
+  }
+  if (fresh.length) await apifyWrite(fresh);
+}
+
+async function apifySocialNews(): Promise<NewsItem[]> {
+  const token = process.env.APIFY_API_TOKEN;
+  if (!token) return []; // graceful fallback: no token, no calls
+  const { lastRun, cached } = await apifyState(); // throws on non-404 → run skipped, failure recorded upstream
+  const due = lastRun === null || Date.now() - lastRun >= APIFY_RATE_LIMIT_MS;
+  if (due && !_apifyRunning) {
+    _apifyRunning = true;
+    apifyRefresh(token, cached)
+      .catch((e: unknown) => recordFailure("apify:refresh", e))
+      .finally(() => { _apifyRunning = false; });
+  }
+  return cached;
+}
+
+async function socialNews(): Promise<NewsItem[]> {
+  const sources = { apify: apifySocialNews, google: googleNewsSocial, hn: hackerNews, lobsters: lobstersNews, youtube: youtubeNews };
+  const names = Object.keys(sources) as Array<keyof typeof sources>;
+  const results = await Promise.allSettled(names.map((n) => sources[n]()));
+  const ordered: NewsItem[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") ordered.push(...r.value);
+    else if (names[i] === "apify") recordFailure("news:apify", r.reason);
+    else console.warn(`social source ${names[i]} failed:`, errMsg(r.reason));
+  });
+  return dedupeItems(ordered); // deterministic: priority order, one pass, no shared mutable state
+}
+
+const NEWS_SECTIONS = ["crypto", "markets", "macro", "social"] as const;
+
+async function buildNews(): Promise<NewsItem[]> {
+  const results = await Promise.allSettled([cryptoNews(), marketsNews(), macroNews(), socialNews()]);
+  const [crypto, markets, macro, social] = results.map((r, i) => {
+    if (r.status === "fulfilled") return r.value;
+    recordFailure(`news:${NEWS_SECTIONS[i]}`, r.reason);
+    return [] as NewsItem[];
+  });
+  return [...macro.slice(0, 6), ...social.slice(0, 6), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 16);
+}
+
+// Stale-while-error: an upstream outage serves the last good feed and retries in 30s.
+let newsCache: { at: number; items: NewsItem[] } | null = null;
+let newsInflight: Promise<NewsItem[]> | null = null;
+const NEWS_TTL = 5 * 60 * 1000;
+const NEWS_RETRY_MS = 30 * 1000;
+
+async function getNews(): Promise<NewsItem[]> {
   const now = Date.now();
   if (newsCache && now - newsCache.at < NEWS_TTL) return newsCache.items;
-  if (!newsInflight) {
-    newsInflight = buildNews().then((items) => {
-      newsCache = { at: Date.now(), items };
+  newsInflight ??= buildNews()
+    .then((items) => {
+      if (items.length) { newsCache = { at: Date.now(), items }; return items; }
+      if (newsCache) { newsCache = { at: Date.now() - NEWS_TTL + NEWS_RETRY_MS, items: newsCache.items }; return newsCache.items; }
       return items;
-    }).finally(() => { newsInflight = null; });
-  }
+    })
+    .catch((e: unknown) => {
+      recordFailure("news:build", e);
+      if (newsCache) return newsCache.items;
+      throw e;
+    })
+    .finally(() => { newsInflight = null; });
   return newsInflight;
 }
 
-const app = express();
-app.use(express.json({ limit: "64kb" }));
+// ============ PINECONE (control-plane host resolution, dimension-safe) ============
+const PINECONE_INDEX = "static-pattern-refinery";
+let _pcHost: { host: string; dimension: number } | null = null;
 
-// CORS for browser clients
+function pineconeHeaders(): Record<string, string> {
+  const k = process.env.PINECONE_API_KEY;
+  if (!k) throw new UserError("PINECONE_API_KEY not configured");
+  return { "Api-Key": k, "Content-Type": "application/json" };
+}
+async function pineconeIndex(): Promise<{ host: string; dimension: number }> {
+  if (_pcHost) return _pcHost;
+  const r = await http(`https://api.pinecone.io/indexes/${PINECONE_INDEX}`,
+    { headers: pineconeHeaders() }, EXT_TIMEOUT);
+  if (!r.ok) throw new Error(`Pinecone describe ${r.status}`);
+  const d = parseJson(r.body);
+  if (!d.host || !d.dimension) throw new Error("Pinecone index describe returned no host/dimension");
+  _pcHost = { host: d.host, dimension: Number(d.dimension) };
+  return _pcHost;
+}
+
+// Phase 3 Section B: Attachment metadata validation
+// Binary uploads go to Cloudinary via uploadAttachmentData (used by
+// POST /upload for the widget and by send_message for inline data_base64).
+// Metadata-only refs are validated here.
+
+
+function validateAttachment(att: { mime_type: string; size_bytes: number; storage_path: string }, uploaderName: string): void {
+  // Check MIME against allowlist
+  const limit = ATTACHMENT_LIMITS[att.mime_type];
+  if (!limit) {
+    throw new UserError(`MIME type not allowed: ${att.mime_type}`);
+  }
+  if (att.size_bytes > limit) {
+    throw new UserError(`File too large: ${att.size_bytes} > ${limit} for ${att.mime_type}`);
+  }
+  // Block dangerous types
+  if (att.mime_type.includes("html") || att.mime_type.includes("javascript") || att.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${att.mime_type}`);
+  }
+  // Storage path must be in attachments/ directory (prevent path traversal)
+  if (!att.storage_path.startsWith("attachments/") || att.storage_path.includes("..")) {
+    throw new UserError("Invalid storage path");
+  }
+}
+
+/**
+ * Verify an end-user Firebase ID token (widget clients). Returns the
+ * Firebase user or null. Used by POST /upload — the widget is a
+ * Firebase-authenticated client, not an MCP bot.
+ */
+async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string; email?: string } | null> {
+  try {
+    const r = await http(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) },
+      EXT_TIMEOUT);
+    if (!r.ok) return null;
+    const u = parseJson(r.body)?.users?.[0];
+    return u?.localId ? { localId: u.localId, email: u.email } : null;
+  } catch {
+    return null;
+  }
+}
+
+// Firebase Auth allows open email signup, so a valid ID token proves nothing about team
+// membership. Fails closed: an unset UPLOAD_ALLOWED_EMAILS refuses every upload.
+const UPLOAD_ALLOWED = new Set(
+  (process.env.UPLOAD_ALLOWED_EMAILS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+
+export function uploadAllowed(email: string | undefined, allowed: ReadonlySet<string> = UPLOAD_ALLOWED): boolean {
+  return !!email && allowed.has(email.trim().toLowerCase());
+}
+
+/** Shared shape for attachment metadata stored in Firestore docs. */
+interface AttachmentMeta {
+  id: string; filename: string; mime_type: string; size_bytes: number;
+  storage_path: string; download_url: string; is_image: boolean; uploaded_by: string;
+}
+
+/**
+ * Validate inline file data and upload it to Cloudinary. Returns the
+ * attachment metadata to store in the Firestore doc. The API secret
+ * never leaves the server — only the public secure_url is returned.
+ */
+async function uploadAttachmentData(input: {
+  filename: string; mime_type: string; data_base64: string; uploadedBy: string;
+}): Promise<AttachmentMeta> {
+  const filename = (input.filename || "").trim();
+  if (!filename || filename.length > 255) throw new UserError("Invalid filename");
+  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+    throw new UserError("Invalid filename");
+  }
+  const limit = ATTACHMENT_LIMITS[input.mime_type];
+  if (!limit) throw new UserError(`MIME type not allowed: ${input.mime_type}`);
+  if (input.mime_type.includes("html") || input.mime_type.includes("javascript") || input.mime_type.includes("executable")) {
+    throw new UserError(`File type blocked for security: ${input.mime_type}`);
+  }
+  let bytes: number;
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(input.data_base64, "base64");
+    bytes = buf.length;
+  } catch {
+    throw new UserError("Invalid base64 data");
+  }
+  if (bytes < 1) throw new UserError("Empty file");
+  if (bytes > limit) throw new UserError(`File too large: ${bytes} > ${limit} for ${input.mime_type}`);
+  if (!cloudinaryConfigured()) throw new UserError("Uploads unavailable: storage not configured");
+  const up = await uploadToCloudinary({
+    dataUri: `data:${input.mime_type};base64,${input.data_base64}`,
+    filename, mimeType: input.mime_type,
+  });
+  const id = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id, filename, mime_type: input.mime_type, size_bytes: up.bytes || bytes,
+    storage_path: `attachments/cloudinary/${up.public_id}`,
+    download_url: up.secure_url,
+    is_image: input.mime_type.toLowerCase().startsWith("image/"),
+    uploaded_by: input.uploadedBy,
+  };
+}
+
+// ============ EXPRESS ============
+const app = express();
+app.disable("x-powered-by");
+
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
-app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// POST /upload — widget file uploads via the bridge (secret stays server-side).
+// Auth: Firebase ID token (the widget is a Firebase-authenticated client).
+// Registered BEFORE the global 2mb JSON parser so uploads get their own limit.
+// NOTE: this route is intentionally outside sec.resolveAuth — it uses the
+// end-user's Firebase identity, not the bot MCP secret.
+app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: Response) => {
+  try {
+    const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
+    if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
+    const who = await verifyFirebaseIdToken(m[1]);
+    if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
+    if (!uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
+    const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
+    const att = await uploadAttachmentData({
+      filename: typeof filename === "string" ? filename : "",
+      mime_type: typeof mime_type === "string" ? mime_type : "",
+      data_base64: typeof data_base64 === "string" ? data_base64 : "",
+      uploadedBy: who.email || who.localId,
+    });
+    res.json({ ok: true, ...att });
+  } catch (e) {
+    const msg = errMsg(e);
+    const status = e instanceof UserError ? 400 : 500;
+    res.status(status).json({ ok: false, error: msg });
+  }
+});
+
+app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
+
+app.get("/health", (_req, res) => { res.json({ ok: true }); });
 
 app.get("/news", async (_req, res) => {
   try {
     const items = await getNews();
     res.json({ ok: true, count: items.length, items });
-  } catch (e: any) {
-    res.status(500).json({ ok: false, error: e.message });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: errMsg(e) });
   }
 });
 
-const route = MCP_SECRET ? `/mcp/${MCP_SECRET}` : "/mcp";
-const server = buildServer(); // Built ONCE at startup
+// REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with
+// duplicate-safe Bearer parsing and no-oracle decoys). The inline check is retired.
+const jsonRpcError = (code: number, message: string) => ({ jsonrpc: "2.0", error: { code, message }, id: null });
 
-app.post(route, async (req, res) => {
+async function handleMcp(req: Request, res: Response): Promise<void> {
+  const server = buildServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  res.on("close", () => {
+    server.close().catch((e: unknown) => console.error("mcp close failed:", errMsg(e)));
+  });
   try {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, enableJsonResponse: true,
-    });
-    res.on("close", () => transport.close());
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-  } catch {
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" }, id: null });
-    }
+  } catch (e) {
+    recordFailure("mcp_route", e);
+    if (!res.headersSent) res.status(500).json(jsonRpcError(-32603, "Internal server error"));
   }
+}
+
+app.all(/^\/mcp\/(.+?)\/?$/, async (req: Request, res: Response) => {
+  // REV 19 auth: Bearer authoritative, duplicate-safe, no-oracle decoys.
+  let ctx: CallerCtx;
+  try {
+    const authRes = await sec.resolveAuth(req as AuthRequest, req.url || '');
+    if (authRes.kind === 'decoy') { res.status(DECOY_STATUS).json(DECOY_BODY); return; }
+    ctx = authRes.ctx;
+  } catch (e) {
+    if (e instanceof WriteThroughFailed) { res.status(503).json({ error: 'write_through_failed' }); return; }
+    throw e;
+  }
+  if (req.method !== "POST") { res.status(405).json(jsonRpcError(-32000, "Method not allowed.")); return; }
+  await reqCtx.run(ctx, () => handleMcp(req, res));
 });
 
+// Body-parser failures (bad JSON, >2mb) answered as JSON-RPC, not an HTML stack page.
+app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) { next(err); return; }
+  const tooBig = err?.type === "entity.too.large";
+  res.status(tooBig ? 413 : 400).json(jsonRpcError(tooBig ? -32600 : -32700, tooBig ? "payload too large" : "parse error"));
+});
 
-const notAllowed = (_req: express.Request, res: express.Response) =>
-  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
-app.get(route, notAllowed);
-app.delete(route, notAllowed);
+process.on("unhandledRejection", (reason) => recordFailure("unhandledRejection", reason));
+process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); setTimeout(() => process.exit(1), 1500).unref(); });
 
+// Testability: the test suite imports this module for its pure helpers
+// (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
+// PHASE3_TEST is set so imports don't bind a port or arm timers.
+if (!process.env.PHASE3_TEST) {
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
+const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
+
+// REV 19: periodic security-telemetry flush (bound write-through buffer → Firestore).
+setInterval(() => sec.telemetry.flush().catch(() => {}), 5 * 60 * 1000);
+
+// Render sends SIGTERM on deploy: stop accepting, let in-flight calls finish, then exit.
+process.on("SIGTERM", () => {
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10000).unref();
+});
+}
