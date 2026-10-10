@@ -32,6 +32,7 @@ import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
 } from "./curated-news.js";
 import { rejectCuratedBatch } from "./privacy.js";
+import { createChannelCache, type CachedMessage } from "./channel-cache.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
 import { sessionMarkerId, sessionMarkerText, createOrientCache, runOrient } from "./orient.js";
@@ -870,19 +871,41 @@ export function mergeNewest(pages: Doc[][], limit: number): Doc[] {
   return newest([...unique.values()], limit);
 }
 
-const queryNewest = async (collectionId: string, limit: number): Promise<Doc[]> => {
-  const [byTs, byNum] = await Promise.all([
-    queryDocs(collectionId, { orderField: "ts", limit }),
-    queryDocs(collectionId, { orderField: "tsNum", limit }),
-  ]);
-  return mergeNewest([byTs.docs, byNum.docs], limit);
-};
-
 // Collections stamped only with tsNum (evolution_logs, jarvis_memory): newest-first by number,
 // falling back to a page read for legacy docs that predate tsNum.
 async function queryNewestNum(collectionId: string, limit: number): Promise<Doc[]> {
   const { docs } = await queryDocs(collectionId, { orderField: "tsNum", limit });
   return docs.length ? docs : newest(await listDocs(collectionId), limit);
+}
+
+const selectFields = (fields?: string[]) =>
+  fields?.length ? { select: { fields: fields.map((fieldPath) => ({ fieldPath })) } } : {};
+
+/** One ordered page, exact limit — no dual ts/tsNum fetch and no 2× over-read. */
+async function queryPage(collectionId: string, orderField: string, limit: number, fields?: string[]): Promise<Doc[]> {
+  const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
+    from: [{ collectionId }],
+    ...selectFields(fields),
+    orderBy: [{ field: { fieldPath: orderField }, direction: "DESCENDING" }],
+    limit,
+  } } });
+  return newest(rowsOf(data), limit);
+}
+
+/** Incremental tsNum page: only docs newer than sinceTs. Empty result still bills 1 read. */
+async function querySince(collectionId: string, sinceTs: number, limit: number, fields?: string[]): Promise<Doc[]> {
+  const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
+    from: [{ collectionId }],
+    ...selectFields(fields),
+    where: { fieldFilter: {
+      field: { fieldPath: "tsNum" },
+      op: "GREATER_THAN",
+      value: { integerValue: String(sinceTs) },
+    } },
+    orderBy: [{ field: { fieldPath: "tsNum" }, direction: "ASCENDING" }],
+    limit,
+  } } });
+  return newest(rowsOf(data), limit);
 }
 
 // ============ SHARED MUTATION HELPERS ============
@@ -959,7 +982,7 @@ async function findTask(task_id?: string, title?: string): Promise<{ id: string;
   }
   if (title) {
     const q = title.toLowerCase();
-    for (const d of await queryNewest(TASKS, 100)) {
+    for (const d of await queryPage(TASKS, "ts", 100)) {
       if (str(d.fields?.text).toLowerCase().includes(q))
         return { id: docIdOf(d.name), fields: d.fields ?? {} };
     }
@@ -1009,6 +1032,11 @@ export function fmtMsg(d: Doc): FmtMsg {
   return msg;
 }
 
+function cachedFromDoc(d: Doc): CachedMessage {
+  const m = fmtMsg(d);
+  return { ...m, ts: m.ts ?? bestTs(d) };
+}
+
 async function countDocs(collectionId: string): Promise<number | null> {
   try {
     const data = await firestore(`:runAggregationQuery`, { method: "POST", body: {
@@ -1020,6 +1048,24 @@ async function countDocs(collectionId: string): Promise<number | null> {
     return v?.integerValue !== undefined ? Number(v.integerValue) : null;
   } catch (e) {
     recordFailure(`countDocs:${collectionId}`, e);
+    return null;
+  }
+}
+
+async function countDocsWhere(collectionId: string, field: string, op: string, value: unknown): Promise<number | null> {
+  try {
+    const data = await firestore(`:runAggregationQuery`, { method: "POST", body: {
+      structuredAggregationQuery: {
+        structuredQuery: {
+          from: [{ collectionId }],
+          where: { fieldFilter: { field: { fieldPath: field }, op, value } },
+        },
+        aggregations: [{ count: {}, alias: "total" }],
+      } } });
+    const v = data?.[0]?.result?.aggregateFields?.total;
+    return v?.integerValue !== undefined ? Number(v.integerValue) : null;
+  } catch (e) {
+    recordFailure(`countDocsWhere:${collectionId}`, e);
     return null;
   }
 }
@@ -1104,6 +1150,23 @@ const channelSchema = z.enum(["room", "code", "dm"]).default("room")
 export const channelCollection = (channel: string): string =>
   CHANNEL_COLLECTIONS[channel as keyof typeof CHANNEL_COLLECTIONS] ?? MESSAGES;
 
+const MSG_FIELDS = ["name", "text", "ts", "tsNum", "attachments", "audio", "audioType"];
+const MSG_LEAN = ["name", "text", "ts", "tsNum"];
+
+const channelCache = createChannelCache({
+  load: async (channel, since, limit) => {
+    const coll = channelCollection(channel);
+    let docs: Doc[];
+    if (since == null) {
+      docs = await queryPage(coll, "tsNum", limit, MSG_FIELDS);
+      if (!docs.length) docs = await queryPage(coll, "ts", limit, MSG_FIELDS);
+    } else {
+      docs = await querySince(coll, since, limit, MSG_FIELDS);
+    }
+    return docs.map(cachedFromDoc);
+  },
+});
+
 // Built PER REQUEST. A shared McpServer rejects every overlapping call with
 // "Already connected to a transport" — the SDK's stateless pattern is one server per request.
 function buildServer(skills: readonly SkillSpec[] = []): McpServer {
@@ -1111,11 +1174,19 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
   // ---- Messages ----
   tool(server, "read_messages",
-        { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first. Channels: 'room' (status + decisions), 'code' (code talk), 'dm' (private Nexus DM).",
-      inputSchema: { limit: z.number().int().min(1).max(50).default(10), channel: channelSchema }, readOnly: true },
-    async ({ limit, channel }) => {
-      const messages = (await queryNewest(channelCollection(channel), limit)).map(fmtMsg);
-      return { count: messages.length, messages };
+        { title: "Read Highway messages", description: "Read Highway messages, newest first, from a shared in-memory cache of the last ~100 per channel (one incremental Firestore query when the TTL expires). Pass since_ts to get only newer messages; mention to keep @-mentions of that name. Channels: 'room', 'code', 'dm'.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).default(10),
+        channel: channelSchema,
+        since_ts: z.number().int().min(0).optional()
+          .describe("Unix ms. Only messages newer than this. Use the newest_ts from the last call."),
+        mention: z.string().trim().min(1).max(40).optional()
+          .describe("If set, only messages that @-mention this name."),
+      }, readOnly: true },
+    async ({ limit, channel, since_ts, mention }) => {
+      const messages = await channelCache.read(channel, { limit, since_ts, mention });
+      const newest_ts = channelCache.peek(channel)[0]?.ts ?? messages[0]?.ts ?? null;
+      return { count: messages.length, messages, newest_ts, cached: true };
     });
 
   const attachmentSchema = z.object({
@@ -1225,7 +1296,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         const res = await writeIdempotent(coll, docId, body, name, idemIo);
         await armLock(res.id, !res.duplicate);
         await claimLock();
-        return { ok: true, duplicate: res.duplicate, id: res.id, name, ts: Date.now() };
+        const ts = Date.now();
+        channelCache.ingest(channel, { id: res.id, name, text, ts });
+        return { ok: true, duplicate: res.duplicate, id: res.id, name, ts };
       }
       const posted = await firestore(`/${channelCollection(channel)}`, {
         method: "POST",
@@ -1235,7 +1308,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const postedId = posted?.name ? docIdOf(posted.name) : "";
       await armLock(postedId, true);
       await claimLock();
-      return { ok: true, name, ts: Date.now(), chars: text.length, id: postedId };
+      const ts = Date.now();
+      channelCache.ingest(channel, { id: postedId, name, text, ts });
+      return { ok: true, name, ts, chars: text.length, id: postedId };
     });
 
   tool(server, "send_voice",
@@ -1250,8 +1325,15 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const fields: Fields = doc.fields;
       fields.audio = { stringValue: audio };
       fields.audioType = { stringValue: audioType || "audio/webm" };
-      await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name });
-      return { ok: true, name, ts: Date.now() };
+      const written = await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name }) as { name?: string };
+      const ts = Date.now();
+      const captionText = caption || "🎤 voice message";
+      channelCache.ingest("room", {
+        id: written?.name ? docIdOf(written.name) : "",
+        name, text: captionText, ts, audio, audioType: audioType || "audio/webm",
+        audioBytes: Math.floor(audio.length * 3 / 4),
+      });
+      return { ok: true, name, ts };
     });
 
 
@@ -1312,12 +1394,16 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     });
 
   tool(server, "search_messages",
-    { title: "Search Highway messages", description: "Keyword search over the 200 newest messages.",
+    { title: "Search Highway messages", description: "Keyword search over the cached recent room (last ~100). Falls back to one 200-doc tsNum page if the cache is cold.",
       inputSchema: { query: z.string().trim().min(1).max(100), limit: z.number().int().min(1).max(50).default(10) },
       readOnly: true },
     async ({ query, limit }) => {
       const q = query.toLowerCase();
-      const matches = (await queryNewest(MESSAGES, 200)).map(fmtMsg)
+      const warm = channelCache.peek("room");
+      const pool = warm.length
+        ? warm
+        : (await queryPage(MESSAGES, "tsNum", 200, MSG_LEAN)).map(cachedFromDoc);
+      const matches = pool
         .filter((m) => m.text.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
         .slice(0, limit);
       return { count: matches.length, query, matches };
@@ -1520,7 +1606,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         get: (id) => brain.get(id),
         cache: orientCache,
         openFromStore: async () => {
-          const docs = await queryNewest(TASKS, 8);
+          const docs = await queryPage(TASKS, "ts", 8, ["text", "done", "createdBy", "ts", "tsNum"]);
           return docs.filter((d) => !boolOf(d.fields?.done)).map((d) => ({
             id: `task:${docIdOf(d.name)}`, score: 0, text: str(d.fields?.text),
             kind: "idea", author: str(d.fields?.createdBy), verified: false,
@@ -1625,7 +1711,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Read Highway activity", description: "Read recent ACTIVITY feed entries, newest first.",
       inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
-      const entries = (await queryNewest(ACTIVITY, limit)).map((d) => {
+      const entries = (await queryPage(ACTIVITY, "ts", limit, ["by", "text", "ts"])).map((d) => {
         const f = d.fields ?? {};
         return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
       });
@@ -1638,7 +1724,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { limit: z.number().int().min(1).max(100).default(30), include_done: z.boolean().default(true) },
       readOnly: true },
     async ({ limit, include_done }) => {
-      let tasks = (await queryNewest(TASKS, limit)).map(fmtTask);
+      let tasks = (await queryPage(TASKS, "ts", limit, ["text", "done", "createdBy", "assignee", "priority", "ts"])).map(fmtTask);
       if (!include_done) tasks = tasks.filter((t) => !t.done);
       return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
     });
@@ -1794,7 +1880,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const degraded: string[] = [];
       const [presDocs, msgDocs] = await Promise.all([
         settle("get_team:presence", listDocs(PRESENCE), [] as Doc[], degraded),
-        settle("get_team:messages", queryNewest(MESSAGES, 50), [] as Doc[], degraded),
+        settle("get_team:messages", channelCache.read("room", { limit: 50 }), [] as CachedMessage[], degraded),
       ]);
       const now = Date.now();
       const online = new Set<string>();
@@ -1802,10 +1888,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         if (isOnline(tsOf(d.fields?.ts), now)) online.add(str(d.fields?.name).toLowerCase());
       }
       const seen = new Map<string, { name: string; online: boolean; lastSeen: number | null }>();
-      for (const d of msgDocs) {
-        const n = str(d.fields?.name);
-        if (n && !seen.has(n.toLowerCase()))
-          seen.set(n.toLowerCase(), { name: n, online: online.has(n.toLowerCase()), lastSeen: tsOf(d.fields?.ts) });
+      for (const m of msgDocs) {
+        if (m.name && !seen.has(m.name.toLowerCase()))
+          seen.set(m.name.toLowerCase(), { name: m.name, online: online.has(m.name.toLowerCase()), lastSeen: m.ts });
       }
       return { count: seen.size, members: [...seen.values()], ...(degraded.length ? { degraded } : {}) };
     });
@@ -1815,19 +1900,20 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: {}, readOnly: true },
     async () => {
       const degraded: string[] = [];
-      const [msgTotal, taskDocs, presDocs, notesDoc] = await Promise.all([
+      const [msgTotal, taskTotal, taskDone, presDocs, notesDoc] = await Promise.all([
         countDocs(MESSAGES),
-        settle("get_stats:tasks", queryNewest(TASKS, 200), [] as Doc[], degraded),
+        settle("get_stats:tasks", countDocs(TASKS), null as number | null, degraded),
+        settle("get_stats:tasks_done", countDocsWhere(TASKS, "done", "EQUAL", { booleanValue: true }), null as number | null, degraded),
         settle("get_stats:presence", listDocs(PRESENCE), [] as Doc[], degraded),
         settle("get_stats:notes", getDocOrNull(NOTES, "shared"), null as Doc | null, degraded),
       ]);
       if (msgTotal === null) degraded.push("get_stats:messages");
       const now = Date.now();
-      const tasks = taskDocs.map(fmtTask);
       const nf = notesDoc?.fields;
+      const tasks_done = taskDone;
+      const tasks_open = taskTotal !== null && taskDone !== null ? Math.max(0, taskTotal - taskDone) : null;
       return {
-        messages_total: msgTotal, tasks_open: tasks.filter((t) => !t.done).length,
-        tasks_done: tasks.filter((t) => t.done).length,
+        messages_total: msgTotal, tasks_open, tasks_done,
         online_now: presDocs.filter((d) => isOnline(tsOf(d.fields?.ts), now)).length,
         grimoire: nf ? { updatedBy: str(nf.updatedBy), ts: tsOf(nf.ts), chars: str(nf.content).length } : null,
         server_time: new Date().toISOString(),
@@ -1872,10 +1958,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Condense session logs", description: "Condense chat history into a dense JSON summary.",
       inputSchema: { limit: z.number().int().min(5).max(50).optional() }, readOnly: true },
     async ({ limit }) => {
-      const condensed = (await queryNewest(MESSAGES, limit || 20)).map((d) => {
-        const f = d.fields ?? {};
-        return { n: str(f.name), t: str(f.text).slice(0, 200) };
-      });
+      const condensed = (await channelCache.read("room", { limit: limit || 20 })).map((m) => ({
+        n: m.name, t: m.text.slice(0, 200),
+      }));
       return { count: condensed.length, condensed };
     });
 
@@ -2168,13 +2253,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Summarize thread", description: "Extract decisions, questions, and action items from recent Highway Chat messages.", readOnly: true,
       inputSchema: { limit: z.number().int().min(5).max(50).optional().default(20) } },
     async ({ limit }) => {
-      const msgs = await queryNewest(MESSAGES, limit || 20);
+      const msgs = await channelCache.read("room", { limit: limit || 20 });
       const decisions: string[] = [], questions: string[] = [], actions: string[] = [];
-      for (const d of msgs) {
-        const f = d.fields ?? {};
-        const text = str(f.text).trim();
+      for (const m of msgs) {
+        const text = m.text.trim();
         if (!text) continue;
-        const line = `${str(f.name) || "unknown"}: ${text.slice(0, 160)}`;
+        const line = `${m.name || "unknown"}: ${text.slice(0, 160)}`;
         if (/\b(decided|decision|agreed|locked in|going with)\b/i.test(text)) decisions.push(line);
         else if (text.includes("?")) questions.push(line);
         else if (/\b(will|todo|action item|action:|need to|must|going to)\b/i.test(text)) actions.push(line);
