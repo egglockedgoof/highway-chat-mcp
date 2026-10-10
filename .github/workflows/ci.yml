@@ -5,7 +5,32 @@ on:
   push:
     branches: [main]
 
+# Job names are the GitHub check names. Sin still has to mark
+# install, typecheck, test, smoke required on main (this token has no admin).
+# Live post-deploy smoke is NOT this job — hitting Render/Firestore from every
+# PR would write into Highway and can starve the daily read quota.
 jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -14,9 +39,16 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install
-        run: npm ci
-      - name: Typecheck
-        run: npm run build
-      - name: Test
-        run: npm test
+      - run: npm ci
+      - run: npm test
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run smoke:offline
