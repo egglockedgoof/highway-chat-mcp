@@ -16,7 +16,8 @@ services:
         sync: false
       - key: BOT_CREDENTIALS
         sync: false
-      # Per-agent Bearer tokens: JSON object { "<token>": "<bot-name>" }
+      # Per-agent Bearer tokens: JSON object { "<token>": "<bot-name>", ... }
+      # Include a row for every bot that will send Authorization: Bearer (incl. hollow).
       - key: MCP_CALLERS
         sync: false
       # Comma-separated emails allowed to POST /upload

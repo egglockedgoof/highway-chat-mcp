@@ -837,6 +837,20 @@ function constantTimeEqual(a: string, b: string): boolean {
   return ba.length === bb.length && timingSafeEqual(ba, bb);
 }
 
+/** Scan every MCP_CALLERS token. No early return — comparison count does not
+ *  leak whether the match was first or last. Last match wins if two compare equal. */
+export function matchCallerToken(
+  presented: string,
+  mcpCallers: Record<string, string>,
+  equal: (a: string, b: string) => boolean = constantTimeEqual,
+): string | null {
+  let matched: string | null = null;
+  for (const [token, bot] of Object.entries(mcpCallers)) {
+    if (equal(presented, token)) matched = bot;
+  }
+  return matched;
+}
+
 export type AuthResolution = { kind: 'ctx'; ctx: CallerCtx } | { kind: 'decoy' };
 
 export interface AuthDeps {
@@ -855,11 +869,8 @@ export function createResolveAuth(deps: AuthDeps): (req: AuthRequest, urlPath: s
   return async function resolveAuth(req: AuthRequest, urlPath: string): Promise<AuthResolution> {
     const parsed = parseBearer(req);
     if (parsed.kind === 'bearer') {
-      for (const [token, bot] of Object.entries(deps.config.mcpCallers)) {
-        if (constantTimeEqual(parsed.token, token)) {
-          return { kind: 'ctx', ctx: { bot, method: 'header_bound' } };
-        }
-      }
+      const bot = matchCallerToken(parsed.token, deps.config.mcpCallers);
+      if (bot) return { kind: 'ctx', ctx: { bot, method: 'header_bound' } };
       deps.count('rejected');
       return { kind: 'decoy' };
     }
