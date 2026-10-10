@@ -61,6 +61,32 @@ test('header_bound write accepts equivalent spellings of the bound name', () => 
   assert.equal(bad.code, 'identity_mismatch');
 });
 
+test('legacy write is rejected when MCP_CALLERS requires a bound token', () => {
+  const gate = sec.createGate({
+    isSunset: () => false,
+    count: () => {},
+    readBot: 'whisper',
+    recordBoundUse: () => {},
+    recordLegacyName: () => {},
+    requireBoundWrite: true,
+  });
+  const denied = gate.resolveWrite({ bot: null, method: 'path_legacy' }, 'whisper');
+  assert.equal(denied.ok, false);
+  assert.equal(denied.code, 'use_bound_token');
+  const read = gate.resolveRead({ bot: null, method: 'path_legacy' });
+  assert.equal(read.ok, true);
+});
+
+test('postedName uses the bound token name and rejects spoof claims', async () => {
+  const bound = { bot: 'Nyx', method: 'header_bound' as const };
+  const got = await sec.reqCtx.run(bound, () => Promise.resolve(idx.postedName('nyx')));
+  assert.equal(got, 'Nyx');
+  await assert.rejects(
+    () => sec.reqCtx.run(bound, async () => { idx.postedName('whisper'); }),
+    /cannot mint for "whisper"/,
+  );
+});
+
 test('buildFirestoreQuery repeats updateMask.fieldPaths (idempotency_key regression)', () => {
   const fields = ['name', 'text', 'ts', 'tsNum', 'deviceId', 'idempotency_key'];
   const q = sec.buildFirestoreQuery({ updateMask: fields });
