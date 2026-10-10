@@ -2940,18 +2940,19 @@ let pgListenUp = false;
 const siteApi = createSiteApi({
   verifyToken: verifyFirebaseIdToken,
   async readMessages(q) {
-    let messages = (await queryNewest(channelCollection(q.channel), q.limit)).map(fmtMsg);
-    if (q.since_ts !== undefined) messages = messages.filter((m) => (m.ts ?? 0) > q.since_ts!);
+    let messages = (await queryPage(channelCollection(q.channel), "tsNum", q.limit)).map(fmtMsg);
+    if (!messages.length) messages = (await queryPage(channelCollection(q.channel), "ts", q.limit)).map(fmtMsg);
+    if (q.since_ts !== undefined) messages = messages.filter((m: { ts: number | null }) => (m.ts ?? 0) > q.since_ts!);
     if (q.mention) {
       const needle = q.mention.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      messages = messages.filter((m) => new RegExp(`(?:^|[^\\w])@${needle}\\b`, "i").test(m.text));
+      messages = messages.filter((m: { text: string }) => new RegExp(`(?:^|[^\\w])@${needle}\\b`, "i").test(m.text));
     }
     return { count: messages.length, messages, newest_ts: messages[0]?.ts ?? null };
   },
   async readTasks(q) {
-    let tasks = (await queryNewest(TASKS, q.limit)).map(fmtTask);
-    if (!q.include_done) tasks = tasks.filter((t) => !t.done);
-    return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
+    let tasks = (await queryPage(TASKS, "ts", q.limit)).map(fmtTask);
+    if (!q.include_done) tasks = tasks.filter((t: { done: boolean }) => !t.done);
+    return { count: tasks.length, open: tasks.filter((t: { done: boolean }) => !t.done).length, tasks };
   },
   bus: siteBus,
 });
