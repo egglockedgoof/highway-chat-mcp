@@ -28,6 +28,10 @@ import {
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
+import {
+  CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
+} from "./curated-news.js";
+import { rejectCuratedBatch } from "./privacy.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
 import { sessionMarkerId, sessionMarkerText, createOrientCache, runOrient } from "./orient.js";
@@ -1740,13 +1744,47 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
   // ---- News / Team / Stats ----
   tool(server, "get_news",
-    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech). 5-min server cache.",
-      inputSchema: { limit: z.number().int().min(1).max(15).default(10) }, readOnly: true, openWorld: true },
+    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech + crew curated). 5-min server cache.",
+      inputSchema: { limit: z.number().int().min(1).max(24).default(10) }, readOnly: true, openWorld: true },
     async ({ limit }) => {
       const items = (await getNews()).slice(0, limit).map((it) => ({
         title: it.title, url: it.url, source: it.source,
         image: it.image || null, description: it.description || null }));
-      return { ok: true, count: items.length, items };
+      return { ok: true, count: items.length, updated: newsUpdatedIso(), items };
+    });
+
+  const curatedItemSchema = z.object({
+    story_key: z.string().trim().min(1).max(80),
+    lane: z.string().trim().max(40).optional().default(""),
+    title: z.string().trim().min(1).max(240),
+    description: z.string().trim().max(500).optional().default(""),
+    url: z.string().trim().min(1).max(2000),
+    sources: z.array(z.string().trim().min(1).max(80)).max(8).optional().default([]),
+    image: z.string().trim().max(2000).optional().default(""),
+    paper: z.boolean().optional().default(false),
+    published_at: z.string().trim().min(1).max(40),
+    expires_at: z.string().trim().max(40).nullable().optional(),
+  });
+
+  tool(server, "post_curated_batch",
+    { title: "Replace the crew curated news batch",
+      description: "Overheard or last30days only (own bridge token). Replaces /system_config/crew_curated in one write. The next news rebuild pulls it. Does not post a card directly. Refuses private data.",
+      inputSchema: { items: z.array(curatedItemSchema).max(32) } },
+    async ({ items }) => {
+      const by = curatedWriter(reqCtx.getStore());
+      if (!by) throw new UserError("post_curated_batch is limited to Overheard or last30days with their own bridge token");
+      const leaked = rejectCuratedBatch(items);
+      if (leaked) throw new UserError(leaked);
+      const batch = normalizeBatch(items, Date.now());
+      if (items.length && !batch.length) throw new UserError("no valid curated items in batch");
+      await runAsSystem("curatedWrite", () =>
+        firestore(CURATED_DOC, { method: "PATCH", body: { fields: {
+          items: { stringValue: JSON.stringify(batch) },
+          updatedBy: { stringValue: by },
+          tsNum: nowNum(), ts: nowTs(),
+        } } }));
+      newsCache = null;
+      return { ok: true, count: batch.length, by };
     });
 
   tool(server, "get_team",
@@ -2551,16 +2589,32 @@ async function socialNews(): Promise<NewsItem[]> {
   return dedupeItems(ordered); // deterministic: priority order, one pass, no shared mutable state
 }
 
-const NEWS_SECTIONS = ["crypto", "markets", "macro", "social"] as const;
+const NEWS_SECTIONS = ["curated", "crypto", "markets", "macro", "social"] as const;
+const NEWS_FEED_CAP = 24; // 6 curated + 6 macro + 6 social + 3 crypto + 3 markets
+
+// Do not copy apifyState()'s raw firestore GET. That path is a normal read
+// (readBot when /news has no reqCtx) and never hits SYSTEM_ALLOWLIST.
+// curatedRead is the allowlisted system GET of /system_config/crew_curated.
+async function curatedNews(): Promise<NewsItem[]> {
+  try {
+    const doc = await runAsSystem("curatedRead", () =>
+      firestore(CURATED_DOC, { method: "GET" })) as Doc;
+    return itemsFromDocFields(doc?.fields, Date.now());
+  } catch (e) {
+    if (is404(e)) return [];
+    recordFailure("news:curated", e);
+    return [];
+  }
+}
 
 async function buildNews(): Promise<NewsItem[]> {
-  const results = await Promise.allSettled([cryptoNews(), marketsNews(), macroNews(), socialNews()]);
-  const [crypto, markets, macro, social] = results.map((r, i) => {
+  const results = await Promise.allSettled([curatedNews(), cryptoNews(), marketsNews(), macroNews(), socialNews()]);
+  const [curated, crypto, markets, macro, social] = results.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
     recordFailure(`news:${NEWS_SECTIONS[i]}`, r.reason);
     return [] as NewsItem[];
   });
-  return [...macro.slice(0, 6), ...social.slice(0, 6), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, 16);
+  return [...curated.slice(0, 6), ...macro.slice(0, 6), ...social.slice(0, 6), ...crypto.slice(0, 3), ...markets.slice(0, 3)].slice(0, NEWS_FEED_CAP);
 }
 
 // Stale-while-error: an upstream outage serves the last good feed and retries in 30s.
@@ -2568,6 +2622,10 @@ let newsCache: { at: number; items: NewsItem[] } | null = null;
 let newsInflight: Promise<NewsItem[]> | null = null;
 const NEWS_TTL = 5 * 60 * 1000;
 const NEWS_RETRY_MS = 30 * 1000;
+
+function newsUpdatedIso(): string {
+  return newsCache ? new Date(newsCache.at).toISOString() : new Date().toISOString();
+}
 
 async function getNews(): Promise<NewsItem[]> {
   const now = Date.now();
@@ -2848,7 +2906,7 @@ app.post("/metrics/reads", async (req: Request, res: Response) => {
 app.get("/news", async (_req, res) => {
   try {
     const items = await getNews();
-    res.json({ ok: true, count: items.length, items });
+    res.json({ ok: true, count: items.length, updated: newsUpdatedIso(), items });
   } catch (e) {
     res.status(500).json({ ok: false, error: errMsg(e) });
   }

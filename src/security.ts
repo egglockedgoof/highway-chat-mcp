@@ -98,7 +98,8 @@ export function isWriteRequest(method: string, path: string): boolean {
 
 export type SystemOp =
   | 'recordFailure' | 'track_tool_telemetry' | 'apifyWrite'
-  | 'apifyState' | 'flushSecurityTelemetry' | 'readSecurityTelemetry';
+  | 'apifyState' | 'flushSecurityTelemetry' | 'readSecurityTelemetry'
+  | 'curatedRead' | 'curatedWrite';
 export type Precondition = 'none' | 'exists-false' | 'updateTime' | 'either';
 export type PreconditionKind = 'none' | 'exists-false' | 'updateTime' | 'both' | 'invalid';
 
@@ -112,6 +113,10 @@ export const SYSTEM_ALLOWLIST: Record<SystemOp, Array<{ docPath: string; method:
   track_tool_telemetry:   [{ docPath: '/evolution_logs',    method: 'POST',  precondition: 'none' }],
   apifyWrite:             [{ docPath: '/system_config/apify_last_run', method: 'PATCH', precondition: 'either' }],
   apifyState:             [{ docPath: '/system_config/apify_last_run', method: 'GET',   precondition: 'none' }],
+  // Whole-doc replace, one PATCH, no precondition (last batch wins). 'either'
+  // would force a GET for updateTime plus a second write.
+  curatedRead:            [{ docPath: '/system_config/crew_curated', method: 'GET',   precondition: 'none' }],
+  curatedWrite:           [{ docPath: '/system_config/crew_curated', method: 'PATCH', precondition: 'none' }],
   flushSecurityTelemetry: [
     { docPath: '/security_telemetry', method: 'GET',   precondition: 'none' },
     // Creation uses PATCH with exists=false — POST is NOT allowlisted (removed per review).
