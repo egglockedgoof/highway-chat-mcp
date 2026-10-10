@@ -29,6 +29,7 @@ import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createUsageMeter } from "./usage.js";
+import { currentDbHealth, startDbProbe, pgTargets } from "./store/index.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
 } from "./site-api.js";
@@ -3052,6 +3053,7 @@ app.get("/health", (_req, res) => {
   const { day, reads, budget, overBudget, cache } = readCache.snapshot();
   res.json({
     ok: true,
+    db: currentDbHealth(),
     reads: { day, reads, budget, overBudget, cache },
     widget_reads: clientMeter.snapshot(),
     site: { sse: siteBus.size(), sse_max: SITE_SSE_MAX, pg_listen: pgListenUp },
@@ -3137,23 +3139,35 @@ process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); 
 // (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
 // PHASE3_TEST is set so imports don't bind a port or arm timers.
 if (!process.env.PHASE3_TEST) {
-const databaseUrl = process.env.DATABASE_URL?.trim();
-if (databaseUrl) {
+const listenTargets = pgTargets();
+if (listenTargets.length) {
   import("pg").then(async ({ Client }) => {
-    await startPgListen({
-      url: databaseUrl,
-      connect: (url) => new Client({ connectionString: url }),
-      onPayload: (raw) => {
-        const ev = parseNotifyPayload(raw);
-        if (ev) siteBus.publish(ev);
-      },
-      onError: (e) => recordFailure("pg_listen", e),
-    });
-    pgListenUp = true;
+    let last: unknown;
+    for (const t of listenTargets) {
+      try {
+        await startPgListen({
+          url: t.url,
+          connect: (url) => new Client({ connectionString: url, connectionTimeoutMillis: 4000 }),
+          onPayload: (raw) => {
+            const ev = parseNotifyPayload(raw);
+            if (ev) siteBus.publish(ev);
+          },
+          onError: (e) => recordFailure("pg_listen", e),
+        });
+        pgListenUp = true;
+        console.log(`pg_listen: host=${t.host} via=${t.source}`);
+        return;
+      } catch (e) {
+        console.warn(`pg_listen: failed host=${t.host} via=${t.source}`);
+        last = e;
+      }
+    }
+    throw last instanceof Error ? last : new Error("pg_listen failed");
   }).catch((e) => recordFailure("pg_listen_start", e));
 }
 const port = Number(process.env.PORT) || 3000;
 const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
+startDbProbe();
 
 // REV 19: periodic security-telemetry flush (bound write-through buffer → Firestore).
 setInterval(() => sec.telemetry.flush().catch(() => {}), 5 * 60 * 1000);

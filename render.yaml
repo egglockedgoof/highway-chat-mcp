@@ -48,3 +48,14 @@ services:
         sync: false
       - key: CLOUDINARY_API_SECRET
         sync: false
+      # Storage seam (flags stay off; URLs set in the dashboard, never in git)
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_FALLBACK
+        sync: false
+      - key: DB_SCHEMA
+        value: highway
+      - key: STORE_BACKEND
+        value: firestore
+      - key: STORE_DUAL_WRITE
+        value: "0"
