@@ -23,6 +23,10 @@ npm ci
 npm test
 ```
 
+## Storage seam (Supabase move, not live)
+
+`src/store/` is a Firestore + Postgres adapter behind `STORE_BACKEND` (default `firestore`). Live Highway still uses the existing Firestore REST path. Do not set `STORE_BACKEND=postgres` or `STORE_DUAL_WRITE=1` on Render until dual-write is proven for one collection. `DATABASE_URL` is optional; CI runs `migrations/` against a Postgres service container. Nightly `pg_dump` skips until the `DATABASE_URL` GitHub Actions secret is set.
+
 ## Environment variables
 
 Set production values in the Render dashboard (see `render.yaml`). Locally, copy `.env.example` to `.env`. **No real secrets belong in git.**
@@ -49,6 +53,9 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 | `APIFY_API_TOKEN` | no | Paid Apify tools; fail closed if a paid call is attempted without it |
 | `DATABASE_URL` | no | Postgres URL. When set, the bridge opens **one** LISTEN on `highway_events` and fans out via SSE. Unset = in-process fanout only. No Supabase SDK. |
 | `FIRESTORE_BASE` | no | Override Firestore REST base URL |
+| `DATABASE_URL` | no | Postgres URL for the storage seam / migrations. Unset = Firestore only. |
+| `STORE_BACKEND` | no (default `firestore`) | `firestore` (live) or `postgres`. Do not flip on Render yet. |
+| `STORE_DUAL_WRITE` | no (default off) | Set `1` only after dual-write is proven for one collection. |
 | `PORT` | Render sets | Bind address is `$PORT` (Render) or `3000` locally |
 | `PHASE3_TEST` | tests only | Skip listen/timers when importing the module in unit tests. Never set on Render. |
 

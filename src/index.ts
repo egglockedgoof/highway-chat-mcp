@@ -28,6 +28,7 @@ import {
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
+import { createUsageMeter } from "./usage.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
 } from "./site-api.js";
@@ -3006,6 +3007,15 @@ app.use((req, res, next) => {
   next();
 });
 
+const usageMeter = createUsageMeter();
+app.use((_req, res, next) => {
+  res.on("finish", () => {
+    const n = Number(res.getHeader("content-length"));
+    if (Number.isFinite(n) && n > 0) usageMeter.addEgress(n);
+  });
+  next();
+});
+
 // POST /upload — widget file uploads via the bridge (secret stays server-side).
 // Auth: Firebase ID token (the widget is a Firebase-authenticated client).
 // Registered BEFORE the global 2mb JSON parser so uploads get their own limit.
@@ -3045,6 +3055,7 @@ app.get("/health", (_req, res) => {
     reads: { day, reads, budget, overBudget, cache },
     widget_reads: clientMeter.snapshot(),
     site: { sse: siteBus.size(), sse_max: SITE_SSE_MAX, pg_listen: pgListenUp },
+    usage: usageMeter.snapshot(),
   });
 });
 
