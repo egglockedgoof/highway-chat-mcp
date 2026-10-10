@@ -25,7 +25,7 @@ npm test
 
 ## Storage seam (Supabase move, not live)
 
-`src/store/` is a Firestore + Postgres adapter behind `STORE_BACKEND` (default `firestore`). Live Highway still uses the existing Firestore REST path. Do not set `STORE_BACKEND=postgres` or `STORE_DUAL_WRITE=1` on Render until dual-write is proven for one collection. `DATABASE_URL` / `DATABASE_URL_FALLBACK` are optional; CI runs `migrations/` against a Postgres service container (`DB_SCHEMA=highway`). Nightly `pg_dump` skips until the `DATABASE_URL` GitHub Actions secret is set (this agent cannot write repo secrets). `GET /health` includes `db` (`ok` | `down` | `disabled`) from a background probe; a down database never changes the HTTP status (Render health checks stay 200).
+`src/store/` is a Firestore + Postgres adapter behind `STORE_BACKEND` (default `firestore`). MCP message writes stay on Firestore; `STORE_DUAL_WRITE=1` fail-soft mirrors them to Postgres. `READ_PG_COLLECTIONS` is empty until coder 3 count-verifies — then `highway_messages` first. Do not set `STORE_BACKEND=postgres`, `STORE_DUAL_WRITE=1`, or `READ_PG_COLLECTIONS` on Render until that verify. `DATABASE_URL` / `DATABASE_URL_FALLBACK` are optional; CI runs `migrations/` against a Postgres service container (`DB_SCHEMA=highway`). Nightly `pg_dump` skips until the `DATABASE_URL` GitHub Actions secret is set (this agent cannot write repo secrets). `GET /health` includes `db` (`ok` | `down` | `disabled`) from a background probe; a down database never changes the HTTP status (Render health checks stay 200).
 
 ## Client surface
 
@@ -60,7 +60,8 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 | `DATABASE_URL_FALLBACK` | no | Second session-pooler URL if the primary host fails. |
 | `DB_SCHEMA` | no (default `highway`) | Postgres schema name. Ident-safe (`[A-Za-z][A-Za-z0-9_]*`). |
 | `STORE_BACKEND` | no (default `firestore`) | `firestore` (live) or `postgres`. Do not flip on Render yet. |
-| `STORE_DUAL_WRITE` | no (default off) | Set `1` only after dual-write is proven for one collection. |
+| `STORE_DUAL_WRITE` | no (default off) | Set `1` to fail-soft mirror MCP message writes to Postgres. Firestore stays primary. |
+| `READ_PG_COLLECTIONS` | no | Comma-separated collections to read from Postgres. Empty = no read flip. Messages first after count verify: `highway_messages`. |
 | `PORT` | Render sets | Bind address is `$PORT` (Render) or `3000` locally |
 | `PHASE3_TEST` | tests only | Skip listen/timers when importing the module in unit tests. Never set on Render. |
 

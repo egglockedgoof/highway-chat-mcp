@@ -27,6 +27,15 @@ export function dualWriteEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
   return env.STORE_DUAL_WRITE === "1";
 }
 
+/** Comma-separated collections that read from Postgres. Empty = no read flip. */
+export function readPgCollections(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  return new Set((env.READ_PG_COLLECTIONS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+export function readsFromPg(collection: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  return readPgCollections(env).has(collection);
+}
+
 function databaseUrlOf(opts: { databaseUrl?: string }, env: NodeJS.ProcessEnv = process.env): string {
   return (opts.databaseUrl ?? env.DATABASE_URL ?? env.DATABASE_URL_FALLBACK ?? "").trim();
 }
@@ -75,7 +84,7 @@ export function createDualWriteStore(primary: Store, secondary: Store): Store {
 /**
  * Build a store. Live Highway must keep STORE_BACKEND=firestore (or unset)
  * until dual-write is proven. Postgres without DATABASE_URL throws.
- * Dual-write wrap is available here; index.ts tools are not on this path yet.
+ * Dual-write wrap is available here. MCP/site read flip is READ_PG_COLLECTIONS (default empty).
  */
 export function createStore(opts: {
   backend?: StoreBackend;

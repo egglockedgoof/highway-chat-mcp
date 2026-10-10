@@ -31,7 +31,11 @@ import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createUsageMeter } from "./usage.js";
-import { currentDbHealth, startDbProbe, pgTargets } from "./store/index.js";
+import {
+  currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema,
+  dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
+  type Store, type StoreCollection, type StoreDoc,
+} from "./store/index.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
 } from "./site-api.js";
@@ -39,7 +43,7 @@ import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
 } from "./curated-news.js";
 import { rejectCuratedBatch } from "./privacy.js";
-import { createChannelCache, type CachedMessage } from "./channel-cache.js";
+import { createChannelCache, selectMessages, type CachedMessage } from "./channel-cache.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
 import { sessionMarkerId, sessionMarkerText, createOrientCache, runOrient } from "./orient.js";
@@ -1174,6 +1178,37 @@ const channelCache = createChannelCache({
   },
 });
 
+let pgStore: Store | null = null;
+let pgHost: string | null = null;
+
+function storeDocAsDoc(d: StoreDoc): Doc {
+  return { name: `${d.collection}/${d.id}`, fields: d.fields as Fields };
+}
+
+function mirrorToPg(coll: string, id: string, fields: Fields) {
+  if (!dualWriteEnabled() || !pgStore || !id || !isStoreCollection(coll)) return;
+  pgStore.upsert(coll, id, fields).catch((e) => recordFailure(`dual_write:${coll}`, e));
+}
+
+function removeFromPg(coll: string, id: string) {
+  if (!dualWriteEnabled() || !pgStore || !id || !isStoreCollection(coll)) return;
+  pgStore.remove(coll, id).catch((e) => recordFailure(`dual_write_del:${coll}`, e));
+}
+
+async function readChannelMessages(
+  channel: string,
+  q: { limit: number; since_ts?: number; mention?: string },
+): Promise<{ messages: CachedMessage[]; newest_ts: number | null; cached: boolean }> {
+  const coll = channelCollection(channel);
+  if (pgStore && readsFromPg(coll)) {
+    const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100));
+    const all = docs.map((d) => cachedFromDoc(storeDocAsDoc(d)));
+    return { messages: selectMessages(all, q), newest_ts: all[0]?.ts ?? null, cached: false };
+  }
+  const messages = await channelCache.read(channel, q);
+  return { messages, newest_ts: channelCache.peek(channel)[0]?.ts ?? messages[0]?.ts ?? null, cached: true };
+}
+
 // Built PER REQUEST. A shared McpServer rejects every overlapping call with
 // "Already connected to a transport" — the SDK's stateless pattern is one server per request.
 function buildServer(skills: readonly SkillSpec[] = []): McpServer {
@@ -1191,9 +1226,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
           .describe("If set, only messages that @-mention this name."),
       }, readOnly: true },
     async ({ limit, channel, since_ts, mention }) => {
-      const messages = await channelCache.read(channel, { limit, since_ts, mention });
-      const newest_ts = channelCache.peek(channel)[0]?.ts ?? messages[0]?.ts ?? null;
-      return { count: messages.length, messages, newest_ts, cached: true };
+      const { messages, newest_ts, cached } = await readChannelMessages(channel, { limit, since_ts, mention });
+      return { count: messages.length, messages, newest_ts, cached };
     });
 
   const attachmentSchema = z.object({
@@ -1310,6 +1344,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         await claimLock();
         const ts = Date.now();
         channelCache.ingest(channel, { id: res.id, name, text, ts });
+        mirrorToPg(coll, res.id, body.fields);
         return { ok: true, duplicate: res.duplicate, id: res.id, name, ts };
       }
       const posted = await firestore(`/${channelCollection(channel)}`, {
@@ -1322,6 +1357,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       await claimLock();
       const ts = Date.now();
       channelCache.ingest(channel, { id: postedId, name, text, ts });
+      mirrorToPg(channelCollection(channel), postedId, body.fields);
       return { ok: true, name, ts, chars: text.length, id: postedId };
     });
 
@@ -1340,11 +1376,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const written = await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name }) as { name?: string };
       const ts = Date.now();
       const captionText = caption || "🎤 voice message";
+      const voiceId = written?.name ? docIdOf(written.name) : "";
       channelCache.ingest("room", {
-        id: written?.name ? docIdOf(written.name) : "",
+        id: voiceId,
         name, text: captionText, ts, audio, audioType: audioType || "audio/webm",
         audioBytes: Math.floor(audio.length * 3 / 4),
       });
+      mirrorToPg(MESSAGES, voiceId, fields);
       return { ok: true, name, ts };
     });
 
@@ -1373,6 +1411,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       requireAuthor(fields, name, "edit");
       await patchFields(MESSAGES, id, { text: { stringValue: text } }, name);
+      mirrorToPg(MESSAGES, id, { ...fields, text: { stringValue: text } });
       return { ok: true, message_id: id, text };
     });
 
@@ -1383,6 +1422,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       requireAuthor(fields, name, "delete");
       await firestore(`/${MESSAGES}/${encodeURIComponent(id)}`, { method: "DELETE", forName: name });
+      removeFromPg(MESSAGES, id);
       return { ok: true, message_id: id, deleted: true };
     });
 
@@ -1412,9 +1452,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ query, limit }) => {
       const q = query.toLowerCase();
       const warm = channelCache.peek("room");
-      const pool = warm.length
-        ? warm
-        : (await queryPage(MESSAGES, "tsNum", 200, MSG_LEAN)).map(cachedFromDoc);
+      const pool = pgStore && readsFromPg(MESSAGES)
+        ? (await pgStore.listNewest(MESSAGES, 200)).map((d) => cachedFromDoc(storeDocAsDoc(d)))
+        : warm.length
+          ? warm
+          : (await queryPage(MESSAGES, "tsNum", 200, MSG_LEAN)).map(cachedFromDoc);
       const matches = pool
         .filter((m) => m.text.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
         .slice(0, limit);
@@ -2950,9 +2992,7 @@ const siteApi = createSiteApi({
   verifyToken: verifyFirebaseIdToken,
   async readMessages(q) {
     const coll = channelCollection(q.channel);
-    let docs = await queryPage(coll, "tsNum", q.limit);
-    if (!docs.length) docs = await queryPage(coll, "ts", q.limit);
-    let messages = docs.map((d) => {
+    const enrich = (d: Doc) => {
       const m = fmtMsg(d);
       const f = d.fields ?? {};
       const image = str(f.image);
@@ -2963,7 +3003,16 @@ const siteApi = createSiteApi({
         reactions: parseReactions(f.reactions),
         ...(image ? { image } : {}),
       };
-    });
+    };
+    let messages;
+    if (pgStore && readsFromPg(coll)) {
+      const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100));
+      messages = docs.map((d) => enrich(storeDocAsDoc(d)));
+    } else {
+      let docs = await queryPage(coll, "tsNum", q.limit);
+      if (!docs.length) docs = await queryPage(coll, "ts", q.limit);
+      messages = docs.map(enrich);
+    }
     if (q.since_ts !== undefined) messages = messages.filter((m: { ts: number | null }) => (m.ts ?? 0) > q.since_ts!);
     if (q.mention) {
       const needle = q.mention.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -3063,7 +3112,10 @@ app.get("/health", (_req, res) => {
     db: currentDbHealth(),
     reads: { day, reads, budget, overBudget, cache },
     widget_reads: clientMeter.snapshot(),
-    site: { sse: siteBus.size(), sse_max: SITE_SSE_MAX, pg_listen: pgListenUp },
+    site: {
+      sse: siteBus.size(), sse_max: SITE_SSE_MAX, pg_listen: pgListenUp,
+      pg_host: pgHost, dual_write: dualWriteEnabled(), read_pg: [...readPgCollections()],
+    },
     usage: usageMeter.snapshot(),
   });
 });
@@ -3159,6 +3211,12 @@ process.on("uncaughtException", (e) => { recordFailure("uncaughtException", e); 
 // (checkDispatchLock, idemDocId, writeIdempotent). Serving is skipped when
 // PHASE3_TEST is set so imports don't bind a port or arm timers.
 if (!process.env.PHASE3_TEST) {
+if ((dualWriteEnabled() || readPgCollections().size) && pgTargets().length) {
+  connectPostgres().then((conn) => {
+    pgStore = createPostgresStore(conn.pool, dbSchema());
+    pgHost = conn.host;
+  }).catch((e) => recordFailure("pg_store_start", e));
+}
 const listenTargets = pgTargets();
 if (listenTargets.length) {
   import("pg").then(async ({ Client }) => {
