@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+Every agent reads ARCH_BLUEPRINT.md before touching code, follows its standing hand-off rule, flips its item's status when a slice is done, and re-ranks the priority queue.
