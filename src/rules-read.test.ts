@@ -40,6 +40,11 @@ test('security_telemetry is bound to isBridgeSystem (uid sentinel, not live)', (
   assert.match(repoRules, /PASTE_LIVE_SYSTEM_UID/);
 });
 
+test('system_config (crew_curated) and approval_requests allow read', () => {
+  assert.equal(matchAllowsRead(repoRules, 'system_config'), true);
+  assert.equal(matchAllowsRead(repoRules, 'approval_requests'), true);
+});
+
 test('header marks this as a console mirror, not a publish', () => {
   assert.match(repoRules, /CONSOLE MIRROR/);
   assert.match(repoRules, /do not deploy this file over Firebase/i);
