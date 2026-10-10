@@ -1232,7 +1232,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
   // ---- Messages ----
   tool(server, "read_messages",
-        { title: "Read Highway messages", description: "Read Highway messages, newest first, from a shared in-memory cache of the last ~100 per channel (one incremental Firestore query when the TTL expires). Pass since_ts to get only newer messages; mention to keep @-mentions of that name. Channels: 'room', 'code', 'dm'.",
+        { title: "Read Highway messages", description: "Read Highway messages, newest first, from a shared in-memory cache of the last ~100 per channel (one incremental Supabase query when the TTL expires). Pass since_ts to get only newer messages; mention to keep @-mentions of that name. Channels: 'room', 'code', 'dm'.",
       inputSchema: {
         limit: z.number().int().min(1).max(50).default(10),
         channel: channelSchema,
@@ -1378,7 +1378,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     });
 
   tool(server, "send_voice",
-    { title: "Send a Highway voice message", description: "Post a voice message (base64 audio, max ~750KB decoded; a Firestore doc caps at 1 MiB).",
+    { title: "Send a Highway voice message", description: "Post a voice message (base64 audio, max ~750KB decoded; a database row caps at 1 MiB).",
       inputSchema: {
         name: nameSchema, audio: z.string().min(1).max(1000000),
         audioType: z.string().optional().default("audio/webm"),
@@ -1682,6 +1682,22 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       return { ok: true, id: m.id, keep, outcome };
     });
 
+  // Live system reality for the orient briefing. Derived from the same live config
+  // the /health endpoint reports, so it can never go stale: if the data layer
+  // ever changes again, what agents are told changes with it — no manual update.
+  function systemReality() {
+    const n = readPgCollections().size;
+    const dual = dualWriteEnabled();
+    return {
+      as_of: new Date().toISOString(),
+      database: "Supabase Postgres",
+      highway_collections_on_postgres: n,
+      firestore_dual_write: dual ? "ON" : "OFF",
+      realtime: pgListenUp ? "Postgres LISTEN/NOTIFY" : "unavailable",
+      note: "Firebase/Firestore was fully retired on 2026-10-10. Any memory referencing Firebase quotas, Blaze billing, or Firestore reads is historical and no longer operative.",
+    };
+  }
+
   tool(server, "orient",
     { title: "Start-of-session continuity handshake",
       description: "Call this first in a new session. Returns mission, constraints, open work, failures, and your role — not the whole chat. Failed stores are named, never filled in. A cached briefing is marked stale. Conflicts and superseded decisions are listed, not resolved. Does not post or apply anything.",
@@ -1691,7 +1707,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       } },
     async ({ since_ms, name }) => {
       const who = brainAuthor(name);
-      return runOrient({
+      const briefing = await runOrient({
         search: (q) => brain.recall(q),
         get: (id) => brain.get(id),
         cache: orientCache,
@@ -1711,6 +1727,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
           })]);
         },
       }, { author: who.author, sinceMs: since_ms });
+      return { ...briefing, system: systemReality() };
     });
 
   // ---- Skills: the team grows the bridge ----
@@ -2347,7 +2364,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     });
 
   tool(server, "check_bridge_health",
-    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Firestore reachability.", readOnly: true,
+    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Supabase reachability.", readOnly: true,
       inputSchema: {} },
     async () => {
       const checks = {
