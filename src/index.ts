@@ -28,6 +28,7 @@ import {
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
+import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 // ============ FAIL-CLOSED ENV ============
 const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
@@ -1192,6 +1193,7 @@ function buildServer(): McpServer {
       inputSchema: { text: z.string().trim().min(1).max(2000), type: z.string().optional().default("milestone") } },
     async ({ text, type }) => {
       await firestore(`/${EVO_LOGS}`, { method: "POST", body: evoDoc(type || "milestone", text) });
+      rememberQuietly(text, "milestone", "save_milestone");
       return { ok: true };
     });
 
@@ -1222,6 +1224,7 @@ function buildServer(): McpServer {
     async ({ key, value }) => {
       await firestore(`/${JARVIS_MEM}`, { method: "POST",
         body: { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } } });
+      rememberQuietly(`${key}: ${value}`, "preference", "store_preference");
       return { ok: true, key };
     });
 
@@ -1231,7 +1234,57 @@ function buildServer(): McpServer {
     async ({ correction, context }) => {
       await firestore(`/${EVO_LOGS}`, { method: "POST",
         body: evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`) });
+      rememberQuietly(context ? `${correction} (context: ${context})` : correction, "correction", "log_correction");
       return { ok: true };
+    });
+
+  // ---- Shared brain ----
+  tool(server, "remember",
+    { title: "Remember in the shared brain",
+      description: "Store something every agent should be able to recall by meaning: a fact, decision, lesson, preference, correction, or idea. Identical memories from the same author are stored once.",
+      inputSchema: {
+        text: z.string().trim().min(1).max(2000),
+        kind: z.enum(MEMORY_KINDS).default("fact"),
+        tags: z.array(z.string().max(40)).max(8).optional(),
+        name: nameSchema.optional().describe("Your name. Ignored when you connect with your own bridge token."),
+      } },
+    async ({ text, kind, tags, name }) => {
+      const m = await remember(text, kind, "remember", { name, tags }).catch(brainErr);
+      return { ok: true, id: m.id, author: m.author, verified: m.verified };
+    });
+
+  tool(server, "recall",
+    { title: "Recall from the shared brain",
+      description: "Semantic search across everything the team has remembered, plus dreamed room history. Ask in plain language.",
+      inputSchema: {
+        query: z.string().trim().min(1).max(1000),
+        top_k: z.number().int().min(1).max(20).optional().default(8),
+        kind: z.enum(MEMORY_KINDS).optional(),
+        author: nameSchema.optional(),
+        verified_only: z.boolean().optional().default(false),
+      }, readOnly: true },
+    async ({ query, top_k, kind, author, verified_only }) => {
+      const hits = await brain.recall({ query, topK: top_k || 8, kind, author, verifiedOnly: verified_only }).catch(brainErr);
+      return { query, hits };
+    });
+
+  tool(server, "dream",
+    { title: "Dream: consolidate recent chat into the shared brain",
+      description: "Index the last N hours of room and code-channel messages as episode memories so they can be recalled by meaning. Safe to re-run; the same message is stored once.",
+      inputSchema: { hours: z.number().int().min(1).max(48).optional().default(24) } },
+    async ({ hours }) => {
+      const since = Date.now() - (hours || 24) * 3600000;
+      const sinceValue = { integerValue: String(since) };
+      const indexed: Record<string, number> = {};
+      const degraded: string[] = [];
+      for (const [channel, coll] of [["room", MESSAGES], ["code", CODE]] as const) {
+        const page = await settle(`dream:${channel}`, queryDocs(coll, { orderField: "tsNum", limit: 100, where: {
+          field: "tsNum", op: "GREATER_THAN_OR_EQUAL", value: sinceValue,
+          match: (d) => bestTs(d) >= since } }), { docs: [] as Doc[], degraded: false }, degraded);
+        const episodes = episodesFrom(page.docs.map(fmtMsg), channel, since).map((e) => brain.memory(e));
+        indexed[channel] = await brain.upsert(episodes).catch(brainErr);
+      }
+      return { ok: true, hours: hours || 24, indexed, ...(degraded.length ? { degraded } : {}) };
     });
 
   // ---- Activity ----
@@ -1500,31 +1553,18 @@ function buildServer(): McpServer {
       inputSchema: { query: z.string().min(1).max(500), topK: z.number().int().min(1).max(10).optional() },
       readOnly: true },
     async ({ query, topK }) => {
-      const { host, dimension } = await pineconeIndex();
-      const r = await http(`https://${host}/query`, {
-        method: "POST", headers: pineconeHeaders(),
-        body: JSON.stringify({ vector: new Array(dimension).fill(0), topK: topK || 5, includeMetadata: true }),
-      }, EXT_TIMEOUT);
-      const data = parseJson(r.body);
-      if (!r.ok) throw new Error(`Pinecone query ${r.status}: ${data?.message ?? r.statusText}`);
+      const hits = await brain.recall({ query, topK: topK || 5, kind: "pattern" }).catch(brainErr);
       return { query,
-        matches: (data.matches ?? []).map((m: any) => ({ id: m.id, score: m.score, metadata: m.metadata ?? {} })) };
+        matches: hits.map((h) => ({ id: h.id, score: h.score, metadata: { text: h.text, author: h.author, tags: h.tags.join(",") } })) };
     });
 
   tool(server, "store_pattern_win",
     { title: "Store pattern win", description: "Store a winning pattern fingerprint to the Pinecone refinery.",
       inputSchema: { pattern_id: z.string().min(1).max(100), metadata: z.record(z.string(), z.string()).optional() } },
     async ({ pattern_id, metadata }) => {
-      const { host, dimension } = await pineconeIndex();
-      const r = await http(`https://${host}/vectors/upsert`, {
-        method: "POST", headers: pineconeHeaders(),
-        body: JSON.stringify({ vectors: [{
-          id: pattern_id,
-          values: new Array(dimension).fill(0.01),
-          metadata: { ...(metadata || {}), stored_at: new Date().toISOString(), source: "static-refinery" },
-        }] }),
-      }, EXT_TIMEOUT);
-      if (!r.ok) throw new Error(`Pinecone upsert ${r.status}: ${parseJson(r.body)?.message ?? r.statusText}`);
+      const detail = Object.entries(metadata || {}).map(([k, v]) => `${k}: ${v}`).join("; ");
+      await remember(detail ? `${pattern_id} — ${detail}` : pattern_id, "pattern", "store_pattern_win",
+        { id: `pattern:${pattern_id}` }).catch(brainErr);
       return { stored: true, pattern_id };
     });
 
@@ -2226,25 +2266,39 @@ async function getNews(): Promise<NewsItem[]> {
   return newsInflight;
 }
 
-// ============ PINECONE (control-plane host resolution, dimension-safe) ============
-const PINECONE_INDEX = "static-pattern-refinery";
-let _pcHost: { host: string; dimension: number } | null = null;
+// ============ SHARED BRAIN (Pinecone, integrated embedding) ============
+const brain = createBrain({
+  apiKey: () => process.env.PINECONE_API_KEY,
+  indexName: process.env.BRAIN_INDEX || "marrow-brain",
+  namespace: process.env.BRAIN_NAMESPACE || "shared",
+  request: async (url, init) => {
+    const r = await http(url, init, EXT_TIMEOUT);
+    return { status: r.status, body: r.body };
+  },
+});
 
-function pineconeHeaders(): Record<string, string> {
-  const k = process.env.PINECONE_API_KEY;
-  if (!k) throw new UserError("PINECONE_API_KEY not configured");
-  return { "Api-Key": k, "Content-Type": "application/json" };
+// Bound-token callers are recorded as themselves; legacy callers name themselves (unverified).
+function brainAuthor(claimed?: string): { author: string; verified: boolean } {
+  const ctx = reqCtx.getStore();
+  if (ctx?.method === "header_bound" && ctx.bot) return { author: ctx.bot, verified: true };
+  return { author: claimed?.trim() || "unknown", verified: false };
 }
-async function pineconeIndex(): Promise<{ host: string; dimension: number }> {
-  if (_pcHost) return _pcHost;
-  const r = await http(`https://api.pinecone.io/indexes/${PINECONE_INDEX}`,
-    { headers: pineconeHeaders() }, EXT_TIMEOUT);
-  if (!r.ok) throw new Error(`Pinecone describe ${r.status}`);
-  const d = parseJson(r.body);
-  if (!d.host || !d.dimension) throw new Error("Pinecone index describe returned no host/dimension");
-  _pcHost = { host: d.host, dimension: Number(d.dimension) };
-  return _pcHost;
+
+async function remember(text: string, kind: MemoryKind, source: string, o: { name?: string; tags?: string[]; id?: string } = {}) {
+  const m = brain.memory({ ...brainAuthor(o.name), text, kind, source, tags: o.tags, id: o.id });
+  await brain.upsert([m]);
+  return m;
 }
+
+// Mirrors writes from the older memory tools into the brain without making them depend on Pinecone.
+function rememberQuietly(text: string, kind: MemoryKind, source: string, name?: string): void {
+  remember(text, kind, source, { name }).catch((e) => recordFailure(`brain:${source}`, e));
+}
+
+const brainErr = (e: unknown): never => {
+  if (e instanceof BrainError) throw new UserError(`brain unavailable: ${e.message}`);
+  throw e;
+};
 
 // Phase 3 Section B: Attachment metadata validation
 // Binary uploads go to Cloudinary via uploadAttachmentData (used by
