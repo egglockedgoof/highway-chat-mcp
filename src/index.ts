@@ -27,6 +27,7 @@ import {
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
+import { createClientMeter, parseReport } from "./client-metrics.js";
 // ============ FAIL-CLOSED ENV ============
 const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
@@ -2388,9 +2389,24 @@ app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: R
 
 app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
 
+// Widget tabs report their own Firestore read counts (see client-metrics.ts).
+const clientMeter = createClientMeter();
+
 app.get("/health", (_req, res) => {
   const { day, reads, budget, overBudget, cache } = readCache.snapshot();
-  res.json({ ok: true, reads: { day, reads, budget, overBudget, cache } });
+  res.json({ ok: true, reads: { day, reads, budget, overBudget, cache }, widget_reads: clientMeter.snapshot() });
+});
+
+app.post("/metrics/reads", async (req: Request, res: Response) => {
+  const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
+  if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
+  const tab = typeof req.body?.tab === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(req.body.tab) ? req.body.tab : null;
+  const counts = parseReport(req.body);
+  if (!tab || !counts) { res.status(400).json({ ok: false, error: "expected { tab, counts: { source: integer } }" }); return; }
+  const who = await verifyFirebaseIdToken(m[1]);
+  if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
+  if (!clientMeter.record(`${who.localId}:${tab}`, counts)) { res.status(429).json({ ok: false, error: "report at most once a minute" }); return; }
+  res.json({ ok: true });
 });
 
 app.get("/news", async (_req, res) => {
