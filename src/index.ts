@@ -32,6 +32,8 @@ import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
 } from "./curated-news.js";
 import { rejectCuratedBatch } from "./privacy.js";
+import { createEditorialNotes } from "./money-notes.js";
+import { createCardBook, presentItem, publicCard } from "./news-cards.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
 import { sessionMarkerId, sessionMarkerText, createOrientCache, runOrient } from "./orient.js";
@@ -1032,38 +1034,18 @@ const fmtUsd = (n: number): string =>
   : n >= 1 ? "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 })
   : "$" + n.toPrecision(3);
 const fmtPct = (n: number): string => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
-function impactLine(pct: number, holder: string): string {
-  if (pct >= 5) return "Ripping — big green day. " + holder + " are up.";
-  if (pct >= 1.5) return "Green — momentum building for " + holder + ".";
-  if (pct <= -5) return "Dumping — don't panic-sell, " + holder + ".";
-  if (pct <= -1.5) return "Dipping — cheaper if you were buying, " + holder + ".";
-  return "Flat — nothing to act on today.";
-}
-// Timeless macro framing — NO hardcoded figures (standing mandate)
-function macroImpact(title: string): string {
-  const t = title.toLowerCase();
-  if (/rate|fed|interest|treasury|yield/.test(t)) return "Rates move → every loan, card, and mortgage reprices. Watch the Fed.";
-  if (t.includes("inflation") || t.includes("cpi")) return "Inflation above target → the Fed can't cut. Your dollar buys less.";
-  if (/jobs|unemployment|wage|hiring/.test(t)) return "Jobs data → hiring freeze or boom. Watch revisions, not headlines.";
-  if (t.includes("tariff")) return "Tariffs → import prices climb. Supply chains reroute.";
-  if (/housing|mortgage|rent/.test(t)) return "Housing costs → the biggest line in most budgets. Rates decide everything.";
-  if (/oil|gas|energy|opec|brent/.test(t)) return "Energy prices → gas, diesel, and shipping costs move together.";
-  if (/\btax(es)?\b/.test(t)) return "Tax policy → what you keep changes. Watch what actually passes.";
-  if (/trump|white house|congress|election|midterm/.test(t)) return "Power shifts → markets reprice. Policy follows the winners.";
-  if (/ukraine|russia|iran|israel|gaza|taiwan|war|hormuz/.test(t)) return "Conflict → oil spikes, markets shake. Watch escalation, not noise.";
-  if (/\bai\b|openai|anthropic|nvidia|chip|robot/.test(t)) return "AI buildout → who funds it and at what rates decides the winners.";
-  if (/spacex|nasa|moon|mars|artemis|starship/.test(t)) return "Space milestones → long-horizon bets. Track launches, not promises.";
-  if (/food|wheat|corn|crop|drought|famine|ebt|snap|beef/.test(t)) return "Food prices → weather and policy. Staples first, speculation never.";
-  if (/hurricane|storm|flood|earthquake|wildfire|tornado/.test(t)) return "Disaster → supply chains break, insurance spikes.";
-  if (/bitcoin|btc|crypto|ethereum/.test(t)) return "Crypto moves with liquidity. Watch the dollar and rates, not the hype.";
-  return "Major shift → watch your wallet, not the headlines.";
-}
-
 // ============ FEEDS (RSS item + Atom entry, one parser) ============
 // Block-scoped (a missing <link> can no longer bleed into the next item), RDF-tolerant
 // (<item rdf:about=…>), entity-decoded (&amp; in titles and URLs), CDATA-safe.
-type FeedItem = { title: string; link: string };
+type FeedItem = { title: string; link: string; publishedAt: string | null };
 const clean = (s: string): string => decodeEntities(s.replace(/<!\[CDATA\[|\]\]>/g, "")).trim();
+
+function parsePublished(block: string): string | null {
+  const raw = clean(block.match(/<(?:pubDate|updated|published|dc:date)[^>]*>([\s\S]*?)<\//)?.[1] ?? "");
+  if (!raw) return null;
+  const t = Date.parse(raw);
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
 
 function parseFeed(xml: string, limit: number): FeedItem[] {
   const items: FeedItem[] = [];
@@ -1073,7 +1055,7 @@ function parseFeed(xml: string, limit: number): FeedItem[] {
     const title = clean(block.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1] ?? "");
     const link = clean(block.match(/<link>([\s\S]*?)<\/link>/)?.[1] ?? "")
       || clean(block.match(/<link\b[^>]*?href="([^"]+)"/)?.[1] ?? "");
-    if (title && link) items.push({ title, link });
+    if (title && link) items.push({ title, link, publishedAt: parsePublished(block) });
   }
   return items;
 }
@@ -1744,12 +1726,10 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
   // ---- News / Team / Stats ----
   tool(server, "get_news",
-    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech + crew curated). 5-min server cache.",
+    { title: "Get Highway money news", description: "Money, tech & social news feed (crypto + markets + macro + social/tech + crew curated). 5-min server cache. Notes bind by story id.",
       inputSchema: { limit: z.number().int().min(1).max(24).default(10) }, readOnly: true, openWorld: true },
     async ({ limit }) => {
-      const items = (await getNews()).slice(0, limit).map((it) => ({
-        title: it.title, url: it.url, source: it.source,
-        image: it.image || null, description: it.description || null }));
+      const items = (await getNews()).slice(0, limit);
       return { ok: true, count: items.length, updated: newsUpdatedIso(), items };
     });
 
@@ -1785,6 +1765,27 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         } } }));
       newsCache = null;
       return { ok: true, count: batch.length, by };
+    });
+
+  tool(server, "set_money_note",
+    { title: "Replace the money note on an existing news story",
+      description: "Overheard or last30days only, own bridge token. Binds by story id. Does not add a news card.",
+      inputSchema: {
+        story_id: z.string().trim().min(1).max(80),
+        body: z.string().trim().min(1).max(280),
+        source: z.string().trim().min(1).max(80),
+        wallet: z.string().trim().min(1).max(80),
+        action: z.string().trim().min(1).max(160),
+      } },
+    async ({ story_id, body, source, wallet, action }) => {
+      const ctx = reqCtx.getStore();
+      const by = ctx?.method === "header_bound" ? ctx.bot ?? "" : "";
+      const err = newsEditorial.set({
+        storyId: story_id, body, source, wallet, action,
+        publishedAt: new Date().toISOString(), unconfirmed: false,
+      }, by);
+      if (err) throw new UserError(err);
+      return { ok: true, storyId: story_id, by };
     });
 
   tool(server, "get_team",
@@ -2201,7 +2202,10 @@ function normalizeUrl(raw: string): string {
 }
 
 // ============ NEWS ENGINE (parallel fetch, ordered processing, per-section isolation) ============
-type NewsItem = { title: string; url: string; source: string; image: string; description: string };
+type NewsItem = {
+  title: string; url: string; source: string; image: string; description?: string;
+  publishedAt?: string | null; facts?: { price?: number; pct?: number };
+};
 type Coin = { sym: string; name: string; id: string; price: number; pct: number; image: string };
 
 const titleKey = (title: string): string => title.toLowerCase().slice(0, 48);
@@ -2213,7 +2217,7 @@ function dedupeItems(items: NewsItem[]): NewsItem[] {
 function coinItem(c: Coin): NewsItem {
   return { title: `${c.sym.toUpperCase()} ${fmtUsd(c.price)} ${fmtPct(c.pct)}`,
     url: `https://www.coingecko.com/en/coins/${c.id}`, source: "CRYPTO", image: c.image,
-    description: impactLine(c.pct, `${c.name} holders`) };
+    facts: { price: c.price, pct: c.pct }, publishedAt: new Date().toISOString() };
 }
 
 // Kraken pair keys are legacy-prefixed: XXBTZUSD, XETHZUSD, XXRPZUSD, XDGUSD, SOLUSD…
@@ -2303,11 +2307,11 @@ async function marketsNews(): Promise<NewsItem[]> {
   for (const q of quotes.filter((q) => q.idx))
     items.push({ title: `${q.name} ${q.price.toLocaleString("en-US", { maximumFractionDigits: 0 })} ${fmtPct(q.pct)}`,
       url: link(q.sym), source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
-      description: q.pct >= 0 ? "Green day — stocks and retirement accounts up." : "Red day — stocks cheaper; don't panic-sell." });
+      facts: { price: q.price, pct: q.pct }, publishedAt: new Date().toISOString() });
   for (const q of quotes.filter((q) => !q.idx).sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct)).slice(0, 2))
     items.push({ title: `${q.name} ${fmtUsd(q.price)} ${fmtPct(q.pct)} — top mover`,
       url: link(q.sym), source: "MARKETS", image: faviconFor("https://finance.yahoo.com"),
-      description: impactLine(q.pct, `${q.name} holders`) });
+      facts: { price: q.price, pct: q.pct }, publishedAt: new Date().toISOString() });
   return items.slice(0, 5);
 }
 
@@ -2337,13 +2341,13 @@ async function macroNews(): Promise<NewsItem[]> {
   feeds.forEach((f, i) => {
     if (f.status === "rejected") { console.warn("macro feed failed:", MACRO_FEEDS[i], errMsg(f.reason)); return; }
     let n = 0;
-    for (const { title, link } of parseFeed(f.value, 12)) {
+    for (const { title, link, publishedAt } of parseFeed(f.value, 12)) {
       if (n >= 4) break;
       const tl = title.toLowerCase(), key = tl.slice(0, 48);
       if (seen.has(key) || SOFT_RE.test(tl)) continue;
       if (!MAJOR_RE.test(tl) && !MONEY_RE.test(tl)) continue;
       seen.add(key);
-      items.push({ title, url: link, source: "WORLD", image: faviconFor(link), description: macroImpact(title) });
+      items.push({ title, url: link, source: "WORLD", image: faviconFor(link), publishedAt });
       n++;
     }
   });
@@ -2357,19 +2361,6 @@ const TECH_RE = new RegExp("\\b(" + ["\\bai\\b", "rag", "agent", "llm", "gpt", "
   "software", "coding", "developer", "github", "startup", "model", "neural",
   "computer vision", "machine learning", "automation", "data center", "quantum",
   "cybersecurity", "breach", "hack"].join("|") + ")s?\\b");
-
-function techImpact(title: string): string {
-  const t = title.toLowerCase();
-  if (/rag|retrieval/.test(t)) return "RAG in production → the practical AI pattern. Watch who's shipping it.";
-  if (/agent/.test(t)) return "Agentic AI → systems that act, not just chat. Track real deployments.";
-  if (/llm|gpt|claude|gemini|deepseek|model/.test(t)) return "Model moves → capability jumps. Watch benchmarks and cost.";
-  if (/openai|anthropic/.test(t)) return "Lab power plays → pricing and access shift. Builders feel it first.";
-  if (/nvidia|gpu|chip/.test(t)) return "Chip supply → who can afford to train. Scarcity decides winners.";
-  if (/robot/.test(t)) return "Robotics → labor costs move. Watch warehouses and factories first.";
-  if (/layoff|hiring|job/.test(t)) return "Jobs signal → where the money's going. Skills follow demand.";
-  if (/cybersecurity|breach|hack/.test(t)) return "Security → every breach reprices trust. Patch fast.";
-  return "Tech shift → builders move first. Watch who's shipping.";
-}
 
 // Google News RSS titles arrive as "Headline - Publisher"
 function stripPublisher(title: string): string {
@@ -2396,23 +2387,26 @@ async function googleNewsSocial(): Promise<NewsItem[]> {
   feeds.forEach((f, i) => {
     if (f.status === "rejected") { console.warn("google news failed:", SOCIAL_QUERIES[i].slice(0, 40), errMsg(f.reason)); return; }
     let n = 0;
-    for (const { title, link } of parseFeed(f.value, 15)) {
+    for (const { title, link, publishedAt } of parseFeed(f.value, 15)) {
       if (n >= 4) break;
       const headline = stripPublisher(title);
       if (!socialGate(headline.toLowerCase())) continue;
-      items.push({ title: headline, url: link, source: "SOCIAL", image: faviconFor(link), description: techImpact(headline) });
+      items.push({ title: headline, url: link, source: "SOCIAL", image: faviconFor(link), publishedAt });
       n++;
     }
   });
   return items;
 }
 
+function isoFromUnix(sec: unknown): string | null {
+  return typeof sec === "number" && sec > 0 ? new Date(sec * 1000).toISOString() : null;
+}
+
 async function hackerNews(): Promise<NewsItem[]> {
   const items: NewsItem[] = [];
-  const push = (title: string, url: string, score: number, comments: number) => {
+  const push = (title: string, url: string, publishedAt: string | null) => {
     if (!title || !socialGate(title.toLowerCase())) return;
-    items.push({ title, url, source: "HACKER NEWS", image: faviconFor("https://news.ycombinator.com"),
-      description: `${score} pts · ${comments} comments — the builders are talking.` });
+    items.push({ title, url, source: "HACKER NEWS", image: faviconFor("https://news.ycombinator.com"), publishedAt });
   };
   const [top, algolia] = await Promise.allSettled([
     (async () => {
@@ -2426,12 +2420,13 @@ async function hackerNews(): Promise<NewsItem[]> {
   if (top.status === "fulfilled") {
     for (const s of top.value) {
       if (!s || s.type !== "story" || !s.title) continue;
-      push(s.title, s.url || `https://news.ycombinator.com/item?id=${s.id}`, s.score || 0, s.descendants || 0);
+      push(s.title, s.url || `https://news.ycombinator.com/item?id=${s.id}`, isoFromUnix(s.time));
     }
   } else console.warn("hacker news failed:", errMsg(top.reason));
   if (algolia.status === "fulfilled") {
     for (const h of (algolia.value?.hits ?? []).slice(0, 6))
-      push(h.title || "", h.url || `https://news.ycombinator.com/item?id=${h.objectID}`, h.points || 0, h.num_comments || 0);
+      push(h.title || "", h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+        isoFromUnix(h.created_at_i) ?? (typeof h.created_at === "string" && Number.isFinite(Date.parse(h.created_at)) ? new Date(h.created_at).toISOString() : null));
   } else console.warn("hn algolia failed:", errMsg(algolia.reason));
   return items;
 }
@@ -2443,8 +2438,9 @@ async function lobstersNews(): Promise<NewsItem[]> {
   for (const p of posts.slice(0, 12)) {
     const title = p.title || "", url = p.url || `https://lobste.rs/s/${p.short_id}`;
     if (!title || !socialGate(title.toLowerCase())) continue;
-    items.push({ title, url, source: "LOBSTERS", image: faviconFor("https://lobste.rs"),
-      description: `${p.score || 0} score · ${p.comment_count ?? 0} comments — curated tech signal.` });
+    const created = typeof p.created_at === "string" && Number.isFinite(Date.parse(p.created_at))
+      ? new Date(p.created_at).toISOString() : null;
+    items.push({ title, url, source: "LOBSTERS", image: faviconFor("https://lobste.rs"), publishedAt: created });
   }
   return items;
 }
@@ -2462,11 +2458,11 @@ async function youtubeNews(): Promise<NewsItem[]> {
   feeds.forEach((f, i) => {
     if (f.status === "rejected") { console.warn("youtube failed:", YT_CHANNELS[i].name, errMsg(f.reason)); return; }
     let n = 0;
-    for (const { title, link } of parseFeed(f.value, 8)) {
+    for (const { title, link, publishedAt } of parseFeed(f.value, 8)) {
       if (n >= 2) break;
       if (!socialGate(title.toLowerCase())) continue;
       items.push({ title: `${title} [${YT_CHANNELS[i].name}]`, url: link, source: "YOUTUBE",
-        image: faviconFor("https://www.youtube.com"), description: techImpact(title) });
+        image: faviconFor("https://www.youtube.com"), publishedAt });
       n++;
     }
   });
@@ -2531,8 +2527,7 @@ async function apifyTikTok(token: string): Promise<NewsItem[]> {
     const text = String(v.text || "").trim(), url = v.webVideoUrl || "";
     if (!text || !url || !socialGate(text.toLowerCase())) continue;
     const author = v.authorMeta?.name || v.authorMeta?.nickName || "tiktok";
-    items.push({ title: text.slice(0, 140), url, source: "TIKTOK", image: faviconFor("https://www.tiktok.com"),
-      description: `@${author} · ${Number(v.diggCount ?? 0).toLocaleString("en-US")} likes — trending on TikTok.` });
+    items.push({ title: text.slice(0, 140), url, source: "TIKTOK", image: faviconFor("https://www.tiktok.com") });
   }
   return items;
 }
@@ -2545,8 +2540,7 @@ async function apifyX(token: string): Promise<NewsItem[]> {
     const text = String(t.text || "").trim(), url = t.url || "";
     if (!text || !url || !socialGate(text.toLowerCase())) continue;
     const author = t.author?.userName || "x";
-    items.push({ title: text.slice(0, 140), url, source: "X", image: faviconFor("https://x.com"),
-      description: `@${author} · ${Number(t.likeCount ?? 0).toLocaleString("en-US")} likes — trending on X.` });
+    items.push({ title: text.slice(0, 140), url, source: "X", image: faviconFor("https://x.com") });
   }
   return items;
 }
@@ -2622,12 +2616,14 @@ let newsCache: { at: number; items: NewsItem[] } | null = null;
 let newsInflight: Promise<NewsItem[]> | null = null;
 const NEWS_TTL = 5 * 60 * 1000;
 const NEWS_RETRY_MS = 30 * 1000;
+const newsEditorial = createEditorialNotes();
+const newsBook = createCardBook();
 
 function newsUpdatedIso(): string {
   return newsCache ? new Date(newsCache.at).toISOString() : new Date().toISOString();
 }
 
-async function getNews(): Promise<NewsItem[]> {
+async function getNewsRaw(): Promise<NewsItem[]> {
   const now = Date.now();
   if (newsCache && now - newsCache.at < NEWS_TTL) return newsCache.items;
   newsInflight ??= buildNews()
@@ -2643,6 +2639,12 @@ async function getNews(): Promise<NewsItem[]> {
     })
     .finally(() => { newsInflight = null; });
   return newsInflight;
+}
+
+async function getNews() {
+  const raw = await getNewsRaw();
+  const now = Date.now();
+  return newsBook.ingest(raw.map((it) => presentItem(it, newsEditorial, now))).map(publicCard);
 }
 
 // ============ SHARED BRAIN (Pinecone, integrated embedding) ============
