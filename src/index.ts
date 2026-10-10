@@ -70,6 +70,7 @@ const BASE =
 
 const MESSAGES = "highway_messages";
 const DMS = "highway_dm";
+const CODE = "highway_code";
 
 
 const PRESENCE = "highway_presence";
@@ -908,8 +909,11 @@ const ROUTES: Array<{ type: string; bot: string; reason: string; re: RegExp }> =
 ];
 
 const nameSchema = z.string().trim().min(1).max(40);
-const channelSchema = z.enum(["room", "dm"]).default("room");
-const channelCollection = (channel: string): string => (channel === "dm" ? DMS : MESSAGES);
+const CHANNEL_COLLECTIONS = { room: MESSAGES, code: CODE, dm: DMS } as const;
+const channelSchema = z.enum(["room", "code", "dm"]).default("room")
+  .describe("room: status updates and decisions. code: PRs, diffs, reviews, test output, debugging. dm: private Nexus DM.");
+export const channelCollection = (channel: string): string =>
+  CHANNEL_COLLECTIONS[channel as keyof typeof CHANNEL_COLLECTIONS] ?? MESSAGES;
 
 // Built PER REQUEST. A shared McpServer rejects every overlapping call with
 // "Already connected to a transport" — the SDK's stateless pattern is one server per request.
@@ -918,7 +922,7 @@ function buildServer(): McpServer {
 
   // ---- Messages ----
   tool(server, "read_messages",
-        { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first. Use channel 'dm' for the private Nexus DM channel.",
+        { title: "Read Highway messages", description: "Read the newest messages from Highway Chat, newest first. Channels: 'room' (status + decisions), 'code' (code talk), 'dm' (private Nexus DM).",
       inputSchema: { limit: z.number().int().min(1).max(50).default(10), channel: channelSchema }, readOnly: true },
     async ({ limit, channel }) => {
       const messages = (await queryNewest(channelCollection(channel), limit)).map(fmtMsg);
@@ -945,7 +949,7 @@ function buildServer(): McpServer {
   });
 
   tool(server, "send_message",
-    { title: "Send a Highway message", description: "Post a message to Highway Chat, or to the private Nexus DM channel.",
+    { title: "Send a Highway message", description: "Post a message to Highway Chat. Use channel 'code' for PRs, diffs, reviews, test output and debugging so the main room stays readable; 'dm' is the private Nexus DM channel.",
       inputSchema: {
         name: nameSchema,
         text: messageTextSchema().describe(`Message text, posted in full (up to ${MESSAGE_MAX_CHARS.toLocaleString("en-US")} chars; long messages display collapsed with tap-to-expand).`),
