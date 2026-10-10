@@ -460,9 +460,8 @@ export async function checkDispatchLock(
   let lock: Doc | null;
   try {
     lock = await getLock("dispatch_locks", replyToId);
-  } catch {
-    // Fail closed: an unreadable lock is a locked lock. Surface `retryable` and let
-    // the sender retry; never degrade to unlocked.
+  } catch (e) {
+    recordFailure(`dispatch_lock:read:${replyToId}`, e);
     return {
       allowed: false,
       reason: "dispatch lock unreadable — failing closed, retry shortly",
@@ -653,34 +652,35 @@ export async function setDispatchLock(
   dispatcher: string,
   opts?: { io?: LockSetIo; now?: Date; ttlMs?: number },
 ): Promise<SetLockResult> {
+  const id = messageId.trim();
   const target = routedTo.trim();
-  if (!messageId.trim() || !target) {
-    return { ok: false, acquired: false, reason: "message_id and routed_to are required" };
-  }
+  const who = dispatcher.trim();
+  if (!id || !target) return { ok: false, acquired: false, reason: "message_id and routed_to are required" };
+  if (!who) return { ok: false, acquired: false, reason: "dispatcher is required" };
   const io = opts?.io ?? lockSetIo;
   const now = opts?.now ?? new Date();
   const ttlMs = opts?.ttlMs ?? DISPATCH_LOCK_TTL_MS;
+  if (!Number.isFinite(ttlMs) || ttlMs < 1) return { ok: false, acquired: false, reason: "ttlMs must be positive" };
   const expiresAt = new Date(now.getTime() + ttlMs);
-  const fields = dispatchLockFields(target, dispatcher, expiresAt);
+  const fields = dispatchLockFields(target, who, expiresAt);
   const acquired: SetLockResult = {
     ok: true, acquired: true, routedTo: target.toLowerCase(), expiresAt: expiresAt.toISOString(),
   };
   try {
-    await io.create("dispatch_locks", messageId, fields, dispatcher);
+    await io.create("dispatch_locks", id, fields, who);
     return acquired;
   } catch (e) {
     if (!isWriteContention(e)) {
+      recordFailure(`dispatch_lock:create:${id}`, e);
       return { ok: false, acquired: false, reason: `dispatch lock write failed: ${errMsg(e)}` };
     }
   }
   let existing: Doc | null;
   try {
-    existing = await io.get("dispatch_locks", messageId, dispatcher);
-  } catch {
-    return {
-      ok: false, acquired: false,
-      reason: "dispatch lock unreadable — failing closed, retry shortly",
-    };
+    existing = await io.get("dispatch_locks", id, who);
+  } catch (e) {
+    recordFailure(`dispatch_lock:read:${id}`, e);
+    return { ok: false, acquired: false, reason: "dispatch lock unreadable — failing closed, retry shortly" };
   }
   const heldBy = existing?.fields?.routed_to?.stringValue as string | undefined;
   if (existing && dispatchLockIsHeld(existing.fields, now)) {
@@ -691,19 +691,20 @@ export async function setDispatchLock(
     };
   }
   try {
-    if (existing) await io.overwrite("dispatch_locks", messageId, fields, dispatcher);
-    else await io.create("dispatch_locks", messageId, fields, dispatcher);
+    if (existing) await io.overwrite("dispatch_locks", id, fields, who);
+    else await io.create("dispatch_locks", id, fields, who);
     return acquired;
   } catch (e) {
     if (isWriteContention(e)) {
       return { ok: false, acquired: false, reason: `Message is dispatch-locked to ${heldBy || "another dispatcher"}` };
     }
+    recordFailure(`dispatch_lock:overwrite:${id}`, e);
     return { ok: false, acquired: false, reason: `dispatch lock write failed: ${errMsg(e)}` };
   }
 }
 
 /** Set a lock on an outgoing message when routed_to or a single @bot mention is present.
- *  Returns null when there is nothing to lock. Never throws. */
+ *  Returns null when there is nothing to lock. */
 export async function armOutgoingDispatchLock(
   messageId: string,
   text: string,
@@ -712,13 +713,10 @@ export async function armOutgoingDispatchLock(
   roster: Iterable<string>,
   io?: LockSetIo,
 ): Promise<SetLockResult | null> {
+  if (!messageId.trim()) return null;
   const target = (routedTo?.trim() || directMentionTarget(text, roster) || "").trim();
-  if (!messageId || !target) return null;
-  try {
-    return await setDispatchLock(messageId, target, sender, io ? { io } : undefined);
-  } catch {
-    return { ok: false, acquired: false, reason: "dispatch lock write failed" };
-  }
+  if (!target) return null;
+  return setDispatchLock(messageId, target, sender, io ? { io } : undefined);
 }
 
 /** Mark a dispatch lock claimed (release). Returns false when there is nothing to claim
@@ -728,10 +726,13 @@ export async function markLockClaimed(
   forName?: string,
   io: LockClaimIo = lockClaimIo,
 ): Promise<boolean> {
+  if (!replyToId.trim()) return false;
   try {
     await io.patch("dispatch_locks", replyToId, { claimed: { booleanValue: true } }, forName);
     return true;
-  } catch {
+  } catch (e) {
+    const expectedMiss = is404(e) || /404|NOT_FOUND/i.test(errMsg(e));
+    if (!expectedMiss) recordFailure(`dispatch_lock:release:${replyToId}`, e);
     return false;
   }
 }

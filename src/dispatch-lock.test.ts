@@ -119,3 +119,12 @@ test('directMentionTarget is whitespace-anchored (not emails) and roster-gated',
   assert.equal(idx.directMentionTarget('email sin@example.com', roster), undefined);
   assert.equal(idx.directMentionTarget('@nobody hello', roster), undefined);
 });
+
+test('setDispatchLock: empty id, target, dispatcher, or ttl rejected', async () => {
+  const { io } = memLockIo();
+  const now = new Date('2026-10-10T07:00:00Z');
+  assert.equal((await idx.setDispatchLock(' ', 'grok', 'whisper', { io, now })).ok, false);
+  assert.equal((await idx.setDispatchLock('m1', '  ', 'whisper', { io, now })).ok, false);
+  assert.equal((await idx.setDispatchLock('m1', 'grok', ' ', { io, now })).ok, false);
+  assert.equal((await idx.setDispatchLock('m1', 'grok', 'whisper', { io, now, ttlMs: 0 })).ok, false);
+});
