@@ -23,6 +23,7 @@ import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
 import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
+  validateCallerConfig,
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
 // ============ FAIL-CLOSED ENV ============
@@ -107,6 +108,38 @@ const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
   catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
 
+// MCP_CALLERS = JSON {token: bot}. A Bearer token binds the caller to one bot, so writes cannot
+// claim another name (identity_mismatch). The shared path secret lets any holder write as any
+// name; LEGACY_PATH_AUTH=off retires it once every bot has moved to a Bearer token.
+export function parseAuthConfig(
+  env: Record<string, string | undefined>,
+  botCreds: Record<string, unknown>,
+): { mcpCallers: Record<string, string>; legacyEnabled: boolean } {
+  let mcpCallers: Record<string, string> = {};
+  if (env.MCP_CALLERS) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(env.MCP_CALLERS); } catch { throw new Error("MCP_CALLERS is not valid JSON"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+        Object.values(parsed).some((v) => typeof v !== "string"))
+      throw new Error("MCP_CALLERS must be a JSON object of token -> bot name");
+    mcpCallers = parsed as Record<string, string>;
+    const v = validateCallerConfig(mcpCallers);
+    if (!v.ok) throw new Error(`MCP_CALLERS invalid: ${v.reason}`);
+    const credNames = new Set(Object.keys(botCreds).map((k) => k.toLowerCase()));
+    const missing = Object.values(mcpCallers).filter((b) => !credNames.has(b.toLowerCase()));
+    if (missing.length) throw new Error(`MCP_CALLERS bots without BOT_CREDENTIALS: ${missing.join(", ")}`);
+  }
+  const legacyEnabled = (env.LEGACY_PATH_AUTH ?? "on").toLowerCase() !== "off";
+  if (!legacyEnabled && !Object.keys(mcpCallers).length)
+    throw new Error("LEGACY_PATH_AUTH=off requires MCP_CALLERS, or no caller can authenticate");
+  return { mcpCallers, legacyEnabled };
+}
+
+const AUTH_CONFIG = (() => {
+  try { return parseAuthConfig(process.env, BOT_CREDS); }
+  catch (e) { console.error(`FATAL: ${errMsg(e)}`); process.exit(1); }
+})();
+
 // ============ REV 19 SECURITY ============
 // All Firestore access flows through sec.firestore (the choke point); all MCP auth
 // flows through sec.resolveAuth. See src/security.ts for the full decision tables.
@@ -128,7 +161,7 @@ const sec = createSecurity(
     quietWindowMs: 14 * 24 * 3600 * 1000,
     boundWriteThroughMs: 3600 * 1000,
   },
-  { mcpCallers: {}, legacySecret: MCP_SECRET, legacyEnabled: true },
+  { ...AUTH_CONFIG, legacySecret: MCP_SECRET },
 );
 
 // ============ HTTP PRIMITIVE ============
@@ -2364,7 +2397,7 @@ async function handleMcp(req: Request, res: Response): Promise<void> {
   }
 }
 
-app.all(/^\/mcp\/(.+?)\/?$/, async (req: Request, res: Response) => {
+app.all(/^\/mcp(?:\/.+?)?\/?$/, async (req: Request, res: Response) => {
   // REV 19 auth: Bearer authoritative, duplicate-safe, no-oracle decoys.
   let ctx: CallerCtx;
   try {

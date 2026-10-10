@@ -13,3 +13,7 @@ services:
         sync: false
       - key: UPLOAD_ALLOWED_EMAILS
         sync: false
+      - key: MCP_CALLERS
+        sync: false
+      - key: LEGACY_PATH_AUTH
+        value: "on"
