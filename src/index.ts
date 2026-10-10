@@ -23,7 +23,7 @@ import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
 import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
-  validateCallerConfig,
+  validateCallerConfig, normalizeBotName,
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
@@ -111,8 +111,16 @@ export { FirestoreError };
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 // ============ CREDENTIALS (parsed once) ============
+export function indexBotCreds(
+  raw: Record<string, { email: string; password: string }>,
+): Record<string, { email: string; password: string }> {
+  const out: Record<string, { email: string; password: string }> = {};
+  for (const [k, v] of Object.entries(raw)) out[normalizeBotName(k)] = v;
+  return out;
+}
+
 const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
-  try { return JSON.parse(process.env.BOT_CREDENTIALS || "{}"); }
+  try { return indexBotCreds(JSON.parse(process.env.BOT_CREDENTIALS || "{}")); }
   catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
 
@@ -133,8 +141,8 @@ export function parseAuthConfig(
     mcpCallers = parsed as Record<string, string>;
     const v = validateCallerConfig(mcpCallers);
     if (!v.ok) throw new Error(`MCP_CALLERS invalid: ${v.reason}`);
-    const credNames = new Set(Object.keys(botCreds).map((k) => k.toLowerCase()));
-    const missing = Object.values(mcpCallers).filter((b) => !credNames.has(b.toLowerCase()));
+    const credNames = new Set(Object.keys(botCreds).map((k) => normalizeBotName(k)));
+    const missing = Object.values(mcpCallers).filter((b) => !credNames.has(normalizeBotName(b)));
     if (missing.length) throw new Error(`MCP_CALLERS bots without BOT_CREDENTIALS: ${missing.join(", ")}`);
   }
   const legacyEnabled = (env.LEGACY_PATH_AUTH ?? "on").toLowerCase() !== "off";
@@ -287,7 +295,7 @@ const _tokens = new Map<string, { token: string; exp: number }>();
 const _inflight = new Map<string, Promise<string>>();
 const _authBackoff = new Map<string, { until: number; message: string }>();
 const AUTH_BACKOFF_MS = 15000;
-const tokenKey = (forName?: string): string => (forName || READ_BOT).toLowerCase();
+const tokenKey = (forName?: string): string => normalizeBotName(forName || READ_BOT);
 
 async function getIdToken(forName?: string, forceRefresh?: boolean): Promise<string> {
   const key = tokenKey(forName);
