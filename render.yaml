@@ -7,17 +7,43 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      # Required to boot (set in the Render dashboard; never commit values)
       - key: FIREBASE_API_KEY
         sync: false
       - key: MCP_SECRET
         sync: false
-      - key: UPLOAD_ALLOWED_EMAILS
+      - key: HIGHWAY_CLIENT_KEY
         sync: false
+      - key: BOT_CREDENTIALS
+        sync: false
+      # Per-agent Bearer tokens: JSON object { "<token>": "<bot-name>" }
       - key: MCP_CALLERS
         sync: false
+      # Comma-separated emails allowed to POST /upload
+      - key: UPLOAD_ALLOWED_EMAILS
+        sync: false
+      # "on" keeps /mcp/<MCP_SECRET>. Flip to "off" only after every bot has a Bearer token.
       - key: LEGACY_PATH_AUTH
         value: "on"
       - key: READ_CACHE_TTL_MS
         value: "15000"
       - key: READ_BUDGET_DAILY
         value: "20000"
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: BRAIN_INDEX
+        value: "marrow-brain"
+      - key: BRAIN_NAMESPACE
+        value: "shared"
+      - key: SKILLS_SIGNING_KEY
+        sync: false
+      - key: SKILL_APPROVERS
+        value: "hollow"
+      - key: APIFY_API_TOKEN
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
