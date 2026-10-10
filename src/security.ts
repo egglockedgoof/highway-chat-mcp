@@ -26,6 +26,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { timingSafeEqual } from 'node:crypto';
+import { mirrorToPg } from './store/mirror.js';
 
 // ============================================================================
 // Part 1 — pure functions (ported 1:1 from security-verify/security.js)
@@ -903,13 +904,18 @@ export interface Security {
 export async function apifyClaimSlot(sec: Security, readUpdateTime: string | null): Promise<'claimed' | 'skipped-quiet'> {
   const precondition: PreconditionInput = readUpdateTime ? { updateTime: readUpdateTime } : { exists: false };
   try {
+    const claimedAt = sec.now();
     await sec.runAsSystem('apifyWrite', () =>
       sec.firestore(APIFY_DOC_PATH, {
         method: 'PATCH',
         precondition,
         updateMask: ['claimedAt', 'slotHours'],
-        body: { claimedAt: sec.now(), slotHours: 6 },
+        body: { claimedAt, slotHours: 6 },
       }));
+    mirrorToPg("system_config", "apify_last_run", {
+      claimedAt: { stringValue: claimedAt },
+      slotHours: { integerValue: "6" },
+    });
     return 'claimed';
   } catch (e) {
     if (e instanceof FirestoreError && (e.grpcCode === 'FAILED_PRECONDITION' || e.grpcCode === 'ALREADY_EXISTS')) {
