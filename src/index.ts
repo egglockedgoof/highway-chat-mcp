@@ -752,10 +752,23 @@ function fmtTask(d: Doc) {
     priority: str(f.priority) || null, ts: tsOf(f.ts),
   };
 }
-function fmtMsg(d: Doc) {
+function fmtAttachment(v: any) {
+  const f = v?.mapValue?.fields ?? {};
+  return { id: str(f.id), filename: str(f.filename), mime_type: str(f.mime_type),
+    size_bytes: f.size_bytes?.integerValue !== undefined ? Number(f.size_bytes.integerValue) : null,
+    storage_path: str(f.storage_path), download_url: str(f.download_url),
+    is_image: f.is_image?.booleanValue ?? false, uploaded_by: str(f.uploaded_by) };
+}
+
+function fmtMsg(d: Doc): { id: string; name: string; text: string; ts: number | null; attachments?: unknown[] } {
   const f = d.fields ?? {};
-  return { id: docIdOf(d.name), name: str(f.name), text: str(f.text),
-    ts: tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null) };
+  const attVals = f.attachments?.arrayValue?.values ?? [];
+  const attachments = Array.isArray(attVals) ? attVals.map(fmtAttachment) : [];
+  const msg: { id: string; name: string; text: string; ts: number | null; attachments?: unknown[] } =
+    { id: docIdOf(d.name), name: str(f.name), text: str(f.text),
+      ts: tsOf(f.ts) ?? (d.createTime ? Date.parse(d.createTime) : null) };
+  if (attachments.length > 0) msg.attachments = attachments;
+  return msg;
 }
 
 async function countDocs(collectionId: string): Promise<number | null> {
