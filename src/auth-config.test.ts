@@ -14,6 +14,7 @@ process.env.PHASE3_TEST ??= '1';
 const { parseAuthConfig } = await import('../dist/index.js');
 
 const TOKEN = 'a'.repeat(32);
+const TOKEN2 = 'b'.repeat(32);
 const creds = { nyx: {}, Whisper: {} };
 
 test('defaults: no callers, legacy path auth on (current behavior preserved)', () => {
@@ -21,12 +22,12 @@ test('defaults: no callers, legacy path auth on (current behavior preserved)', (
 });
 
 test('MCP_CALLERS binds tokens to bots; bot lookup is case-insensitive', () => {
-  const env = { MCP_CALLERS: JSON.stringify({ [TOKEN]: 'whisper' }) };
-  assert.deepEqual(parseAuthConfig(env, creds).mcpCallers, { [TOKEN]: 'whisper' });
+  const env = { MCP_CALLERS: JSON.stringify({ [TOKEN]: 'whisper', [TOKEN2]: 'nyx' }) };
+  assert.deepEqual(parseAuthConfig(env, creds).mcpCallers, { [TOKEN]: 'whisper', [TOKEN2]: 'nyx' });
 });
 
 test('LEGACY_PATH_AUTH=off retires the shared path secret', () => {
-  const env = { MCP_CALLERS: JSON.stringify({ [TOKEN]: 'nyx' }), LEGACY_PATH_AUTH: 'OFF' };
+  const env = { MCP_CALLERS: JSON.stringify({ [TOKEN]: 'nyx', [TOKEN2]: 'whisper' }), LEGACY_PATH_AUTH: 'OFF' };
   assert.equal(parseAuthConfig(env, creds).legacyEnabled, false);
 });
 
@@ -39,6 +40,7 @@ test('rejects configs that would lock everyone out or fail at write time', () =>
     [{ MCP_CALLERS: JSON.stringify({ short: 'nyx' }) }, /weak-token/],
     [{ MCP_CALLERS: JSON.stringify({ [TOKEN]: 'system' }) }, /reserved-name/],
     [{ MCP_CALLERS: JSON.stringify({ [TOKEN]: 'ghost' }) }, /without BOT_CREDENTIALS: ghost/],
+    [{ MCP_CALLERS: JSON.stringify({ [TOKEN]: 'whisper' }) }, /without MCP_CALLERS token: nyx/],
   ];
   for (const [env, re] of bad) assert.throws(() => parseAuthConfig(env, creds), re, JSON.stringify(env));
 });

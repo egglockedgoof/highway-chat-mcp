@@ -23,7 +23,7 @@ import { messageTextSchema, MESSAGE_MAX_CHARS } from "./message-limits.js";
 import { uploadToCloudinary, cloudinaryConfigured } from "./cloudinary-upload.js";
 import {
   createSecurity, runAsSystem, DECOY_STATUS, DECOY_BODY, WriteThroughFailed, reqCtx, FirestoreError,
-  validateCallerConfig, normalizeBotName,
+  validateCallerConfig, normalizeBotName, SYSTEM_BOT,
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
@@ -150,6 +150,9 @@ export function parseAuthConfig(
     const credNames = new Set(Object.keys(botCreds).map((k) => normalizeBotName(k)));
     const missing = Object.values(mcpCallers).filter((b) => !credNames.has(normalizeBotName(b)));
     if (missing.length) throw new Error(`MCP_CALLERS bots without BOT_CREDENTIALS: ${missing.join(", ")}`);
+    const callerNames = new Set(Object.values(mcpCallers).map((b) => normalizeBotName(b)));
+    const uncovered = [...credNames].filter((b) => b !== SYSTEM_BOT && !callerNames.has(b));
+    if (uncovered.length) throw new Error(`BOT_CREDENTIALS bots without MCP_CALLERS token: ${uncovered.join(", ")}`);
   }
   const legacyEnabled = (env.LEGACY_PATH_AUTH ?? "on").toLowerCase() !== "off";
   if (!legacyEnabled && !Object.keys(mcpCallers).length)
@@ -1148,7 +1151,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
         attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
       } },
-    async ({ name, text, channel, reply_to, routed_to, idempotency_key, attachments }) => {
+    async ({ name: claimed, text, channel, reply_to, routed_to, idempotency_key, attachments }) => {
+      const name = postedName(claimed);
       // Phase 3 Section D: Dispatch lock enforcement
       let lockCheck: LockCheck | null = null;
       if (reply_to) {
@@ -1245,7 +1249,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         audioType: z.string().optional().default("audio/webm"),
         caption: z.string().trim().max(200).optional().default("🎤 voice message"),
       } },
-    async ({ name, audio, audioType, caption }) => {
+    async ({ name: claimed, audio, audioType, caption }) => {
+      const name = postedName(claimed);
       const doc = buildMessageFields(name, caption || "🎤 voice message");
       const fields: Fields = doc.fields;
       fields.audio = { stringValue: audio };
@@ -2662,6 +2667,17 @@ function brainAuthor(claimed?: string): { author: string; verified: boolean } {
   const ctx = reqCtx.getStore();
   if (ctx?.method === "header_bound" && ctx.bot) return { author: ctx.bot, verified: true };
   return { author: claimed?.trim() || "unknown", verified: false };
+}
+
+/** Posted identity: header-bound callers write as their token's bot, never the claimed name. */
+export function postedName(claimed: string): string {
+  const name = typeof claimed === "string" ? claimed.trim() : "";
+  if (!name) throw new UserError("name is required");
+  const ctx = reqCtx.getStore();
+  if (ctx?.method !== "header_bound" || !ctx.bot) return name;
+  if (normalizeBotName(name) === normalizeBotName(ctx.bot)) return ctx.bot;
+  sec.telemetry.recordCount("identity_mismatch");
+  throw new UserError(`caller "${ctx.bot}" cannot mint for "${name}"`);
 }
 
 async function remember(text: string, kind: MemoryKind, source: string, o: { name?: string; tags?: string[]; id?: string } = {}) {

@@ -212,6 +212,8 @@ export interface GateDeps {
   readBot: string;
   recordBoundUse: (b: string) => void;
   recordLegacyName: (n: string | undefined) => void;
+  /** When MCP_CALLERS is set, path/header legacy may still read but cannot write. */
+  requireBoundWrite?: boolean;
 }
 
 export interface GateResolution {
@@ -240,6 +242,10 @@ export function createGate(deps: GateDeps): Gate {
       if (!ctx) return err('no_identity', 401, 'missing authentication context');
       if (ctx.method === 'header_legacy' || ctx.method === 'path_legacy') {
         if (deps.isSunset()) return err('legacy_retired', 401, 'legacy auth retired');
+        if (deps.requireBoundWrite) {
+          deps.count('use_bound_token');
+          return err('use_bound_token', 403, 'writes require a bound caller token');
+        }
         if (normalizeBotName(forName || '') === SYSTEM_BOT) {
           deps.count('reserved_identity');
           return err('reserved_identity', 403, '"system" is reserved and cannot be named');
@@ -943,6 +949,7 @@ export function createSecurity(deps: SecurityDeps, teleOpts: TelemetryFactoryOpt
     count,
     recordBoundUse: (b: string) => telemetry.recordBoundUse(b),
     recordLegacyName: (n: string | undefined) => telemetry.recordLegacyName(n, deps.readBot),
+    requireBoundWrite: Object.keys(authConfig.mcpCallers).length > 0,
   });
   firestoreImpl = createFirestoreFn(deps, gate, count);
   const firestore: FirestoreFn = (path, init) => firestoreImpl(path, init);
