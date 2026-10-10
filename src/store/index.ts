@@ -11,6 +11,7 @@ export { createFirestoreStore } from "./firestore.js";
 export {
   createPostgresStore, postgresPool, connectPostgres, probeDb, currentDbHealth,
   startDbProbe, stopDbProbe, dbHostOf, pgTargets, dbSchema, POOL_MAX,
+  countCollection, listSampleDocs,
 } from "./postgres.js";
 export type { DbHealth, PgSource } from "./postgres.js";
 

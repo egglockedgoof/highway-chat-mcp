@@ -23,6 +23,16 @@ npm ci
 npm test
 ```
 
+## Backfill `highway_messages` (after midnight PT)
+
+Firestore is out of quota until the daily reset. The script defaults to a dry plan (zero reads, no Postgres). Run it **on Render** (the only host that can reach `DATABASE_URL`) after midnight PT. `startCommand` does not migrate — apply `002_backfill_checkpoint.sql` first:
+
+```bash
+npm run migrate && npm run backfill:messages -- --apply --verify --max-reads 200 --delay-ms 400 --sample 20
+```
+
+Resumable via `highway.backfill_checkpoint`. Repeat until the JSON shows `"done": true` (verify is skipped until then, then counts + sample-hash run). Idempotent upserts. Firestore stays source of truth — do not set `STORE_BACKEND=postgres`. Dry plan (safe anytime): `npm run backfill:messages`
+
 ## Storage seam (Supabase move, not live)
 
 `src/store/` is a Firestore + Postgres adapter behind `STORE_BACKEND` (default `firestore`). MCP message writes stay on Firestore; `STORE_DUAL_WRITE=1` fail-soft mirrors them to Postgres. `READ_PG_COLLECTIONS` is empty until coder 3 count-verifies — then `highway_messages` first. Do not set `STORE_BACKEND=postgres`, `STORE_DUAL_WRITE=1`, or `READ_PG_COLLECTIONS` on Render until that verify. `DATABASE_URL` / `DATABASE_URL_FALLBACK` are optional; CI runs `migrations/` against a Postgres service container (`DB_SCHEMA=highway`). Nightly `pg_dump` skips until the `DATABASE_URL` GitHub Actions secret is set (this agent cannot write repo secrets). `GET /health` includes `db` (`ok` | `down` | `disabled`) from a background probe; a down database never changes the HTTP status (Render health checks stay 200).
