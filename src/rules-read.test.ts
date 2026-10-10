@@ -23,12 +23,26 @@ test('firestore.rules allows read on every collection the bridge GETs', () => {
   assert.deepEqual(deniedBridgeReads(repoRules), []);
 });
 
-test('highway_code (known live 403) has an allow-read match', () => {
+test('highway_code matches highway_messages: read and create', () => {
   assert.equal(matchAllowsRead(repoRules, 'highway_code'), true);
+  assert.match(repoRules, /match \/highway_code\/\{id\}[\s\S]*?allow create: if signedInNonAnon\(\)/);
+  assert.match(repoRules, /match \/highway_messages\/\{id\}[\s\S]*?allow create: if signedInNonAnon\(\)/);
 });
 
-test('dispatch_locks has an allow-read match (fail-closed lock GET)', () => {
+test('dispatch_locks allows signed-in non-anonymous read and write', () => {
   assert.equal(matchAllowsRead(repoRules, 'dispatch_locks'), true);
+  assert.match(repoRules, /match \/dispatch_locks\/\{id\}[\s\S]*?allow read, write: if signedInNonAnon\(\)/);
+});
+
+test('security_telemetry is bound to isBridgeSystem (uid sentinel, not live)', () => {
+  assert.equal(matchAllowsRead(repoRules, 'security_telemetry'), true);
+  assert.match(repoRules, /match \/security_telemetry\/\{docId\}[\s\S]*?allow read, write: if isBridgeSystem\(\)/);
+  assert.match(repoRules, /PASTE_LIVE_SYSTEM_UID/);
+});
+
+test('header marks this as a console mirror, not a publish', () => {
+  assert.match(repoRules, /CONSOLE MIRROR/);
+  assert.match(repoRules, /do not deploy this file over Firebase/i);
 });
 
 test('deniedBridgeReads: empty or missing rules fail closed (all collections denied)', () => {
@@ -53,9 +67,9 @@ test('matchAllowsRead: allow read, write counts as a read grant', () => {
   assert.equal(matchAllowsRead(src, 'highway_code'), true);
 });
 
-test('repo rules do not declare highway_messages write (posting stays on console)', () => {
+test('highway_messages create is signedInNonAnon, not a write-all', () => {
   const m = /match\s+\/highway_messages\/\{[^}]+\}[\s\S]{0,400}/.exec(repoRules);
   assert.ok(m, 'highway_messages match missing');
+  assert.match(m[0], /allow create: if signedInNonAnon\(\)/);
   assert.equal(/\ballow\s+write\b/.test(m[0]), false);
-  assert.equal(/\ballow\s+create\b/.test(m[0]), false);
 });
