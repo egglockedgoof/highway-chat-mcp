@@ -192,3 +192,91 @@ export async function verifyMessages(opts: {
   const sampleOk = mismatches.length === 0 && firestore === postgres;
   return { ok: counts.ok && sampleOk, counts, sample: { n: rows.length, ok: sampleOk, firestore, postgres, mismatches } };
 }
+
+export function firestoreBase(env: NodeJS.ProcessEnv = process.env): string {
+  return (env.FIRESTORE_BASE ||
+    "https://firestore.googleapis.com/v1/projects/highway-chat/databases/(default)/documents").replace(/\/$/, "");
+}
+
+export function botCredsFromEnv(env: NodeJS.ProcessEnv = process.env): { email: string; password: string } {
+  const raw = JSON.parse(env.BOT_CREDENTIALS || "{}") as Record<string, { email?: string; password?: string }>;
+  const row = raw.whisper || raw.Whisper || Object.values(raw)[0];
+  if (!row?.email || !row?.password) throw new Error("BOT_CREDENTIALS missing email/password");
+  return { email: row.email, password: row.password };
+}
+
+export async function firebaseIdToken(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchFn: typeof fetch = fetch,
+): Promise<string> {
+  const key = env.FIREBASE_API_KEY?.trim();
+  if (!key) throw new Error("FIREBASE_API_KEY missing");
+  const creds = botCredsFromEnv(env);
+  const res = await fetchFn(
+    `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${key}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }),
+    },
+  );
+  const body = JSON.parse(await res.text()) as { idToken?: string; error?: { message?: string } };
+  if (!res.ok || !body.idToken) throw new Error(`Auth ${res.status}: ${body.error?.message ?? "no idToken"}`);
+  return body.idToken;
+}
+
+export function createFsClient(opts: {
+  token: () => Promise<string>;
+  base?: string;
+  fetchFn?: typeof fetch;
+}): {
+  listPage: (pageToken: string | undefined, pageSize: number) => Promise<FsPage>;
+  count: () => Promise<number>;
+  getFields: (id: string) => Promise<StoreFields | null>;
+} {
+  const base = (opts.base ?? firestoreBase()).replace(/\/$/, "");
+  const fetchFn = opts.fetchFn ?? fetch;
+  async function call(path: string, init: RequestInit = {}): Promise<{ ok: boolean; status: number; json: unknown }> {
+    const token = await opts.token();
+    const res = await fetchFn(`${base}${path}`, {
+      ...init,
+      headers: { Authorization: `Bearer ${token}`, ...(init.headers as Record<string, string> | undefined) },
+    });
+    return { ok: res.ok, status: res.status, json: JSON.parse(await res.text()) };
+  }
+  return {
+    async listPage(pageToken, size) {
+      const u = new URL(`${base}/${MESSAGES}`);
+      u.searchParams.set("pageSize", String(size));
+      if (pageToken) u.searchParams.set("pageToken", pageToken);
+      const token = await opts.token();
+      const res = await fetchFn(u.href, { headers: { Authorization: `Bearer ${token}` } });
+      const body = JSON.parse(await res.text()) as FsPage & { error?: { message?: string } };
+      if (!res.ok) throw new Error(`list ${res.status}: ${body.error?.message ?? "failed"}`);
+      return { documents: body.documents ?? [], nextPageToken: body.nextPageToken };
+    },
+    async count() {
+      const hit = await call(":runAggregationQuery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          structuredAggregationQuery: {
+            structuredQuery: { from: [{ collectionId: MESSAGES }] },
+            aggregations: [{ count: {}, alias: "total" }],
+          },
+        }),
+      });
+      if (!hit.ok) throw new Error(`count HTTP ${hit.status}`);
+      const n = (hit.json as Array<{ result?: { aggregateFields?: { total?: { integerValue?: string } } } }>)
+        ?.[0]?.result?.aggregateFields?.total?.integerValue;
+      if (n === undefined) throw new Error("count missing");
+      return Number(n);
+    },
+    async getFields(id) {
+      const hit = await call(`/${MESSAGES}/${encodeURIComponent(id)}`);
+      if (hit.status === 404) return null;
+      if (!hit.ok) throw new Error(`get ${id} HTTP ${hit.status}`);
+      return ((hit.json as { fields?: StoreFields }).fields) ?? {};
+    },
+  };
+}

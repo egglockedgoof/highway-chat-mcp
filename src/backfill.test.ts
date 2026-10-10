@@ -144,6 +144,90 @@ test("verify: counts + sample-hash match; drift fails", async () => {
   assert.deepEqual(bad.sample.mismatches, ["m1"]);
 });
 
+const boot = await import("../dist/store/boot-backfill.js");
+
+async function waitFor(pred: () => boolean, ms = 800): Promise<void> {
+  const t0 = Date.now();
+  while (!pred()) {
+    if (Date.now() - t0 > ms) throw new Error("timeout waiting for backfill status");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+function mockPool(): { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>; end: () => Promise<void> } {
+  const db = ckptDb();
+  return { query: db.query, end: async () => {} };
+}
+
+test("boot backfill: flag off never lists", () => {
+  boot.resetBackfillStatus();
+  let listed = 0;
+  boot.startMessagesBackfill({
+    env: {},
+    listPage: async () => { listed += 1; return { documents: [] }; },
+  });
+  assert.equal(boot.backfillStatus().enabled, false);
+  assert.equal(boot.backfillStatus().state, "off");
+  assert.equal(listed, 0);
+});
+
+test("boot backfill: start returns immediately; errors stay on the snapshot", async () => {
+  boot.resetBackfillStatus();
+  let started = false;
+  boot.startMessagesBackfill({
+    env: { BACKFILL_MESSAGES: "1" },
+    applyMigrations: async () => { started = true; throw new Error("no db"); },
+  });
+  assert.equal(started, false);
+  assert.equal(boot.backfillStatus().enabled, true);
+  await waitFor(() => boot.backfillStatus().state === "error");
+  assert.equal(boot.backfillStatus().error, "no db");
+  assert.equal(boot.backfillStatus().done, false);
+});
+
+test("boot backfill: apply + verify until done; snapshot has counts", async () => {
+  boot.resetBackfillStatus();
+  const store = memStore();
+  const fields = { text: { stringValue: "hi" } };
+  const pages: bf.FsPage[] = [
+    { documents: [{ name: "highway_messages/m1", fields }], nextPageToken: "p2" },
+    { documents: [{ name: "highway_messages/m2", fields }] },
+  ];
+  let i = 0;
+  const pgDocs: Array<{ id: string; fields: typeof fields }> = [];
+  boot.startMessagesBackfill({
+    env: { BACKFILL_MESSAGES: "1", DB_SCHEMA: "highway" },
+    applyMigrations: async () => {},
+    connect: async () => ({ pool: mockPool() }),
+    createStore: () => ({
+      ...store,
+      async upsert(c, id, f) {
+        const doc = await store.upsert(c, id, f);
+        pgDocs.push({ id, fields: f as typeof fields });
+        return doc;
+      },
+    }),
+    listPage: async () => pages[i++] ?? { documents: [] },
+    countFs: async () => 2,
+    getFs: async () => fields,
+    countPg: async () => pgDocs.length,
+    samplePg: async (_p, _c, n) => pgDocs.slice(0, n),
+    sleep: async () => {},
+    maxReads: 1,
+    delayMs: 0,
+    pageSize: 1,
+    sample: 2,
+  });
+  await waitFor(() => boot.backfillStatus().state === "done" || boot.backfillStatus().state === "error");
+  const snap = boot.backfillStatus();
+  assert.equal(snap.state, "done");
+  assert.equal(snap.done, true);
+  assert.equal(snap.counts?.ok, true);
+  assert.equal(snap.verify?.ok, true);
+  assert.equal(snap.verify?.n, 2);
+  assert.equal(snap.checkpoint?.done, true);
+});
+
 const url = process.env.DATABASE_URL?.trim();
 const schema = dbSchema();
 test("postgres: idempotent upsert then count + sample hash", { skip: !url }, async () => {

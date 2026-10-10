@@ -25,13 +25,12 @@ npm test
 
 ## Backfill `highway_messages` (after midnight PT)
 
-Firestore is out of quota until the daily reset. The script defaults to a dry plan (zero reads, no Postgres). Run it **on Render** (the only host that can reach `DATABASE_URL`) after midnight PT. `startCommand` does not migrate — apply `002_backfill_checkpoint.sql` first:
+Firestore is out of quota until the daily reset. Render free has no shell. After midnight PT, set `BACKFILL_MESSAGES=1` in the Render dashboard (leave `STORE_BACKEND=firestore`). On the next boot the bridge migrates, then runs the same throttled apply+verify (`--max-reads 200 --delay-ms 400 --sample 20`) in the background. It does not block listen or crash the process. Watch:
 
-```bash
-npm run migrate && npm run backfill:messages -- --apply --verify --max-reads 200 --delay-ms 400 --sample 20
-```
+- `GET /admin/backfill` — `{ enabled, state, done, checkpoint, counts, verify, error }`
+- `GET /health` — same object under `backfill` (HTTP 200 even if the job failed)
 
-Resumable via `highway.backfill_checkpoint`. Repeat until the JSON shows `"done": true` (verify is skipped until then, then counts + sample-hash run). Idempotent upserts. Firestore stays source of truth — do not set `STORE_BACKEND=postgres`. Dry plan (safe anytime): `npm run backfill:messages`
+Resumable via `highway.backfill_checkpoint`. Unset `BACKFILL_MESSAGES` after `"done": true`. Firestore stays source of truth — do not set `STORE_BACKEND=postgres`. CLI dry plan (safe anytime, hosts with a shell): `npm run backfill:messages`
 
 ## Storage seam (Supabase move, not live)
 
@@ -72,6 +71,7 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 | `STORE_BACKEND` | no (default `firestore`) | `firestore` (live) or `postgres`. Do not flip on Render yet. |
 | `STORE_DUAL_WRITE` | no (default off) | Set `1` to fail-soft mirror MCP message writes to Postgres. Firestore stays primary. |
 | `READ_PG_COLLECTIONS` | no | Comma-separated collections to read from Postgres. Empty = no read flip. Messages first after count verify: `highway_messages`. |
+| `BACKFILL_MESSAGES` | no (default off) | Set `1` after midnight PT. Background migrate + messages backfill/verify. Unset after `done`. |
 | `PORT` | Render sets | Bind address is `$PORT` (Render) or `3000` locally |
 | `PHASE3_TEST` | tests only | Skip listen/timers when importing the module in unit tests. Never set on Render. |
 
@@ -110,6 +110,7 @@ What it hits, in order, with a small Firestore footprint:
 | Check | Live call | Firestore |
 | --- | --- | --- |
 | Health | `GET /health` | none |
+| Backfill status | `GET /admin/backfill` | none (job itself lists Firestore only when `BACKFILL_MESSAGES=1`) |
 | Tool count | MCP `tools/list` | skill-registry cache at most |
 | Read round-trip | `send_message` then `read_messages` (limit 5, `code` channel) | 1 create + 1 small query |
 | Duplicate-key | second `send_message` with the same `idempotency_key` | 1 GET, no extra create |

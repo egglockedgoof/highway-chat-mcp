@@ -34,6 +34,7 @@ import { createUsageMeter } from "./usage.js";
 import {
   currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema,
   dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
+  backfillStatus, startMessagesBackfill,
   type Store, type StoreCollection, type StoreDoc,
 } from "./store/index.js";
 import {
@@ -3117,7 +3118,12 @@ app.get("/health", (_req, res) => {
       pg_host: pgHost, dual_write: dualWriteEnabled(), read_pg: [...readPgCollections()],
     },
     usage: usageMeter.snapshot(),
+    backfill: backfillStatus(),
   });
+});
+
+app.get("/admin/backfill", (_req, res) => {
+  res.json(backfillStatus());
 });
 
 app.post("/metrics/reads", async (req: Request, res: Response) => {
@@ -3246,6 +3252,7 @@ if (listenTargets.length) {
 const port = Number(process.env.PORT) || 3000;
 const httpServer = app.listen(port, () => console.log(`highway-chat-mcp-server listening on :${port}`));
 startDbProbe();
+startMessagesBackfill();
 
 // REV 19: periodic security-telemetry flush (bound write-through buffer → Firestore).
 setInterval(() => sec.telemetry.flush().catch(() => {}), 5 * 60 * 1000);
