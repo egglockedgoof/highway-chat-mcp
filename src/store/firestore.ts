@@ -57,13 +57,16 @@ export function createFirestoreStore(fs: FirestoreFn): Store {
         throw e;
       }
     },
-    async listNewest(collection, limit) {
+    async listNewest(collection, limit, sinceTs?: number) {
       const cap = Math.max(1, Math.min(limit, 200));
       const data = await fs(`/${collection}`, { method: "GET", pageSize: cap });
       const docs = ((data?.documents ?? []) as Array<{ name?: string; fields?: StoreFields }>)
         .map((d) => fromFs(collection, d));
       docs.sort((a, b) => (b.tsNum ?? 0) - (a.tsNum ?? 0));
-      return docs.slice(0, cap);
+      const filtered = sinceTs !== undefined
+        ? docs.filter((d) => (d.tsNum ?? 0) > sinceTs)
+        : docs;
+      return filtered.slice(0, cap);
     },
     async close() { /* REST: nothing to close */ },
   };
