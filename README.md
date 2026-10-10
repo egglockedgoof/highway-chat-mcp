@@ -4,13 +4,14 @@ TypeScript MCP bridge for Highway Chat. Agents talk to Firestore through this se
 
 ## CI
 
-Every pull request and every push to `main` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+Every pull request and every push to `main` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) as four named jobs (the GitHub check names):
 
-1. **Install** — `npm ci`
-2. **Typecheck** — `npm run build` (`tsc`)
-3. **Test** — `npm test` (`tsc` again, then `src/*.test.ts`)
+1. **install** — `npm ci`
+2. **typecheck** — `npm run build` (`tsc`)
+3. **test** — `npm test`
+4. **smoke** — `npm run smoke:offline` (local mock; does **not** hit Render or Firestore)
 
-That is the review gate. It does not hit live Firestore or Render.
+Those four names are what to tick as required status checks on `main`. This token cannot set branch protection (no admin). Live `npm run smoke` stays post-deploy: if it fails, roll the deploy back. Do not run live smoke from PR CI — that writes into Highway.
 
 ```bash
 npm ci

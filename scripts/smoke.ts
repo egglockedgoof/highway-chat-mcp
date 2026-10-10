@@ -3,14 +3,17 @@
  * Post-deploy smoke against the live bridge.
  *
  *   SMOKE_TOKEN=... SMOKE_BOT_NAME=whisper npm run smoke
+ *   SMOKE_OFFLINE=1 npm run smoke:offline   # CI: local mock, never hits Highway
  *
  * Does not import src/. Uses GET /health + MCP JSON-RPC only.
- * Writes one tagged [smoke] message on the code channel (idempotent).
+ * Live mode writes one tagged [smoke] message on the code channel (idempotent).
  */
-const BASE = (process.env.SMOKE_BASE_URL || "https://highway-chat-mcp.onrender.com").replace(/\/$/, "");
-const TOKEN = process.env.SMOKE_TOKEN?.trim() || "";
-const PATH_SECRET = process.env.SMOKE_PATH_SECRET?.trim() || "";
-const BOT = process.env.SMOKE_BOT_NAME?.trim() || "";
+function baseUrl(): string {
+  return (process.env.SMOKE_BASE_URL || "https://highway-chat-mcp.onrender.com").replace(/\/$/, "");
+}
+function smokeToken(): string { return process.env.SMOKE_TOKEN?.trim() || ""; }
+function smokePathSecret(): string { return process.env.SMOKE_PATH_SECRET?.trim() || ""; }
+function smokeBot(): string { return process.env.SMOKE_BOT_NAME?.trim() || ""; }
 const CHANNEL = process.env.SMOKE_CHANNEL?.trim() || "code";
 const TIMEOUT_MS = 20_000;
 const MIN_TOOLS = 50;
@@ -42,7 +45,7 @@ async function http(path: string, init: RequestInit = {}): Promise<{ status: num
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(`${BASE}${path}`, { ...init, signal: ctrl.signal });
+    const res = await fetch(`${baseUrl()}${path}`, { ...init, signal: ctrl.signal });
     const text = await res.text();
     return { status: res.status, contentType: res.headers.get("content-type") || "", text };
   } finally {
@@ -69,8 +72,8 @@ function parseRpc(contentType: string, text: string): Rpc {
 }
 
 function mcpPath(): string {
-  if (TOKEN) return "/mcp";
-  if (PATH_SECRET) return `/mcp/${encodeURIComponent(PATH_SECRET)}`;
+  if (smokeToken()) return "/mcp";
+  if (smokePathSecret()) return `/mcp/${encodeURIComponent(smokePathSecret())}`;
   throw new Error("set SMOKE_TOKEN (preferred) or SMOKE_PATH_SECRET");
 }
 
@@ -80,7 +83,7 @@ function mcpHeaders(): Record<string, string> {
     accept: "application/json, text/event-stream",
     "mcp-protocol-version": "2025-03-26",
   };
-  if (TOKEN) h.authorization = `Bearer ${TOKEN}`;
+  if (smokeToken()) h.authorization = `Bearer ${smokeToken()}`;
   return h;
 }
 
@@ -146,7 +149,8 @@ async function checkTools(): Promise<string[]> {
 }
 
 async function checkRoundTripAndIdempotency() {
-  if (!BOT) {
+  const bot = smokeBot();
+  if (!bot) {
     skip("read round-trip", "set SMOKE_BOT_NAME");
     skip("duplicate-key", "set SMOKE_BOT_NAME");
     return;
@@ -156,7 +160,7 @@ async function checkRoundTripAndIdempotency() {
   const text = `[smoke] env-check ${stamp} (safe to ignore)`;
 
   const first = await callTool("send_message", {
-    name: BOT, text, channel: CHANNEL, idempotency_key: key,
+    name: bot, text, channel: CHANNEL, idempotency_key: key,
   });
   if (first.isError || first.json?.ok !== true) {
     fail("read round-trip", `send failed: ${first.text.slice(0, 300)}`);
@@ -180,7 +184,7 @@ async function checkRoundTripAndIdempotency() {
   }
 
   const second = await callTool("send_message", {
-    name: BOT, text, channel: CHANNEL, idempotency_key: key,
+    name: bot, text, channel: CHANNEL, idempotency_key: key,
   });
   if (second.isError) {
     fail("duplicate-key", `second send errored: ${second.text.slice(0, 300)}`);
@@ -198,11 +202,11 @@ async function checkRoundTripAndIdempotency() {
 }
 
 async function checkSpoof() {
-  if (!TOKEN) {
+  if (!smokeToken()) {
     skip("spoofed sender", "needs SMOKE_TOKEN; path secret still allows any name until the token flip");
     return;
   }
-  if (!BOT) {
+  if (!smokeBot()) {
     skip("spoofed sender", "set SMOKE_BOT_NAME");
     return;
   }
@@ -225,11 +229,88 @@ async function checkSpoof() {
   fail("spoofed sender", `unexpected: ${spoof.text.slice(0, 300)}`);
 }
 
+async function startOfflineMock(): Promise<{ url: string; close: () => Promise<void> }> {
+  const { createServer } = await import("node:http");
+  const sent = new Map<string, { id: string; text: string; name: string }>();
+  const tools = [...CORE_TOOLS, ...Array.from({ length: MIN_TOOLS }, (_, i) => `offline_${i}`)];
+  const server = createServer((req, res) => {
+    const url = req.url || "/";
+    if (req.method === "GET" && url.startsWith("/health")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, reads: { budget: 20000, overBudget: false } }));
+      return;
+    }
+    if (req.method === "POST" && url.startsWith("/mcp")) {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c as Buffer));
+      req.on("end", () => {
+        let rpc: { id?: unknown; method?: string; params?: Record<string, unknown> };
+        try { rpc = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+        catch {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "parse error" } }));
+          return;
+        }
+        const toolResult = (obj: unknown, isError = false) => ({
+          jsonrpc: "2.0", id: rpc.id, result: { isError, content: [{ type: "text", text: JSON.stringify(obj) }] },
+        });
+        if (rpc.method === "tools/list") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { tools: tools.map((name) => ({ name })) } }));
+          return;
+        }
+        if (rpc.method === "tools/call") {
+          const params = rpc.params ?? {};
+          const name = String(params.name ?? "");
+          const args = (params.arguments ?? {}) as Record<string, unknown>;
+          if (name === "read_messages") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(toolResult({ messages: [...sent.values()] })));
+            return;
+          }
+          if (name === "send_message") {
+            const sender = String(args.name ?? "");
+            if (sender === SPOOF_NAME) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify(toolResult({ error: "identity_mismatch" }, true)));
+              return;
+            }
+            const key = String(args.idempotency_key ?? "");
+            const existing = sent.get(key);
+            if (existing) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify(toolResult({ ok: true, duplicate: true, id: existing.id })));
+              return;
+            }
+            const row = { id: `offline-${sent.size + 1}`, text: String(args.text ?? ""), name: sender };
+            if (key) sent.set(key, row);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(toolResult({ ok: true, duplicate: false, id: row.id })));
+            return;
+          }
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "method not found" } }));
+      });
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("offline mock failed to bind");
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise((resolve, reject) => server.close((err) => err ? reject(err) : resolve())),
+  };
+}
+
 async function main() {
-  console.log(`smoke → ${BASE}`);
+  console.log(`smoke → ${baseUrl()}`);
   await checkHealth();
 
-  if (!TOKEN && !PATH_SECRET) {
+  if (!smokeToken() && !smokePathSecret()) {
     fail("mcp auth", "set SMOKE_TOKEN (preferred) or SMOKE_PATH_SECRET, plus SMOKE_BOT_NAME");
   } else {
     try {
@@ -248,4 +329,14 @@ async function main() {
   }
 }
 
-await main();
+if (process.env.SMOKE_OFFLINE === "1") {
+  const mock = await startOfflineMock();
+  process.env.SMOKE_BASE_URL = mock.url;
+  process.env.SMOKE_TOKEN = process.env.SMOKE_TOKEN?.trim() || "offline-smoke-token-16ch";
+  process.env.SMOKE_BOT_NAME = process.env.SMOKE_BOT_NAME?.trim() || "whisper";
+  console.log(`smoke offline mock → ${mock.url}`);
+  try { await main(); }
+  finally { await mock.close(); }
+} else {
+  await main();
+}
