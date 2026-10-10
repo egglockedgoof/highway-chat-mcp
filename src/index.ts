@@ -2940,8 +2940,21 @@ let pgListenUp = false;
 const siteApi = createSiteApi({
   verifyToken: verifyFirebaseIdToken,
   async readMessages(q) {
-    let messages = (await queryPage(channelCollection(q.channel), "tsNum", q.limit)).map(fmtMsg);
-    if (!messages.length) messages = (await queryPage(channelCollection(q.channel), "ts", q.limit)).map(fmtMsg);
+    const coll = channelCollection(q.channel);
+    let docs = await queryPage(coll, "tsNum", q.limit);
+    if (!docs.length) docs = await queryPage(coll, "ts", q.limit);
+    let messages = docs.map((d) => {
+      const m = fmtMsg(d);
+      const f = d.fields ?? {};
+      const image = str(f.image);
+      return {
+        ...m,
+        tsNum: m.ts,
+        deviceId: str(f.deviceId),
+        reactions: parseReactions(f.reactions),
+        ...(image ? { image } : {}),
+      };
+    });
     if (q.since_ts !== undefined) messages = messages.filter((m: { ts: number | null }) => (m.ts ?? 0) > q.since_ts!);
     if (q.mention) {
       const needle = q.mention.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -2953,6 +2966,30 @@ const siteApi = createSiteApi({
     let tasks = (await queryPage(TASKS, "ts", q.limit)).map(fmtTask);
     if (!q.include_done) tasks = tasks.filter((t: { done: boolean }) => !t.done);
     return { count: tasks.length, open: tasks.filter((t: { done: boolean }) => !t.done).length, tasks };
+  },
+  async readPresence() {
+    return (await queryPage(PRESENCE, "ts", 80)).map((d) => {
+      const f = d.fields ?? {};
+      return { id: docIdOf(d.name), name: str(f.name), platform: str(f.platform) || null, ts: tsOf(f.ts) };
+    });
+  },
+  async readTyping() {
+    return (await queryPage(TYPING, "ts", 40)).map((d) => {
+      const f = d.fields ?? {};
+      return { id: docIdOf(d.name), name: str(f.name), typing: boolOf(f.typing), ts: tsOf(f.ts) };
+    });
+  },
+  async readNotes() {
+    const d = await getDocOrNull(NOTES, "shared");
+    if (!d) return null;
+    const f = d.fields ?? {};
+    return { content: str(f.content), updatedBy: str(f.updatedBy), ts: tsOf(f.ts) };
+  },
+  async readActivity(limit) {
+    return (await queryPage(ACTIVITY, "ts", limit, ["by", "text", "ts"])).map((d) => {
+      const f = d.fields ?? {};
+      return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
+    });
   },
   bus: siteBus,
 });
@@ -3035,6 +3072,10 @@ app.get("/news", async (_req, res) => {
 // Firebase ID token (same as /upload). No MCP secret. No Firestore from the browser.
 app.get("/api/messages", (req, res) => { void siteApi.messages(req, res); });
 app.get("/api/tasks", (req, res) => { void siteApi.tasks(req, res); });
+app.get("/api/presence", (req, res) => { void siteApi.presence(req, res); });
+app.get("/api/typing", (req, res) => { void siteApi.typing(req, res); });
+app.get("/api/notes", (req, res) => { void siteApi.notes(req, res); });
+app.get("/api/activity", (req, res) => { void siteApi.activity(req, res); });
 app.get("/api/stream", (req, res) => { void siteApi.stream(req, res); });
 
 // REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with

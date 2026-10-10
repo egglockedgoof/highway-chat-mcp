@@ -76,11 +76,19 @@ function mockReq(auth?: string, query: Record<string, unknown> = {}) {
   };
 }
 
+const extras = {
+  readPresence: async () => [{ id: "p1", name: "sin" }],
+  readTyping: async () => [],
+  readNotes: async () => ({ content: "hi", updatedBy: "sin", ts: 1 }),
+  readActivity: async () => [{ id: "a1", text: "x" }],
+};
+
 test("API refuses missing and invalid tokens", async () => {
   const api = createSiteApi({
     verifyToken: async () => null,
     readMessages: async () => ({ count: 0, messages: [], newest_ts: null }),
     readTasks: async () => ({ count: 0, open: 0, tasks: [] }),
+    ...extras,
     bus: createSiteBus(),
   });
   const missing = mockRes();
@@ -96,6 +104,7 @@ test("API serves messages and tasks after a valid token", async () => {
     verifyToken: async (t) => t === "good" ? { localId: "u1" } : null,
     readMessages: async (q) => ({ count: 1, messages: [{ id: "m1", channel: q.channel }], newest_ts: 9, cached: true }),
     readTasks: async () => ({ count: 1, open: 1, tasks: [{ id: "t1" }] }),
+    ...extras,
     bus: createSiteBus(),
   });
   const msgs = mockRes();
@@ -114,6 +123,7 @@ test("SSE writes events and unsubscribes on close; 503 when full", async () => {
     verifyToken: async () => ({ localId: "u1" }),
     readMessages: async () => ({ count: 0, messages: [], newest_ts: null }),
     readTasks: async () => ({ count: 0, open: 0, tasks: [] }),
+    ...extras,
     bus,
   });
   const a = mockReq("Bearer t");
@@ -127,6 +137,26 @@ test("SSE writes events and unsubscribes on close; 503 when full", async () => {
   assert.equal(full.out.status, 503);
   a.close();
   assert.equal(bus.size(), 0);
+});
+
+test("presence/notes require a token and return items", async () => {
+  const api = createSiteApi({
+    verifyToken: async (t) => t === "good" ? { localId: "u1" } : null,
+    readMessages: async () => ({ count: 0, messages: [], newest_ts: null }),
+    readTasks: async () => ({ count: 0, open: 0, tasks: [] }),
+    ...extras,
+    bus: createSiteBus(),
+  });
+  const no = mockRes();
+  await api.presence(mockReq().req, no.res);
+  assert.equal(no.out.status, 401);
+  const ok = mockRes();
+  await api.presence(mockReq("Bearer good").req, ok.res);
+  assert.equal(ok.out.status, 200);
+  assert.deepEqual((ok.out.body as { items: unknown[] }).items, [{ id: "p1", name: "sin" }]);
+  const notes = mockRes();
+  await api.notes(mockReq("Bearer good").req, notes.res);
+  assert.equal((notes.out.body as { notes: { content: string } }).notes.content, "hi");
 });
 
 test("startPgListen opens one LISTEN and fans payloads; empty url fails closed", async () => {
