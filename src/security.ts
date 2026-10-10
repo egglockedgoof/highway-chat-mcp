@@ -332,7 +332,8 @@ export class FirestoreError extends UserError {
     this.grpcCode = grpcCode;
   }
   static fromResponse(status: number, body: any): FirestoreError {
-    const e = body?.error || {};
+    // :runQuery reports errors as a one-element array, not a bare object.
+    const e = (Array.isArray(body) ? body[0] : body)?.error || {};
     return new FirestoreError(status, e.status || 'UNKNOWN', e.message || `firestore ${status}`);
   }
 }
