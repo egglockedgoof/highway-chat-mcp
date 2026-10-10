@@ -30,6 +30,7 @@ import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import { diagnose, cycleText } from "./reflect.js";
+import { sessionMarkerId, sessionMarkerText, createOrientCache, runOrient } from "./orient.js";
 import {
   validateSpec, renderUrl, shapeResponse, signSkill, parseRegistry, activeSkills,
   SKILL_PREFIX, MAX_SKILLS, type SkillSpec, type SkillEntry, type Registry,
@@ -1332,6 +1333,37 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       return { ok: true, id: m.id, keep, outcome };
     });
 
+  tool(server, "orient",
+    { title: "Start-of-session continuity handshake",
+      description: "Call this first in a new session. Returns mission, constraints, open work, failures, and your role — not the whole chat. Failed stores are named, never filled in. A cached briefing is marked stale. Conflicts and superseded decisions are listed, not resolved. Does not post or apply anything.",
+      inputSchema: {
+        since_ms: z.number().int().min(0).optional().describe("Only count memories newer than this. Omit to use your last orient marker."),
+        name: nameSchema.optional().describe("Your name. Ignored when you connect with your own bridge token."),
+      } },
+    async ({ since_ms, name }) => {
+      const who = brainAuthor(name);
+      return runOrient({
+        search: (q) => brain.recall(q),
+        get: (id) => brain.get(id),
+        cache: orientCache,
+        openFromStore: async () => {
+          const docs = await queryNewest(TASKS, 8);
+          return docs.filter((d) => !boolOf(d.fields?.done)).map((d) => ({
+            id: `task:${docIdOf(d.name)}`, score: 0, text: str(d.fields?.text),
+            kind: "idea", author: str(d.fields?.createdBy), verified: false,
+            ts: bestTs(d), tags: ["topic:task"],
+          }));
+        },
+        stamp: async (author) => {
+          await brain.upsert([brain.memory({
+            id: sessionMarkerId(author),
+            text: sessionMarkerText(Date.now()),
+            kind: "fact", author: who.author, verified: who.verified, source: "orient",
+          })]);
+        },
+      }, { author: who.author, sinceMs: since_ms });
+    });
+
   // ---- Skills: the team grows the bridge ----
   tool(server, "propose_skill",
     { title: "Propose a new skill (tool) for every agent",
@@ -2396,6 +2428,7 @@ const brain = createBrain({
     return { status: r.status, body: r.body };
   },
 });
+const orientCache = createOrientCache();
 
 // Bound-token callers are recorded as themselves; legacy callers name themselves (unverified).
 function brainAuthor(claimed?: string): { author: string; verified: boolean } {
