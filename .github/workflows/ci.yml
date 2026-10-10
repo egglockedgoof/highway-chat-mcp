@@ -5,7 +5,35 @@ on:
   push:
     branches: [main]
 
+# Job names ARE the GitHub check names. Required on main (needs admin):
+#   install, typecheck, test
+# plus "Require branches to be up to date before merging" (strict).
+# typecheck runs `npm run build` — the same compile Render uses
+# (`npm install && npm run build`). It emits dist/; it is not tsc --noEmit.
 jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Prove emit (not tsc --noEmit)
+        run: test -f dist/index.js
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -14,9 +42,5 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install
-        run: npm ci
-      - name: Typecheck
-        run: npm run build
-      - name: Test
-        run: npm test
+      - run: npm ci
+      - run: npm test
