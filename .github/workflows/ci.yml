@@ -63,3 +63,5 @@ jobs:
       - run: npm ci
       - run: npm run migrate
       - run: npm test
+      - name: Backfill dry plan (zero Firestore)
+        run: npm run backfill:messages

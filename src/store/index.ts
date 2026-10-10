@@ -11,8 +11,11 @@ export { createFirestoreStore } from "./firestore.js";
 export {
   createPostgresStore, postgresPool, connectPostgres, probeDb, currentDbHealth,
   startDbProbe, stopDbProbe, dbHostOf, pgTargets, dbSchema, POOL_MAX,
+  countCollection, listSampleDocs,
 } from "./postgres.js";
 export type { DbHealth, PgSource } from "./postgres.js";
+export { backfillStatus, startMessagesBackfill, backfillEnabled } from "./boot-backfill.js";
+export type { BackfillPublic } from "./boot-backfill.js";
 
 export type StoreBackend = "firestore" | "postgres";
 

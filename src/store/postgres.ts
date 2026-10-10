@@ -203,3 +203,27 @@ export function createPostgresStore(pool: SqlPool, schema = DEFAULT_SCHEMA): Sto
     async close() { await pool.end(); },
   };
 }
+
+export async function countCollection(pool: SqlPool, collection: string, schema = DEFAULT_SCHEMA): Promise<number> {
+  const docs = `${dbSchema({ DB_SCHEMA: schema })}.docs`;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::text AS id FROM ${docs} WHERE collection = $1`,
+    [collection],
+  );
+  return Number(rows[0]?.id ?? 0);
+}
+
+export async function listSampleDocs(
+  pool: SqlPool,
+  collection: string,
+  limit: number,
+  schema = DEFAULT_SCHEMA,
+): Promise<Array<{ id: string; fields: StoreFields }>> {
+  const docs = `${dbSchema({ DB_SCHEMA: schema })}.docs`;
+  const cap = Math.max(1, Math.min(limit, 100));
+  const { rows } = await pool.query(
+    `SELECT id, fields FROM ${docs} WHERE collection = $1 ORDER BY id ASC LIMIT $2`,
+    [collection, cap],
+  );
+  return rows.map((r) => ({ id: r.id, fields: r.fields ?? {} }));
+}

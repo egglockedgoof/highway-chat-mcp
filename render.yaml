@@ -59,3 +59,6 @@ services:
         value: firestore
       - key: STORE_DUAL_WRITE
         value: "0"
+      # Set to 1 in the dashboard after midnight PT. Unset after /admin/backfill done=true.
+      - key: BACKFILL_MESSAGES
+        sync: false
