@@ -49,7 +49,7 @@ Phase 3 (close ASAP). GitHub state checked 1:55 AM PT; Nyx flip Sat Oct 10 ~2:10
 | #23 tool-surface catalog (draft) | coder 2 | in progress | rook/ember must send idempotency_key after deploy |
 | #16 read cache + since-last-seen reads | Nyx | review (CI green) | merge when Sin says; then site-via-bridge |
 | §7.2 site via bridge (no browser Firestore listeners) | Nyx | PAUSED | no write access to money-city-ui (permissions all false). Report to Sin. |
-| §7.6 thin API + SSE (LISTEN/NOTIFY, one DB listener) | Nyx | in progress | after #16 on main; additive routes only |
+| §7.6 thin API + SSE (LISTEN/NOTIFY, one DB listener) | Nyx | review (PR #26) | additive routes; waiting Sin. Does not flip reads. |
 | §7.7 read flip (messages first) | Nyx + coder 3 | PAUSED | dual-write first; waiting on Sin DATABASE_URL + coder 3 backfill. Instant-rollback flag required. |
 | #9, #10, #11, #15, #17, #18, #19 | various | live (deploy d936044, 1:11 AM PT) | — |
 Phase 4 (after phase 3 closes): Whisper's 4-piece compatibility scope in the Highway room. Status: todo. Do not contact Whisper or Hollow.
@@ -58,7 +58,7 @@ Consolidation (from INVENTORY): status todo for all; see section 5.
 ## 5. Self-ranking priority queue
 Rule: when Sin says "get this done", the TOP item fires through the whole chain (coder builds, CI + Snatcher review, merge, deploy) with no further discussion. Hollow is on hold — do not contact. Coding agents own this ranking: highest impact + lowest risk first. Re-rank whenever an item finishes or a new one appears; one line of impact/risk each. §7a applies to every data-path item.
 1. #16 read cache + since-last-seen. Impact: stops the daily read-quota blackout. Risk: low (bridge-only, CI green). Waiting Sin merge.
-2. §7.6 thin API + SSE. Impact: site can drop Firestore listeners without a DB move. Risk: low (additive /api routes; one LISTEN, SSE fanout ≤150).
+2. §7.6 thin API + SSE (PR #26). Impact: site can drop Firestore listeners without a DB move. Risk: low (additive /api routes; one LISTEN, SSE fanout ≤150).
 3. §7.2 site via bridge. Impact: kills the 8 browser listeners. Risk: medium (touches every tab). PAUSED — no money-city-ui write access. Visual look must hold (before/after shots).
 4. #12 money notes. Impact: news feed value for Sin. Risk: low (review-ready). Do not merge until told.
 5. Piece A #24. Impact: unblocks the spoof fix. Risk: low (client change + one env var name).
@@ -91,7 +91,7 @@ Steps (owner / status):
 3. Prep removal PRs: push_subs code, duplicate connector docs, Hosting config. Service/project deletions (hollow-inbox, Firebase Hosting site, second connector) WAIT for Sin's approval. Owner: coder 2. Status: todo
 4. Sin creates the free Supabase project (US West); DATABASE_URL goes on Render. Owner: Sin. Status: waiting on Sin
 5. Storage seam src/store/ (Firestore impl + Postgres impl), plain-SQL migrations/, CI runs migrations, nightly pg_dump via GitHub Actions to a private location. Owner: coder 2. Status: todo (can start before step 4 against local Postgres in CI)
-6. Thin API + SSE on the bridge (/api/messages, /api/tasks, ...), Firebase ID token verified server-side. Owner: Nyx (after step 2). Status: in progress (additive routes; one DB LISTEN, SSE fanout). No read flip in this slice.
+6. Thin API + SSE on the bridge (/api/messages, /api/tasks, ...), Firebase ID token verified server-side. Owner: Nyx (after step 2). Status: review (PR #26). Additive routes; one DB LISTEN, SSE fanout ≤150. No read flip in this slice.
 7. Dual-write, backfill from Firestore export, compare counts, flip reads one collection at a time (messages first), Firestore -> read-only archive. Owner: coder 3 (backfill/verify scripts) + Nyx (flip). Status: PAUSED — dual-write first; needs DATABASE_URL + per-collection flag with instant rollback. Do not flip yet.
 8. Brain -> pgvector, uploads -> Supabase Storage. Owner: coder 3. Status: later
 9. Auth -> Supabase Auth / bridge sessions; Firebase project deletion is Sin's call. Status: later
