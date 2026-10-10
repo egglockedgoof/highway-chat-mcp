@@ -33,6 +33,13 @@ import { timingSafeEqual } from 'node:crypto';
 
 export const SYSTEM_BOT = 'system';
 
+/** Canonical bot identity: trim, lowercase, collapse spaces / _ / - so
+ *  "MONEY SNATCHER 3000", "money-snatcher-3000", and "money snatcher 3000"
+ *  resolve to the same BOT_CREDENTIALS / MCP_CALLERS row. */
+export function normalizeBotName(name: string): string {
+  return name.trim().toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+}
+
 // --- §1b: Authorization parsing ---
 // Node joins duplicate headers with ", " in req.headers (except set-cookie), so an
 // Array.isArray check on req.headers NEVER fires for Authorization. Read the
@@ -228,7 +235,7 @@ export function createGate(deps: GateDeps): Gate {
       if (!ctx) return err('no_identity', 401, 'missing authentication context');
       if (ctx.method === 'header_legacy' || ctx.method === 'path_legacy') {
         if (deps.isSunset()) return err('legacy_retired', 401, 'legacy auth retired');
-        if ((forName || '').toLowerCase() === SYSTEM_BOT) {
+        if (normalizeBotName(forName || '') === SYSTEM_BOT) {
           deps.count('reserved_identity');
           return err('reserved_identity', 403, '"system" is reserved and cannot be named');
         }
@@ -239,7 +246,7 @@ export function createGate(deps: GateDeps): Gate {
       }
       if (ctx.method === 'header_bound') {
         deps.recordBoundUse(ctx.bot!);
-        if (forName && forName.toLowerCase() !== (ctx.bot || '').toLowerCase()) {
+        if (forName && normalizeBotName(forName) !== normalizeBotName(ctx.bot || '')) {
           deps.count('identity_mismatch');
           return err('identity_mismatch', 403, `caller "${ctx.bot}" cannot mint for "${forName}"`);
         }
@@ -407,7 +414,12 @@ export type FirestoreFn = (path: string, init: FirestoreInit) => Promise<any>;
 
 export function buildFirestoreQuery(init: FirestoreInit): string {
   const params = new URLSearchParams();
-  if (init.updateMask && init.updateMask.length) params.set('updateMask.fieldPaths', init.updateMask.join(','));
+  // Firestore REST wants one updateMask.fieldPaths per field. A single
+  // comma-joined value is parsed as ONE path ("name,text,...") and rejected
+  // as "Invalid property path name,text,ts,tsNum,deviceId,idempotency_key".
+  if (init.updateMask && init.updateMask.length) {
+    for (const field of init.updateMask) params.append('updateMask.fieldPaths', field);
+  }
   const pc = preconditionKind(init.precondition); // validated upstream; recompute for the kind
   if (pc === 'exists-false') params.set('currentDocument.exists', 'false');
   else if (pc === 'updateTime') params.set('currentDocument.updateTime', init.precondition!.updateTime!);
@@ -809,7 +821,7 @@ export function validateCallerConfig(mcpCallers: Record<string, string>): { ok: 
     if (!token || token.length < 16) return { ok: false, reason: `weak-token:${bot}` };
     if (seen.has(token)) return { ok: false, reason: 'duplicate-token' };
     seen.add(token);
-    if (!bot || bot.toLowerCase() === SYSTEM_BOT) return { ok: false, reason: `reserved-name:${bot}` };
+    if (!bot || normalizeBotName(bot) === SYSTEM_BOT) return { ok: false, reason: `reserved-name:${bot}` };
   }
   return { ok: true };
 }
