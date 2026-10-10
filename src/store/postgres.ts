@@ -39,6 +39,13 @@ export function dbHostOf(url: string): string {
   }
 }
 
+/**
+ * LISTEN constraint (C3): pg_listen needs a session-mode Postgres connection.
+ * Supabase's transaction-mode pooler (:6543 on the pooler host) does NOT
+ * support LISTEN/NOTIFY. Use :5432 (session-mode pooler) or a direct
+ * connection for realtime; plain queries work on either port. If the URL is
+ * switched to :6543, LISTEN fails at startup and SSE realtime silently dies.
+ */
 export function pgTargets(env: NodeJS.ProcessEnv = process.env): Array<{ source: PgSource; host: string; url: string }> {
   const out: Array<{ source: PgSource; host: string; url: string }> = [];
   const primary = env.DATABASE_URL?.trim();
@@ -56,7 +63,7 @@ export function postgresPool(url: string, schema = DEFAULT_SCHEMA): SqlPool {
     connectionString: url,
     max: POOL_MAX,
     connectionTimeoutMillis: 4000,
-    options: `-c search_path=${s}`,
+    options: `-c search_path=${s} -c statement_timeout=10000`,
   });
 }
 
@@ -67,6 +74,22 @@ export async function connectPostgres(env: NodeJS.ProcessEnv = process.env): Pro
   const schema = dbSchema(env);
   const targets = pgTargets(env);
   if (!targets.length) throw new Error("DATABASE_URL is not set");
+  // C3: pg_listen (LISTEN/NOTIFY) requires Supabase session-mode pooler (:5432).
+  // Transaction-mode pooler (:6543) silently breaks realtime — warn loudly.
+  for (const t of targets) {
+    try {
+      const port = new URL(t.url).port;
+      if (port === "6543") {
+        console.warn(
+          `postgres: WARNING host=${t.host} uses port 6543 (transaction-mode pooler). ` +
+          `LISTEN/NOTIFY is NOT supported on :6543 — pg_listen realtime will silently break. ` +
+          `Use the session-mode pooler (:5432) or a direct connection instead.`
+        );
+      }
+    } catch {
+      // ignore URL parse errors here; connect will fail with a clear error below
+    }
+  }
   let last: unknown;
   for (const t of targets) {
     const pool = postgresPool(t.url, schema);
@@ -189,14 +212,14 @@ export function createPostgresStore(pool: SqlPool, schema = DEFAULT_SCHEMA): Sto
       );
       return (rowCount ?? 0) > 0;
     },
-    async listNewest(collection, limit) {
+    async listNewest(collection, limit, sinceTs?: number) {
       const cap = Math.max(1, Math.min(limit, 200));
       const { rows } = await pool.query(
         `SELECT id, fields, ts_num FROM ${docs}
-          WHERE collection = $1
+          WHERE collection = $1 AND ($3::bigint IS NULL OR ts_num > $3)
           ORDER BY ts_num DESC NULLS LAST, created_at DESC
           LIMIT $2`,
-        [collection, cap],
+        [collection, cap, sinceTs ?? null],
       );
       return rows.map((r) => row(collection, r));
     },

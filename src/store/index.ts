@@ -56,7 +56,7 @@ export function createDualWriteStore(primary: Store, secondary: Store): Store {
   };
   return {
     get: (c, id) => primary.get(c, id),
-    listNewest: (c, n) => primary.listNewest(c, n),
+    listNewest: (c, n, sinceTs) => primary.listNewest(c, n, sinceTs),
     async create(c: StoreCollection, fields: StoreFields, id?: string) {
       const doc = await primary.create(c, fields, id);
       await shadow("create", () => secondary.create(c, fields, doc.id));

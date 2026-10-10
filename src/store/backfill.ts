@@ -117,6 +117,17 @@ export async function runBackfill(opts: {
   if (!opts.apply) return { ...cp, updatedAt: now() };
   if (cp.done) return cp;
 
+  // C1: silence pg_notify during backfill so thousands of upserts don't
+  // thundering-herd every SSE client. 003_notify_hardening.sql gates the
+  // trigger on this GUC. Best-effort: pool may rotate connections, but
+  // sequential backfill reuses the same client in practice.
+  try {
+    await opts.db.query("SELECT set_config('highway.skip_notify', '1', false)");
+  } catch {
+    // non-fatal: backfill proceeds, notifications may fire
+  }
+  try {
+
   // maxReads is per invocation (quota). Checkpoint.reads is cumulative.
   const maxReads = capReads(opts.maxReads);
   let pageToken = cp.pageToken;
@@ -155,6 +166,14 @@ export async function runBackfill(opts: {
     if (opts.delayMs > 0) await opts.sleep(opts.delayMs);
   }
   return cp;
+  } finally {
+    // C1: re-enable notifications after backfill.
+    try {
+      await opts.db.query("SELECT set_config('highway.skip_notify', '', false)");
+    } catch {
+      // non-fatal
+    }
+  }
 }
 
 export type VerifyResult = {

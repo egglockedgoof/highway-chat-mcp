@@ -11,6 +11,8 @@ export const STORE_COLLECTIONS = [
   "dispatch_locks",
   "approval_requests",
   "system_config",
+  "evolution_logs",
+  "jarvis_memory",
 ] as const;
 
 export type StoreCollection = (typeof STORE_COLLECTIONS)[number];
@@ -30,7 +32,7 @@ export interface Store {
   upsert(collection: StoreCollection, id: string, fields: StoreFields): Promise<StoreDoc>;
   patch(collection: StoreCollection, id: string, fields: StoreFields): Promise<StoreDoc>;
   remove(collection: StoreCollection, id: string): Promise<boolean>;
-  listNewest(collection: StoreCollection, limit: number): Promise<StoreDoc[]>;
+  listNewest(collection: StoreCollection, limit: number, sinceTs?: number): Promise<StoreDoc[]>;
   close(): Promise<void>;
 }
 
