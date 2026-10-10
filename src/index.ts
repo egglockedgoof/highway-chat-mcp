@@ -2785,12 +2785,17 @@ async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string
 }
 
 // Firebase Auth allows open email signup, so a valid ID token proves nothing about team
-// membership. Fails closed: an unset UPLOAD_ALLOWED_EMAILS refuses every upload.
-const UPLOAD_ALLOWED = new Set(
-  (process.env.UPLOAD_ALLOWED_EMAILS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+// membership. Fails closed: an unset or empty UPLOAD_ALLOWED_EMAILS refuses every upload.
+// Parsed at call time so tests (and a Render env change + restart) share one function.
+export function parseUploadAllowlist(raw: string | undefined): Set<string> {
+  return new Set((raw ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
 
-export function uploadAllowed(email: string | undefined, allowed: ReadonlySet<string> = UPLOAD_ALLOWED): boolean {
-  return !!email && allowed.has(email.trim().toLowerCase());
+export function uploadAllowed(
+  email: string | undefined,
+  allowed: ReadonlySet<string> = parseUploadAllowlist(process.env.UPLOAD_ALLOWED_EMAILS),
+): boolean {
+  return !!email?.trim() && allowed.has(email.trim().toLowerCase());
 }
 
 /** Shared shape for attachment metadata stored in Firestore docs. */

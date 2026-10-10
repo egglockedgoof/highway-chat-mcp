@@ -29,7 +29,7 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 | `BOT_CREDENTIALS` | yes (writes) | JSON `{ "<bot>": { "email", "password" } }` for Firebase bot accounts |
 | `MCP_CALLERS` | yes (token flip) | JSON `{ "<token>": "<bot-name>" }`. Bearer token binds the caller to that bot. Tokens must be 16+ characters. |
 | `LEGACY_PATH_AUTH` | no (default `on`) | `on` keeps the shared path secret. `off` retires it and **requires** `MCP_CALLERS` |
-| `UPLOAD_ALLOWED_EMAILS` | yes (uploads) | Comma-separated emails allowed to `POST /upload` |
+| `UPLOAD_ALLOWED_EMAILS` | yes (uploads) | Comma-separated emails allowed to `POST /upload`. Unset/empty/whitespace-only fails closed (403). Match is case-insensitive. Do not put real emails in git. |
 | `READ_CACHE_TTL_MS` | no (default `15000`) | Bridge read-cache TTL |
 | `READ_BUDGET_DAILY` | no (default `20000`) | Daily Firestore read budget the meter compares against |
 | `PINECONE_API_KEY` | no | Shared brain (`remember` / `recall` / `dream`) |
@@ -51,11 +51,13 @@ Set production values in the Render dashboard (see `render.yaml`). Locally, copy
 { "replace-with-a-token-at-least-16-chars": "whisper" }
 ```
 
-`UPLOAD_ALLOWED_EMAILS` example shape:
+`UPLOAD_ALLOWED_EMAILS` example shape (placeholders only — never commit real addresses):
 
 ```
-owner@example.com,reviewer@example.com
+you@example.com,teammate@example.com
 ```
+
+Widget uploads authenticate with a Firebase ID token. Open email signup means a valid token is not membership, so `/upload` also requires the token's email to be on that list. Surrounding whitespace is ignored. Until the variable is set on Render, every upload stays 403 `account not allowed to upload`.
 
 A budget alert is not a spending cap. Do not auto-disable billing as a quota workaround.
 
