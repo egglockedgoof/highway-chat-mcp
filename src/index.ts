@@ -483,6 +483,9 @@ export async function checkDispatchLock(
   // Broadcast = everyone can reply
   if (broadcast) return { allowed: true, routedTo: routedNorm, advisory: true };
 
+  // Released (claimed) lock = open so the next dispatcher can take the message
+  if (fields.claimed?.booleanValue) return { allowed: true, routedTo: routedNorm, advisory: true };
+
   // Expired lock = open
   if (expiresAt && new Date(expiresAt) < new Date()) return { allowed: true, routedTo: routedNorm, advisory: true };
 
@@ -558,15 +561,82 @@ const idemIo: IdemIo = {
     }),
 };
 
-// ---- LOCK CLAIM (hollow re-review #38: "nothing writes dispatch_locks — lock inert") ----
-// The writer lives in the listener (highway-push/dispatch-lock-writer.js, writes the
-// lock on routing). This is the other half: when the routed agent's reply lands,
-// the bridge marks the lock claimed (spec §2 ledger). Ledger only — never blocks
-// the send, never throws, never creates a lock doc from a claim (exists:true).
+// ---- DISPATCH LOCK SET / RELEASE (hollow: "no setter, regression") ----
+// The highway-push listener writer is dormant (HIGHWAY_DISPATCH_LOCKS unset).
+// The bridge now writes dispatch_locks on the live path:
+//   - route_task(message_id) acquires the lock for the recommended bot
+//   - send_message with routed_to, or a single @bot mention, locks the new message
+// Create is exists:false (atomic). A second dispatcher is blocked while the lock
+// is held. Stale (expired or claimed) locks can be overwritten. TTL 120s, matching
+// the listener spec. Set is fail-open: a lock-write failure never blocks the send.
+// Release is the claim ledger (exists:true, claimed:true) — checkDispatchLock
+// treats claimed as open.
+
+export const DISPATCH_LOCK_TTL_MS = 120_000;
+export const DISPATCH_ROSTER = [
+  "whisper", "hollow", "nyx", "grok", "ember", "rook", "gemini", "deepseek",
+] as const;
+
+export type SetLockResult =
+  | { ok: true; acquired: true; routedTo: string; expiresAt: string }
+  | { ok: false; acquired: false; reason: string; routedTo?: string };
+
+export interface LockSetIo {
+  get: (collection: string, docId: string, forName?: string) => Promise<Doc | null>;
+  create: (collection: string, docId: string, fields: Record<string, unknown>, forName?: string) => Promise<void>;
+  overwrite: (collection: string, docId: string, fields: Record<string, unknown>, forName?: string) => Promise<void>;
+}
 
 export interface LockClaimIo {
   patch: (collection: string, docId: string, fields: Record<string, unknown>, forName?: string) => Promise<void>;
 }
+
+function dispatchLockFields(routedTo: string, dispatcher: string, expiresAt: Date): Record<string, unknown> {
+  return {
+    routed_to: { stringValue: routedTo },
+    dispatcher: { stringValue: dispatcher },
+    claimed: { booleanValue: false },
+    broadcast: { booleanValue: false },
+    expires_at: { timestampValue: expiresAt.toISOString() },
+  };
+}
+
+/** True when a lock doc no longer exclusively holds the message. */
+export function dispatchLockIsHeld(fields: Fields | undefined, now: Date = new Date()): boolean {
+  if (!fields) return false;
+  if (fields.claimed?.booleanValue) return false;
+  if (fields.broadcast?.booleanValue) return false;
+  const expiresAt = fields.expires_at?.timestampValue;
+  if (expiresAt && new Date(expiresAt) < now) return false;
+  return !!fields.routed_to?.stringValue;
+}
+
+/** Single @bot mention against a roster. Two bots (or none) → undefined (no lock / broadcast). */
+export function directMentionTarget(text: string, roster: Iterable<string>): string | undefined {
+  const allowed = new Set([...roster].map((s) => s.toLowerCase()));
+  const hits = new Set<string>();
+  const re = /(^|[\s])@([A-Za-z][A-Za-z0-9_-]{0,39})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const n = m[2].toLowerCase();
+    if (allowed.has(n)) hits.add(n);
+  }
+  return hits.size === 1 ? [...hits][0] : undefined;
+}
+
+const lockSetIo: LockSetIo = {
+  get: (c, d, n) => getDocOrNull(c, d, n),
+  create: (c, d, fields, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body: { fields }, forName: n,
+      updateMask: Object.keys(fields), precondition: { exists: false },
+    }),
+  overwrite: (c, d, fields, n) =>
+    firestore(`/${c}/${encodeURIComponent(d)}`, {
+      method: "PATCH", body: { fields }, forName: n,
+      updateMask: Object.keys(fields), precondition: { exists: true },
+    }),
+};
 
 const lockClaimIo: LockClaimIo = {
   patch: (c, d, fields, n) =>
@@ -576,7 +646,82 @@ const lockClaimIo: LockClaimIo = {
     }),
 };
 
-/** Mark a dispatch lock claimed. Returns false when there is nothing to claim
+/** Acquire a dispatch lock. Second dispatcher is blocked while the lock is held. */
+export async function setDispatchLock(
+  messageId: string,
+  routedTo: string,
+  dispatcher: string,
+  opts?: { io?: LockSetIo; now?: Date; ttlMs?: number },
+): Promise<SetLockResult> {
+  const target = routedTo.trim();
+  if (!messageId.trim() || !target) {
+    return { ok: false, acquired: false, reason: "message_id and routed_to are required" };
+  }
+  const io = opts?.io ?? lockSetIo;
+  const now = opts?.now ?? new Date();
+  const ttlMs = opts?.ttlMs ?? DISPATCH_LOCK_TTL_MS;
+  const expiresAt = new Date(now.getTime() + ttlMs);
+  const fields = dispatchLockFields(target, dispatcher, expiresAt);
+  const acquired: SetLockResult = {
+    ok: true, acquired: true, routedTo: target.toLowerCase(), expiresAt: expiresAt.toISOString(),
+  };
+  try {
+    await io.create("dispatch_locks", messageId, fields, dispatcher);
+    return acquired;
+  } catch (e) {
+    if (!isWriteContention(e)) {
+      return { ok: false, acquired: false, reason: `dispatch lock write failed: ${errMsg(e)}` };
+    }
+  }
+  let existing: Doc | null;
+  try {
+    existing = await io.get("dispatch_locks", messageId, dispatcher);
+  } catch {
+    return {
+      ok: false, acquired: false,
+      reason: "dispatch lock unreadable — failing closed, retry shortly",
+    };
+  }
+  const heldBy = existing?.fields?.routed_to?.stringValue as string | undefined;
+  if (existing && dispatchLockIsHeld(existing.fields, now)) {
+    return {
+      ok: false, acquired: false,
+      reason: `Message is dispatch-locked to ${heldBy}`,
+      routedTo: heldBy ? String(heldBy).toLowerCase() : undefined,
+    };
+  }
+  try {
+    if (existing) await io.overwrite("dispatch_locks", messageId, fields, dispatcher);
+    else await io.create("dispatch_locks", messageId, fields, dispatcher);
+    return acquired;
+  } catch (e) {
+    if (isWriteContention(e)) {
+      return { ok: false, acquired: false, reason: `Message is dispatch-locked to ${heldBy || "another dispatcher"}` };
+    }
+    return { ok: false, acquired: false, reason: `dispatch lock write failed: ${errMsg(e)}` };
+  }
+}
+
+/** Set a lock on an outgoing message when routed_to or a single @bot mention is present.
+ *  Returns null when there is nothing to lock. Never throws. */
+export async function armOutgoingDispatchLock(
+  messageId: string,
+  text: string,
+  sender: string,
+  routedTo: string | undefined,
+  roster: Iterable<string>,
+  io?: LockSetIo,
+): Promise<SetLockResult | null> {
+  const target = (routedTo?.trim() || directMentionTarget(text, roster) || "").trim();
+  if (!messageId || !target) return null;
+  try {
+    return await setDispatchLock(messageId, target, sender, io ? { io } : undefined);
+  } catch {
+    return { ok: false, acquired: false, reason: "dispatch lock write failed" };
+  }
+}
+
+/** Mark a dispatch lock claimed (release). Returns false when there is nothing to claim
  *  (no lock doc) or the write failed — the reply already landed either way. */
 export async function markLockClaimed(
   replyToId: string,
@@ -590,6 +735,9 @@ export async function markLockClaimed(
     return false;
   }
 }
+
+/** Release alias — claimed locks are treated as open by checkDispatchLock and setDispatchLock. */
+export const releaseDispatchLock = markLockClaimed;
 
 // Shared evolution_logs doc — one builder, three tools
 function evoDoc(type: string, text: string) {
@@ -940,6 +1088,10 @@ const ROUTES: Array<{ type: string; bot: string; reason: string; re: RegExp }> =
     re: /\b(?:coordinat|plan(?:s|ning)?\b|organi[sz]e|manage|team|schedul)/ },
 ];
 
+function liveDispatchRoster(): string[] {
+  return [...DISPATCH_ROSTER, ...Object.keys(BOT_CREDS), ...ROUTES.map((r) => r.bot)];
+}
+
 const nameSchema = z.string().trim().min(1).max(40);
 const CHANNEL_COLLECTIONS = { room: MESSAGES, code: CODE, dm: DMS } as const;
 const channelSchema = z.enum(["room", "code", "dm"]).default("room")
@@ -987,10 +1139,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         text: messageTextSchema().describe(`Message text, posted in full (up to ${MESSAGE_MAX_CHARS.toLocaleString("en-US")} chars; long messages display collapsed with tap-to-expand).`),
         channel: channelSchema,
         reply_to: z.string().trim().min(1).optional().describe("Doc ID of the message being replied to (for threading + dispatch lock)"),
+        routed_to: z.string().trim().min(1).max(40).optional().describe("Lock this new message to one agent (dispatch). Overrides a single @bot mention."),
         idempotency_key: z.string().trim().min(1).max(100).optional().describe("Unique key to prevent duplicate sends"),
         attachments: z.array(attachmentInputSchema).max(5).optional().describe("File attachments: either metadata refs (storage_path + download_url) or inline data_base64 — the bridge uploads inline data to Cloudinary and stores the CDN URL."),
       } },
-    async ({ name, text, channel, reply_to, idempotency_key, attachments }) => {
+    async ({ name, text, channel, reply_to, routed_to, idempotency_key, attachments }) => {
       // Phase 3 Section D: Dispatch lock enforcement
       let lockCheck: LockCheck | null = null;
       if (reply_to) {
@@ -1056,21 +1209,28 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
           })) }
         };
       }
+      const armLock = async (messageId: string, isNew: boolean) => {
+        if (!isNew || !messageId) return;
+        await armOutgoingDispatchLock(messageId, text, name, routed_to, liveDispatchRoster());
+      };
       if (idempotency_key) {
         // Deterministic id + check-before-write (hollow #35): same key twice = one message.
         const coll = channelCollection(channel);
         const docId = idemDocId(channel, idempotency_key);
         const res = await writeIdempotent(coll, docId, body, name, idemIo);
+        await armLock(res.id, !res.duplicate);
         await claimLock();
         return { ok: true, duplicate: res.duplicate, id: res.id, name, ts: Date.now() };
       }
-      await firestore(`/${channelCollection(channel)}`, {
+      const posted = await firestore(`/${channelCollection(channel)}`, {
         method: "POST",
         body,
         forName: name,
-      });
+      }) as Doc;
+      const postedId = posted?.name ? docIdOf(posted.name) : "";
+      await armLock(postedId, true);
       await claimLock();
-      return { ok: true, name, ts: Date.now(), chars: text.length };
+      return { ok: true, name, ts: Date.now(), chars: text.length, id: postedId };
     });
 
   tool(server, "send_voice",
@@ -1091,12 +1251,20 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
 
   tool(server, "route_task",
-    { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it.",
-      inputSchema: { task: z.string().trim().min(1).max(2000) }, readOnly: true },
-    async ({ task }) => {
+    { title: "Route a task to the best AI", description: "Analyze a task and recommend which team AI should handle it. Pass message_id to acquire the dispatch lock for that message (a second dispatcher is blocked until the lock expires or is released).",
+      inputSchema: {
+        task: z.string().trim().min(1).max(2000),
+        message_id: z.string().trim().min(1).optional().describe("Existing message to lock to the recommended agent"),
+        name: nameSchema.optional().describe("Dispatcher name recorded on the lock"),
+      } },
+    async ({ task, message_id, name }) => {
       const hit = ROUTES.find((r) => r.re.test(task.toLowerCase()));
-      return { task, taskType: hit?.type ?? "general",
-        recommended: hit?.bot ?? "whisper", reason: hit?.reason ?? "default coordinator" };
+      const recommended = hit?.bot ?? "whisper";
+      const result: Record<string, unknown> = { task, taskType: hit?.type ?? "general",
+        recommended, reason: hit?.reason ?? "default coordinator" };
+      if (!message_id) return result;
+      result.lock = await setDispatchLock(message_id, recommended, name || "whisper");
+      return result;
     });
 
   tool(server, "edit_message",
