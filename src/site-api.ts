@@ -143,6 +143,10 @@ export interface SiteApiDeps {
   readTasks: (q: { limit: number; include_done: boolean }) => Promise<{
     count: number; open: number; tasks: unknown[];
   }>;
+  readPresence: () => Promise<unknown[]>;
+  readTyping: () => Promise<unknown[]>;
+  readNotes: () => Promise<unknown | null>;
+  readActivity: (limit: number) => Promise<unknown[]>;
   bus: SiteBus;
 }
 
@@ -177,6 +181,28 @@ export function createSiteApi(deps: SiteApiDeps) {
       } catch (e) {
         res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
       }
+    },
+    async presence(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      try { res.status(200).json({ ok: true, items: await deps.readPresence() }); }
+      catch (e) { res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) }); }
+    },
+    async typing(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      try { res.status(200).json({ ok: true, items: await deps.readTyping() }); }
+      catch (e) { res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) }); }
+    },
+    async notes(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      try { res.status(200).json({ ok: true, notes: await deps.readNotes() }); }
+      catch (e) { res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) }); }
+    },
+    async activity(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const limit = parseIntQuery(qstr(req.query.limit), 30, 1, 100);
+      if (limit === null) { res.status(400).json({ ok: false, error: "limit must be an integer 1-100" }); return; }
+      try { res.status(200).json({ ok: true, items: await deps.readActivity(limit) }); }
+      catch (e) { res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) }); }
     },
     async stream(req: SiteReq, res: SiteRes): Promise<void> {
       if (!(await requireUser(req, res, deps.verifyToken))) return;
