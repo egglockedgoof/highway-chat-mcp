@@ -6,7 +6,7 @@ import type { Store, StoreCollection, StoreDoc, StoreFields } from "../dist/stor
 const { createFirestoreStore } = await import("../dist/store/firestore.js");
 const { createPostgresStore, postgresPool, dbSchema, dbHostOf, pgTargets, probeDb, currentDbHealth, POOL_MAX } =
   await import("../dist/store/postgres.js");
-const { createStore, createDualWriteStore, dualWriteEnabled, storeBackend } = await import("../dist/store/index.js");
+const { createStore, createDualWriteStore, dualWriteEnabled, storeBackend, readPgCollections, readsFromPg } = await import("../dist/store/index.js");
 
 function memFs() {
   const docs = new Map<string, { name: string; fields: StoreFields }>();
@@ -78,6 +78,10 @@ test("createStore defaults to firestore; postgres without URL throws", () => {
   assert.equal(storeBackend({ STORE_BACKEND: "postgres" }), "postgres");
   assert.equal(dualWriteEnabled({}), false);
   assert.equal(dualWriteEnabled({ STORE_DUAL_WRITE: "1" }), true);
+  assert.deepEqual([...readPgCollections({})], []);
+  assert.deepEqual([...readPgCollections({ READ_PG_COLLECTIONS: "highway_messages, highway_tasks" })], ["highway_messages", "highway_tasks"]);
+  assert.equal(readsFromPg("highway_messages", {}), false);
+  assert.equal(readsFromPg("highway_messages", { READ_PG_COLLECTIONS: "highway_messages" }), true);
   const { fs } = memFs();
   assert.ok(createStore({ firestore: fs }));
   assert.throws(() => createStore({ backend: "postgres", databaseUrl: "" }), /DATABASE_URL/);
