@@ -29,6 +29,7 @@ import type { AuthRequest, CallerCtx } from './security.js';
 import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
+import { diagnose, cycleText } from "./reflect.js";
 import {
   validateSpec, renderUrl, shapeResponse, signSkill, parseRegistry, activeSkills,
   SKILL_PREFIX, MAX_SKILLS, type SkillSpec, type SkillEntry, type Registry,
@@ -1297,6 +1298,38 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         indexed[channel] = await brain.upsert(episodes).catch(brainErr);
       }
       return { ok: true, hours: hours || 24, indexed, ...(degraded.length ? { degraded } : {}) };
+    });
+
+  // ---- Reflection: observe meters, name the bottleneck, do not apply anything ----
+  tool(server, "reflect",
+    { title: "Reflect on live telemetry",
+      description: "Observe bridge and widget read meters, name the current bottleneck as a hypothesis, and propose one testable change. Never applies a change and never recommends paying for quota. Stores the cycle in the shared brain.",
+      inputSchema: {} },
+    async () => {
+      const b = readCache.snapshot();
+      const w = clientMeter.snapshot();
+      const cycle = diagnose({
+        day: b.day,
+        bridge: { reads: b.reads, budget: b.budget, overBudget: b.overBudget, cache: b.cache },
+        widget: { total: w.total, reporters: w.reporters, bySource: w.bySource },
+      });
+      rememberQuietly(cycleText(cycle), "idea", "reflect");
+      return { ok: true, ...cycle };
+    });
+
+  tool(server, "record_lesson",
+    { title: "Record whether a change helped",
+      description: "Close a reflection cycle: what we changed, what the meters did, and whether to keep it. Stored in the shared brain so the next session does not repeat a failed experiment.",
+      inputSchema: {
+        change: z.string().trim().min(1).max(500),
+        outcome: z.enum(["improved", "no_change", "worse"]),
+        evidence: z.string().trim().min(1).max(1000),
+        keep: z.boolean(),
+      } },
+    async ({ change, outcome, evidence, keep }) => {
+      const text = `${keep ? "Kept" : "Reverted"} (${outcome}): ${change} Evidence: ${evidence}`;
+      const m = await remember(text, "lesson", "record_lesson").catch(brainErr);
+      return { ok: true, id: m.id, keep, outcome };
     });
 
   // ---- Skills: the team grows the bridge ----
