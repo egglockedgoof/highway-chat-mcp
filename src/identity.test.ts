@@ -61,6 +61,63 @@ test('header_bound write accepts equivalent spellings of the bound name', () => 
   assert.equal(bad.code, 'identity_mismatch');
 });
 
+test('matchCallerToken scans every token (no early exit) and returns the bound bot', () => {
+  const first = 'a'.repeat(16);
+  const second = 'b'.repeat(16);
+  const third = 'c'.repeat(16);
+  const callers = { [first]: 'hollow', [second]: 'whisper', [third]: 'nyx' };
+  let compared = 0;
+  const equal = (a: string, b: string) => { compared += 1; return a === b; };
+  assert.equal(sec.matchCallerToken(first, callers, equal), 'hollow');
+  assert.equal(compared, 3, 'must compare all callers even after a hit');
+  compared = 0;
+  assert.equal(sec.matchCallerToken(third, callers, equal), 'nyx');
+  assert.equal(compared, 3);
+  compared = 0;
+  assert.equal(sec.matchCallerToken('z'.repeat(16), callers, equal), null);
+  assert.equal(compared, 3);
+  assert.equal(sec.matchCallerToken(first, {}), null);
+});
+
+test('spoofed name on the legacy path fails closed (Bearer is authoritative; no path fallback)', async () => {
+  const hollowToken = 'h'.repeat(32);
+  const resolveAuth = sec.createResolveAuth({
+    config: {
+      mcpCallers: { [hollowToken]: 'hollow' },
+      legacySecret: 's3cret-path',
+      legacyEnabled: true,
+    },
+    isSunset: () => false,
+    count: () => {},
+    recordLegacySignal: async () => {},
+  });
+  const spoofBearer = {
+    headersDistinct: { authorization: [`Bearer ${'x'.repeat(32)}`] },
+  };
+  const decoy = await resolveAuth(spoofBearer, '/mcp/s3cret-path');
+  assert.equal(decoy.kind, 'decoy', 'wrong Bearer on /mcp/<secret> must not fall back to path auth');
+
+  const bound = await resolveAuth(
+    { headersDistinct: { authorization: [`Bearer ${hollowToken}`] } },
+    '/mcp/s3cret-path',
+  );
+  assert.equal(bound.kind, 'ctx');
+  if (bound.kind !== 'ctx') throw new Error('expected ctx');
+  assert.equal(bound.ctx.method, 'header_bound');
+  assert.equal(bound.ctx.bot, 'hollow');
+
+  const gate = sec.createGate({
+    isSunset: () => false,
+    count: () => {},
+    readBot: 'whisper',
+    recordBoundUse: () => {},
+    recordLegacyName: () => {},
+  });
+  const spoofWrite = gate.resolveWrite(bound.ctx, 'whisper');
+  assert.equal(spoofWrite.ok, false);
+  assert.equal(spoofWrite.code, 'identity_mismatch');
+});
+
 test('buildFirestoreQuery repeats updateMask.fieldPaths (idempotency_key regression)', () => {
   const fields = ['name', 'text', 'ts', 'tsNum', 'deviceId', 'idempotency_key'];
   const q = sec.buildFirestoreQuery({ updateMask: fields });

@@ -130,17 +130,20 @@ const BOT_CREDS: Record<string, { email: string; password: string }> = (() => {
   catch { console.error("FATAL: BOT_CREDENTIALS is not valid JSON."); process.exit(1); }
 })();
 
-// MCP_CALLERS = JSON {token: bot}. A Bearer token binds the caller to one bot, so writes cannot
-// claim another name (identity_mismatch). The shared path secret lets any holder write as any
-// name; LEGACY_PATH_AUTH=off retires it once every bot has moved to a Bearer token.
+// MCP_CALLERS = JSON {token: bot}. Each token is 16+ chars and maps to one bot name
+// that already exists in BOT_CREDENTIALS. A Bearer token binds the caller to that bot
+// (identity_mismatch on a spoofed name). LEGACY_PATH_AUTH default "on" keeps
+// /mcp/<MCP_SECRET>; presented Bearer is still authoritative (no path fallback).
+// "off" (trim, case-insensitive) retires the path secret and requires MCP_CALLERS.
 export function parseAuthConfig(
   env: Record<string, string | undefined>,
   botCreds: Record<string, unknown>,
 ): { mcpCallers: Record<string, string>; legacyEnabled: boolean } {
   let mcpCallers: Record<string, string> = {};
-  if (env.MCP_CALLERS) {
+  const callersRaw = env.MCP_CALLERS?.trim();
+  if (callersRaw) {
     let parsed: unknown;
-    try { parsed = JSON.parse(env.MCP_CALLERS); } catch { throw new Error("MCP_CALLERS is not valid JSON"); }
+    try { parsed = JSON.parse(callersRaw); } catch { throw new Error("MCP_CALLERS is not valid JSON"); }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
         Object.values(parsed).some((v) => typeof v !== "string"))
       throw new Error("MCP_CALLERS must be a JSON object of token -> bot name");
@@ -151,7 +154,7 @@ export function parseAuthConfig(
     const missing = Object.values(mcpCallers).filter((b) => !credNames.has(normalizeBotName(b)));
     if (missing.length) throw new Error(`MCP_CALLERS bots without BOT_CREDENTIALS: ${missing.join(", ")}`);
   }
-  const legacyEnabled = (env.LEGACY_PATH_AUTH ?? "on").toLowerCase() !== "off";
+  const legacyEnabled = (env.LEGACY_PATH_AUTH ?? "on").trim().toLowerCase() !== "off";
   if (!legacyEnabled && !Object.keys(mcpCallers).length)
     throw new Error("LEGACY_PATH_AUTH=off requires MCP_CALLERS, or no caller can authenticate");
   return { mcpCallers, legacyEnabled };
