@@ -4,6 +4,7 @@ import {
   curatedWriter, normalizeBatch, parseCuratedItem, toNewsItems, itemsFromDocFields, CURATED_MAX_ITEMS,
 } from "../dist/curated-news.js";
 import { checkSystemScope } from "../dist/security.js";
+import { rejectCuratedBatch } from "../dist/privacy.js";
 
 const NOW = Date.parse("2026-10-10T12:00:00Z");
 
@@ -58,12 +59,24 @@ test("caps the batch", () => {
   assert.equal(normalizeBatch(raw, NOW).length, CURATED_MAX_ITEMS);
 });
 
-test("only a header-bound crew bot can write", () => {
+test("only Overheard or last30days with a bound token can write", () => {
   assert.equal(curatedWriter({ method: "header_bound", bot: "Overheard" }), "Overheard");
+  assert.equal(curatedWriter({ method: "header_bound", bot: "last30days" }), "last30days");
+  assert.equal(curatedWriter({ method: "header_bound", bot: "Nyx" }), null);
+  assert.equal(curatedWriter({ method: "header_bound", bot: "hollow" }), null);
   assert.equal(curatedWriter({ method: "path_legacy", bot: "Overheard" }), null);
   assert.equal(curatedWriter({ method: "header_legacy", bot: "Overheard" }), null);
   assert.equal(curatedWriter({ method: "header_bound", bot: null }), null);
   assert.equal(curatedWriter(null), null);
+});
+
+test("batch with private data in title or description is refused", () => {
+  const clean = item();
+  assert.equal(rejectCuratedBatch([clean]), null);
+  assert.match(rejectCuratedBatch([{ ...clean, title: "Wire nyx@highway.chat" }]) ?? "", /email in title/);
+  assert.match(rejectCuratedBatch([{ ...clean, description: "ssn 123-45-6789" }]) ?? "", /ssn in description/);
+  assert.match(rejectCuratedBatch([{ ...clean, description: "card 4111 1111 1111 1111" }]) ?? "", /card number/);
+  assert.match(rejectCuratedBatch([{ ...clean, title: "Meet at 44 Elm Road" }]) ?? "", /street address in title/);
 });
 
 test("system allowlist: curated read/write only on /system_config/crew_curated", () => {

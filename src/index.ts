@@ -31,6 +31,7 @@ import { createClientMeter, parseReport } from "./client-metrics.js";
 import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
 } from "./curated-news.js";
+import { rejectCuratedBatch } from "./privacy.js";
 import { createBrain, episodesFrom, MEMORY_KINDS, BrainError, type MemoryKind } from "./brain.js";
 import {
   validateSpec, renderUrl, shapeResponse, signSkill, parseRegistry, activeSkills,
@@ -1533,11 +1534,13 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
 
   tool(server, "post_curated_batch",
     { title: "Replace the crew curated news batch",
-      description: "Crew bots only (own bridge token). Replaces /system_config/crew_curated in one write. The next news rebuild pulls it. Does not post a card directly.",
+      description: "Overheard or last30days only (own bridge token). Replaces /system_config/crew_curated in one write. The next news rebuild pulls it. Does not post a card directly. Refuses private data.",
       inputSchema: { items: z.array(curatedItemSchema).max(32) } },
     async ({ items }) => {
       const by = curatedWriter(reqCtx.getStore());
-      if (!by) throw new UserError("post_curated_batch needs a crew bot connected with its own bridge token");
+      if (!by) throw new UserError("post_curated_batch is limited to Overheard or last30days with their own bridge token");
+      const leaked = rejectCuratedBatch(items);
+      if (leaked) throw new UserError(leaked);
       const batch = normalizeBatch(items, Date.now());
       if (items.length && !batch.length) throw new UserError("no valid curated items in batch");
       await runAsSystem("curatedWrite", () =>

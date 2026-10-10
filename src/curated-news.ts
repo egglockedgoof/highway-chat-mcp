@@ -1,6 +1,8 @@
 // Crew-curated news batch. One Firestore doc, whole-batch replace.
 // story_key is the stable id: latest published_at wins, expired rows drop.
 
+import { isEditor } from "./privacy.js";
+
 export const CURATED_DOC = "/system_config/crew_curated";
 export const CURATED_MAX_ITEMS = 32;
 
@@ -26,8 +28,8 @@ export interface CuratedNewsItem {
 }
 
 export function curatedWriter(ctx: { method?: string; bot?: string | null } | null | undefined): string | null {
-  if (ctx?.method === "header_bound" && ctx.bot) return ctx.bot;
-  return null;
+  if (ctx?.method !== "header_bound" || !ctx.bot || !isEditor(ctx.bot)) return null;
+  return ctx.bot;
 }
 
 export function parseCuratedItem(raw: unknown): CuratedItem | null {
