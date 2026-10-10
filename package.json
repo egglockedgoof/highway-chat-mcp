@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "test": "tsc && node --experimental-strip-types --no-warnings --test src/*.test.ts",
     "migrate": "node --experimental-strip-types --no-warnings scripts/migrate.ts",
+    "purge-push-subs": "node --experimental-strip-types --no-warnings scripts/purge-push-subs.ts",
     "smoke": "node --experimental-strip-types --no-warnings scripts/smoke.ts"
   },
   "engines": {
