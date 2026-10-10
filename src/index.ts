@@ -26,6 +26,7 @@ import {
   validateCallerConfig,
 } from './security.js';
 import type { AuthRequest, CallerCtx } from './security.js';
+import { createReadCache } from "./read-cache.js";
 // ============ FAIL-CLOSED ENV ============
 const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
@@ -322,7 +323,22 @@ async function getIdToken(forName?: string, forceRefresh?: boolean): Promise<str
 // validated URL → 401 retry. All Firestore access in this file goes through here.
 // Query strings are rejected in paths — use structured init (pageSize, documentId,
 // updateMask, precondition) instead.
-const firestore = sec.firestore;
+const envInt = (v: string | undefined, dflt: number): number => {
+  const n = Number(v);
+  return v !== undefined && v !== "" && Number.isInteger(n) && n >= 0 ? n : dflt;
+};
+const readCache = createReadCache(sec.firestore, {
+  ttlMs: envInt(process.env.READ_CACHE_TTL_MS, 15000),
+  budget: envInt(process.env.READ_BUDGET_DAILY, 20000),
+  maxEntries: 500,
+  identity: () => {
+    const ctx = reqCtx.getStore();
+    return ctx ? `${ctx.method}:${ctx.bot ?? ""}` : "anon";
+  },
+  onBudgetCrossed: (day, reads, budget) =>
+    console.warn(`[read-budget] ${day}: ${reads}/${budget} reads metered; cached reads now serve stale data`),
+});
+const firestore = readCache.firestore;
 
 const is404 = (e: unknown): boolean => e instanceof FirestoreError && e.status === 404;
 
@@ -1398,6 +1414,7 @@ function buildServer(): McpServer {
         online_now: presDocs.filter((d) => isOnline(tsOf(d.fields?.ts), now)).length,
         grimoire: nf ? { updatedBy: str(nf.updatedBy), ts: tsOf(nf.ts), chars: str(nf.content).length } : null,
         server_time: new Date().toISOString(),
+        bridge_reads: readCache.snapshot(),
         ...(degraded.length ? { degraded } : {}),
       };
     });
@@ -2367,7 +2384,10 @@ app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: R
 
 app.use(express.json({ limit: "2mb" })); // voice payloads exceed 64kb — 413 was a phantom
 
-app.get("/health", (_req, res) => { res.json({ ok: true }); });
+app.get("/health", (_req, res) => {
+  const { day, reads, budget, overBudget, cache } = readCache.snapshot();
+  res.json({ ok: true, reads: { day, reads, budget, overBudget, cache } });
+});
 
 app.get("/news", async (_req, res) => {
   try {

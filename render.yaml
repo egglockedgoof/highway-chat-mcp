@@ -17,3 +17,7 @@ services:
         sync: false
       - key: LEGACY_PATH_AUTH
         value: "on"
+      - key: READ_CACHE_TTL_MS
+        value: "15000"
+      - key: READ_BUDGET_DAILY
+        value: "20000"
