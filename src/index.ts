@@ -14,7 +14,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 import { lookup } from "node:dns/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -32,7 +32,7 @@ import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createUsageMeter } from "./usage.js";
 import {
-  currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema,
+  currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema, probeDb,
   dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
   backfillStatus, startMessagesBackfill,
   type Store, type StoreCollection, type StoreDoc,
@@ -538,6 +538,15 @@ export function idemDocId(channel: string, key: string): string {
   return `idem_${h}`;
 }
 
+/** Generate a Firestore-style 20-char alphanumeric document ID. */
+export function generateDocId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = randomBytes(20);
+  let id = "";
+  for (let i = 0; i < 20; i++) id += chars[bytes[i] % chars.length];
+  return id;
+}
+
 /** A write that lost its create-only race: someone else created the doc first. */
 export function isWriteContention(e: unknown): boolean {
   return e instanceof FirestoreError &&
@@ -924,7 +933,12 @@ async function querySince(collectionId: string, sinceTs: number, limit: number, 
 }
 
 // ============ SHARED MUTATION HELPERS ============
+// PG-first (Supabase): write to Postgres when available, Firestore only as fallback.
 async function patchFields(collectionId: string, docId: string, fields: Record<string, unknown>, forName?: string) {
+  if (pgStore && readsFromPg(collectionId)) {
+    await pgStore.patch(collectionId as StoreCollection, docId, fields as StoreFields);
+    return;
+  }
   await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, {
     method: "PATCH", body: { fields }, forName, updateMask: Object.keys(fields),
   });
@@ -932,12 +946,23 @@ async function patchFields(collectionId: string, docId: string, fields: Record<s
 
 // Read-modify-write under an updateTime precondition: concurrent writers retry instead of
 // silently overwriting each other (react_to_message and append_note used to lose updates).
+// PG-first: uses pgStore when available (no precondition support — simple read/mutate/write).
 async function mutateDoc(
   collectionId: string,
   docId: string,
   mutate: (current: Fields | null) => Record<string, unknown>,
   forName?: string
 ): Promise<Fields> {
+  if (pgStore && readsFromPg(collectionId)) {
+    const cur = await pgStore.get(collectionId as StoreCollection, docId);
+    const patch = mutate(cur?.fields ? storeFieldsToFields(cur.fields) : null);
+    if (cur) {
+      await pgStore.patch(collectionId as StoreCollection, docId, patch as StoreFields);
+    } else {
+      await pgStore.create(collectionId as StoreCollection, patch as StoreFields, docId);
+    }
+    return { ...((cur?.fields ? storeFieldsToFields(cur.fields) : {}) as Fields), ...patch } as Fields;
+  }
   for (let attempt = 0; ; attempt++) {
     const cur = await getDocOrNull(collectionId, docId, forName);
     const patch = mutate(cur?.fields ?? null);
@@ -1353,22 +1378,43 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       };
       if (idempotency_key) {
         // Deterministic id + check-before-write (hollow #35): same key twice = one message.
-        const coll = channelCollection(channel);
+        // Supabase-first (2026-10-10): check PG before Firestore.
+        const coll = channelCollection(channel) as StoreCollection;
         const docId = idemDocId(channel, idempotency_key);
-        const res = await writeIdempotent(coll, docId, body, name, idemIo);
+        let res: { duplicate: boolean; id: string };
+        if (pgStore && readsFromPg(coll)) {
+          const existing = await pgStore.get(coll, docId).catch(() => null);
+          if (existing) {
+            res = { duplicate: true, id: docId };
+          } else {
+            await pgStore.create(coll, body.fields, docId);
+            res = { duplicate: false, id: docId };
+          }
+        } else {
+          res = await writeIdempotent(coll, docId, body, name, idemIo);
+          mirrorToPg(coll, res.id, body.fields);
+        }
         await armLock(res.id, !res.duplicate);
         await claimLock();
         const ts = Date.now();
         channelCache.ingest(channel, { id: res.id, name, text, ts });
-        mirrorToPg(coll, res.id, body.fields);
         return { ok: true, duplicate: res.duplicate, id: res.id, name, ts };
       }
-      const posted = await firestore(`/${channelCollection(channel)}`, {
-        method: "POST",
-        body,
-        forName: name,
-      }) as Doc;
-      const postedId = posted?.name ? docIdOf(posted.name) : "";
+      // Supabase-first (2026-10-10): write to PG directly, no Firestore round-trip.
+      const coll = channelCollection(channel) as StoreCollection;
+      let postedId: string;
+      if (pgStore && readsFromPg(coll)) {
+        postedId = generateDocId();
+        await pgStore.create(coll, body.fields, postedId);
+      } else {
+        const posted = await firestore(`/${coll}`, {
+          method: "POST",
+          body,
+          forName: name,
+        }) as Doc;
+        postedId = posted?.name ? docIdOf(posted.name) : "";
+        mirrorToPg(coll, postedId, body.fields);
+      }
       await armLock(postedId, true);
       await claimLock();
       const ts = Date.now();
@@ -2347,7 +2393,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     });
 
   tool(server, "check_bridge_health",
-    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Firestore reachability.", readOnly: true,
+    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Supabase Postgres reachability.", readOnly: true,
       inputSchema: {} },
     async () => {
       const checks = {
@@ -2355,17 +2401,18 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         client_key: !!process.env.HIGHWAY_CLIENT_KEY,
         mcp_secret: !!process.env.MCP_SECRET,
         pinecone_key: !!process.env.PINECONE_API_KEY,
-        firestore_reachable: false,
+        postgres_reachable: false,
       };
-      let firestore_error: string | undefined;
+      let postgres_error: string | undefined;
       try {
-        await firestore(`/${EVO_LOGS}`, { method: "GET", pageSize: 1 });
-        checks.firestore_reachable = true;
+        const dbHealth = await probeDb();
+        checks.postgres_reachable = dbHealth === "ok";
+        if (dbHealth !== "ok") postgres_error = `postgres: ${dbHealth}`;
       } catch (e) {
-        firestore_error = errMsg(e);
+        postgres_error = errMsg(e);
         recordFailure("check_bridge_health", e);
       }
-      return { healthy: Object.values(checks).every(Boolean), checks, ...(firestore_error ? { firestore_error } : {}) };
+      return { healthy: Object.values(checks).every(Boolean), checks, ...(postgres_error ? { postgres_error } : {}) };
     });
 
   tool(server, "get_weather",
