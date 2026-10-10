@@ -2241,6 +2241,15 @@ async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string
   }
 }
 
+// Firebase Auth allows open email signup, so a valid ID token proves nothing about team
+// membership. Fails closed: an unset UPLOAD_ALLOWED_EMAILS refuses every upload.
+const UPLOAD_ALLOWED = new Set(
+  (process.env.UPLOAD_ALLOWED_EMAILS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
+
+export function uploadAllowed(email: string | undefined, allowed: ReadonlySet<string> = UPLOAD_ALLOWED): boolean {
+  return !!email && allowed.has(email.trim().toLowerCase());
+}
+
 /** Shared shape for attachment metadata stored in Firestore docs. */
 interface AttachmentMeta {
   id: string; filename: string; mime_type: string; size_bytes: number;
@@ -2313,6 +2322,7 @@ app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: R
     if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
     const who = await verifyFirebaseIdToken(m[1]);
     if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
+    if (!uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
     const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
     const att = await uploadAttachmentData({
       filename: typeof filename === "string" ? filename : "",

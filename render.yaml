@@ -11,3 +11,5 @@ services:
         sync: false
       - key: MCP_SECRET
         sync: false
+      - key: UPLOAD_ALLOWED_EMAILS
+        sync: false
