@@ -3206,6 +3206,23 @@ const siteApi = createSiteApi({
     if (input.reply_to) fields.reply_to = { stringValue: input.reply_to };
     if (input.attachments) fields.attachments = { stringValue: JSON.stringify(input.attachments) };
     await requirePgStore().create(coll, fields as StoreFields, id);
+    // Auto-cleanup: keep only latest 20 messages per channel (Sin's FIFO rule)
+    // When 21st arrives, delete the oldest (1st), keeping 2-21
+    try {
+      const store = requirePgStore();
+      const allDocs = await store.listNewest(coll, 1000);
+      if (allDocs.length > 20) {
+        // listNewest returns newest first, so slice(20) gets the oldest beyond 20
+        const toDelete = allDocs.slice(20);
+        for (const doc of toDelete) {
+          if (doc.id) {
+            await store.remove(coll, doc.id).catch(() => {});
+          }
+        }
+      }
+    } catch (e) {
+      // Cleanup is best-effort, don't fail the write
+    }
     siteBus.publish({ type: "message", channel });
     return { id };
   },
