@@ -77,6 +77,8 @@ function mockReq(auth?: string, query: Record<string, unknown> = {}) {
 }
 
 const extras = {
+  verifyCredentials: async () => false,
+  widgetToken: "widget-tok",
   readPresence: async () => [{ id: "p1", name: "sin" }],
   readTyping: async () => [],
   readNotes: async () => ({ content: "hi", updatedBy: "sin", ts: 1 }),
@@ -157,6 +159,43 @@ test("presence/notes require a token and return items", async () => {
   const notes = mockRes();
   await api.notes(mockReq("Bearer good").req, notes.res);
   assert.equal((notes.out.body as { notes: { content: string } }).notes.content, "hi");
+});
+
+test("login needs no token; valid credentials return the widget token", async () => {
+  const api = createSiteApi({
+    ...extras,
+    verifyToken: async () => null,
+    verifyCredentials: async (email, pw) => email === "sin@example.com" && pw === "s3cret",
+    widgetToken: "widget-tok",
+    readMessages: async () => ({ count: 0, messages: [], newest_ts: null }),
+    readTasks: async () => ({ count: 0, open: 0, tasks: [] }),
+    bus: createSiteBus(),
+  });
+  const loginReq = (body: unknown) => ({
+    header: () => undefined,
+    query: {},
+    body,
+    on(_e: "close", _fn: () => void) {},
+  });
+  // No body -> 400
+  const noBody = mockRes();
+  await api.login(loginReq(undefined), noBody.res);
+  assert.equal(noBody.out.status, 400);
+  // Missing fields -> 400
+  const missing = mockRes();
+  await api.login(loginReq({ email: "sin@example.com" }), missing.res);
+  assert.equal(missing.out.status, 400);
+  // Bad credentials -> 401, exact error string
+  const bad = mockRes();
+  await api.login(loginReq({ email: "sin@example.com", password: "wrong" }), bad.res);
+  assert.equal(bad.out.status, 401);
+  assert.deepEqual(bad.out.body, { ok: false, error: "Invalid credentials" });
+  // Good credentials -> 200 with the widget token, no bearer required
+  // (email is lowercased before verification)
+  const good = mockRes();
+  await api.login(loginReq({ email: "SIN@example.com", password: "s3cret" }), good.res);
+  assert.equal(good.out.status, 200);
+  assert.deepEqual(good.out.body, { ok: true, token: "widget-tok" });
 });
 
 test("startPgListen opens one LISTEN and fans payloads; empty url fails closed", async () => {

@@ -164,6 +164,10 @@ export async function startPgListen(opts: {
 
 export interface SiteApiDeps {
   verifyToken: (token: string) => Promise<SiteUser | null>;
+  /** Email/password check for POST /api/auth/login. True = credentials valid. */
+  verifyCredentials: (email: string, password: string) => Promise<boolean>;
+  /** Token handed to the browser after a successful login. */
+  widgetToken: string;
   readMessages: (q: { channel: SiteChannel; limit: number; since_ts?: number; mention?: string }) => Promise<{
     count: number; messages: unknown[]; newest_ts: number | null; cached?: boolean;
   }>;
@@ -380,6 +384,23 @@ export function createSiteApi(deps: SiteApiDeps) {
           ...(bstrOpt(b.updatedBy, 40) ? { updatedBy: bstr(b.updatedBy, 40)! } : {}),
         });
         res.status(200).json({ ok: true });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async login(req: SiteReq, res: SiteRes): Promise<void> {
+      // No bearer token required — this IS the login. Verifies email/password
+      // against highway_users and returns the widget token on success.
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const email = bstr(b.email, 320)?.toLowerCase();
+      const password = typeof b.password === "string" && b.password.length <= 500 ? b.password : "";
+      if (!email || !password) { res.status(400).json({ ok: false, error: "email and password are required" }); return; }
+      try {
+        const ok = await deps.verifyCredentials(email, password);
+        if (!ok) { res.status(401).json({ ok: false, error: "Invalid credentials" }); return; }
+        if (!deps.widgetToken) { res.status(503).json({ ok: false, error: "login unavailable: widget token not configured" }); return; }
+        res.status(200).json({ ok: true, token: deps.widgetToken });
       } catch (e) {
         res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
       }
