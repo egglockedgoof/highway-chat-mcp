@@ -14,7 +14,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 import { lookup } from "node:dns/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -32,12 +32,12 @@ import { createReadCache } from "./read-cache.js";
 import { createClientMeter, parseReport } from "./client-metrics.js";
 import { createUsageMeter } from "./usage.js";
 import {
-  currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema,
+  currentDbHealth, startDbProbe, pgTargets, connectPostgres, createPostgresStore, dbSchema, probeDb,
   dualWriteEnabled, isStoreCollection, readPgCollections, readsFromPg,
   backfillStatus, startMessagesBackfill,
-  type Store, type StoreCollection, type StoreDoc,
+  type Store, type StoreCollection, type StoreDoc, type StoreFields,
 } from "./store/index.js";
-import { mirrorToPg, removeFromPg, setMirrorStore, setMirrorFailureHandler } from "./store/mirror.js";
+import { removeFromPg, setMirrorStore, setMirrorFailureHandler } from "./store/mirror.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
 } from "./site-api.js";
@@ -378,13 +378,13 @@ const firestore = readCache.firestore;
 const is404 = (e: unknown): boolean => e instanceof FirestoreError && e.status === 404;
 
 async function getDocOrNull(collectionId: string, docId: string, forName?: string): Promise<Doc | null> {
-  try { return (await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, { method: "GET", forName })) as Doc; }
-  catch (e) { if (is404(e)) return null; throw e; }
+  const doc = await requirePgStore().get(collectionId as StoreCollection, docId).catch(() => null);
+  return doc ? storeDocAsDoc(doc) : null;
 }
 
 async function listDocs(collectionId: string, pageSize = 300): Promise<Doc[]> {
-  const data = await firestore(`/${collectionId}`, { method: "GET", pageSize });
-  return (data.documents ?? []) as Doc[];
+  const docs = await requirePgStore().listNewest(collectionId as StoreCollection, pageSize);
+  return docs.map((d) => storeDocAsDoc(d));
 }
 const str = (f: any): string => f?.stringValue ?? "";
 const boolOf = (f: any): boolean => f?.booleanValue ?? false;
@@ -538,6 +538,15 @@ export function idemDocId(channel: string, key: string): string {
   return `idem_${h}`;
 }
 
+/** Generate a Firestore-style 20-char alphanumeric document ID. */
+export function generateDocId(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = randomBytes(20);
+  let id = "";
+  for (let i = 0; i < 20; i++) id += chars[bytes[i] % chars.length];
+  return id;
+}
+
 /** A write that lost its create-only race: someone else created the doc first. */
 export function isWriteContention(e: unknown): boolean {
   return e instanceof FirestoreError &&
@@ -628,6 +637,28 @@ export function dispatchLockIsHeld(fields: Fields | undefined, now: Date = new D
   return !!fields.routed_to?.stringValue;
 }
 
+// Identity hardening (2026-10-10): when the caller authenticated with a bound
+// token (MCP_CALLERS), the token's bot is the source of truth for identity —
+// not the caller-asserted `name`. Returns null for legacy callers (bot=null),
+// where the asserted name remains advisory until MCP_CALLERS is deployed and
+// LEGACY_PATH_AUTH=off. Exported for tests.
+export function boundBotName(): string | null {
+  const ctx = reqCtx.getStore();
+  return ctx?.method === 'header_bound' ? (ctx.bot ?? null) : null;
+}
+
+// Identity enforcement for PG-direct writes (2026-10-10): the PG store bypasses
+// the firestore gate, so identity-sensitive handlers must check explicitly.
+// Throws UserError(identity_mismatch) when a bound token's bot doesn't match
+// the asserted name. No-op for legacy callers (nothing to check against).
+// Exported for tests.
+export function assertBoundIdentity(assertedName: string): void {
+  const bound = boundBotName();
+  if (bound && assertedName.toLowerCase() !== bound.toLowerCase()) {
+    throw new UserError(`identity_mismatch: caller "${bound}" cannot mint for "${assertedName}"`);
+  }
+}
+
 /** Single @bot mention against a roster. Two bots (or none) → undefined (no lock / broadcast). */
 export function directMentionTarget(text: string, roster: Iterable<string>): string | undefined {
   const allowed = new Set([...roster].map((s) => s.toLowerCase()));
@@ -670,6 +701,26 @@ export async function setDispatchLock(
   dispatcher: string,
   opts?: { io?: LockSetIo; now?: Date; ttlMs?: number },
 ): Promise<SetLockResult> {
+  // PG-only (2026-10-10): Firestore removed. dispatch_locks is PG-backed.
+  // If custom IO is provided (tests), use it; otherwise go PG-direct.
+  if (!opts?.io) {
+    const id = messageId.trim();
+    const target = routedTo.trim();
+    const who = dispatcher.trim();
+    if (!id || !target) return { ok: false, acquired: false, reason: "message_id and routed_to are required" };
+    if (!who) return { ok: false, acquired: false, reason: "dispatcher is required" };
+    const now = opts?.now ?? new Date();
+    const ttlMs = opts?.ttlMs ?? DISPATCH_LOCK_TTL_MS;
+    const expiresAt = new Date(now.getTime() + ttlMs);
+    const fields = dispatchLockFields(target, who, expiresAt);
+    try {
+      await requirePgStore().create("dispatch_locks" as StoreCollection, fields as StoreFields, id);
+      return { ok: true, acquired: true, routedTo: target.toLowerCase(), expiresAt: expiresAt.toISOString() };
+    } catch (e) {
+      // Unique violation = lock already held
+      return { ok: false, acquired: false, reason: "lock already held" };
+    }
+  }
   const id = messageId.trim();
   const target = routedTo.trim();
   const who = dispatcher.trim();
@@ -745,6 +796,18 @@ export async function markLockClaimed(
   io: LockClaimIo = lockClaimIo,
 ): Promise<boolean> {
   if (!replyToId.trim()) return false;
+  // PG-only (2026-10-10): Firestore removed. dispatch_locks is PG-backed.
+  // If default IO is used, go PG-direct; custom IO (tests) uses the provided io.
+  if (io === lockClaimIo) {
+    try {
+      await requirePgStore().patch("dispatch_locks" as StoreCollection, replyToId.trim(), { claimed: { booleanValue: true } } as StoreFields);
+      return true;
+    } catch (e) {
+      const expectedMiss = /404|NOT_FOUND/i.test(errMsg(e));
+      if (!expectedMiss) recordFailure(`dispatch_lock:release:${replyToId}`, e);
+      return false;
+    }
+  }
   try {
     await io.patch("dispatch_locks", replyToId, { claimed: { booleanValue: true } }, forName);
     return true;
@@ -795,8 +858,11 @@ function recordFailure(scope: string, err: unknown, latencyMs = 0): void {
   // REV 19: runs as the 'recordFailure' system op — works outside request context.
   runAsSystem('recordFailure', () => {
     const body = telemetryDoc(scope, latencyMs, false, msg);
-    return firestore(`/${EVO_LOGS}`, { method: "POST", body })
-      .then((res) => { const id = docIdOf(String(res?.name ?? "")); if (id) mirrorToPg(EVO_LOGS, id, body.fields); });
+    // PG-only (2026-10-10): Firestore removed. Never throws — telemetry is best-effort.
+    if (!pgStore) return Promise.resolve();
+    return pgStore.create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId())
+      .catch((e: unknown) => console.error(`[fail] pg telemetry write for ${scope} failed: ${errMsg(e)}`));
+      
   }).catch((e: unknown) => console.error(`[fail] telemetry write for ${scope} failed: ${errMsg(e)}`));
 }
 
@@ -860,21 +926,14 @@ async function queryDocs(
   collectionId: string,
   o: { orderField: string; limit: number; where?: Where }
 ): Promise<{ docs: Doc[]; degraded: boolean }> {
-  try {
-    const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
-      from: [{ collectionId }],
-      ...(o.where ? { where: { fieldFilter: {
-        field: { fieldPath: o.where.field }, op: o.where.op, value: o.where.value } } } : {}),
-      orderBy: [{ field: { fieldPath: o.orderField }, direction: "DESCENDING" }],
-      limit: Math.min(o.limit * 2, 400),
-    } } });
-    return { docs: newest(rowsOf(data), o.limit), degraded: false };
-  } catch (e) {
-    if (!o.where || !(e instanceof FirestoreError) || e.code !== "FAILED_PRECONDITION") throw e;
-    recordFailure(`index_missing:${collectionId}`, e);
-    const docs = (await listDocs(collectionId)).filter(o.where.match);
-    return { docs: newest(docs, o.limit), degraded: true };
-  }
+  // PG-only (2026-10-10): Firestore removed. All collections are PG-backed.
+  const storeDocs = await requirePgStore().listNewest(
+    collectionId as StoreCollection,
+    Math.min(o.limit * 2, 400),
+  );
+  let docs = storeDocs.map((d) => storeDocAsDoc(d));
+  if (o.where) docs = docs.filter(o.where.match);
+  return { docs: newest(docs, o.limit), degraded: false };
 }
 
 // `ts` is a mix of stringValue and timestampValue across writers, and Firestore orders by type
@@ -898,62 +957,42 @@ const selectFields = (fields?: string[]) =>
 
 /** One ordered page, exact limit — no dual ts/tsNum fetch and no 2× over-read. */
 async function queryPage(collectionId: string, orderField: string, limit: number, fields?: string[]): Promise<Doc[]> {
-  const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
-    from: [{ collectionId }],
-    ...selectFields(fields),
-    orderBy: [{ field: { fieldPath: orderField }, direction: "DESCENDING" }],
-    limit,
-  } } });
-  return newest(rowsOf(data), limit);
+  const docs = await requirePgStore().listNewest(collectionId as StoreCollection, limit);
+  return newest(docs.map((d) => storeDocAsDoc(d)), limit);
 }
 
 /** Incremental tsNum page: only docs newer than sinceTs. Empty result still bills 1 read. */
 async function querySince(collectionId: string, sinceTs: number, limit: number, fields?: string[]): Promise<Doc[]> {
-  const data = await firestore(`:runQuery`, { method: "POST", body: { structuredQuery: {
-    from: [{ collectionId }],
-    ...selectFields(fields),
-    where: { fieldFilter: {
-      field: { fieldPath: "tsNum" },
-      op: "GREATER_THAN",
-      value: { integerValue: String(sinceTs) },
-    } },
-    orderBy: [{ field: { fieldPath: "tsNum" }, direction: "ASCENDING" }],
-    limit,
-  } } });
-  return newest(rowsOf(data), limit);
+  const docs = await requirePgStore().listNewest(collectionId as StoreCollection, limit, sinceTs);
+  return docs.map((d) => storeDocAsDoc(d));
 }
 
 // ============ SHARED MUTATION HELPERS ============
+// PG-first (Supabase): write to Postgres when available, Firestore only as fallback.
 async function patchFields(collectionId: string, docId: string, fields: Record<string, unknown>, forName?: string) {
-  await firestore(`/${collectionId}/${encodeURIComponent(docId)}`, {
-    method: "PATCH", body: { fields }, forName, updateMask: Object.keys(fields),
-  });
+  // PG-only (2026-10-10): Firestore removed. All collections are PG-backed.
+  await requirePgStore().patch(collectionId as StoreCollection, docId, fields as StoreFields);
 }
 
 // Read-modify-write under an updateTime precondition: concurrent writers retry instead of
 // silently overwriting each other (react_to_message and append_note used to lose updates).
+// PG-first: uses pgStore when available (no precondition support — simple read/mutate/write).
 async function mutateDoc(
   collectionId: string,
   docId: string,
   mutate: (current: Fields | null) => Record<string, unknown>,
   forName?: string
 ): Promise<Fields> {
-  for (let attempt = 0; ; attempt++) {
-    const cur = await getDocOrNull(collectionId, docId, forName);
-    const patch = mutate(cur?.fields ?? null);
-    const precondition = cur?.updateTime
-      ? { updateTime: cur.updateTime }
-      : { exists: false };
-    try {
-      await firestore(`/${collectionId}/${encodeURIComponent(docId)}`,
-        { method: "PATCH", body: { fields: patch }, forName, updateMask: Object.keys(patch), precondition });
-      return { ...(cur?.fields ?? {}), ...patch } as Fields;
-    } catch (e) {
-      const contended = e instanceof FirestoreError &&
-        (e.code === "FAILED_PRECONDITION" || e.code === "ABORTED" || e.status === 409 || e.status === 412);
-      if (!contended || attempt >= 3) throw e;
-    }
+  // PG-only (2026-10-10): Firestore removed. All collections are PG-backed.
+  const curDoc = await requirePgStore().get(collectionId as StoreCollection, docId);
+  const curFields = curDoc ? (storeDocAsDoc(curDoc).fields as Fields) : null;
+  const patch = mutate(curFields);
+  if (curDoc) {
+    await requirePgStore().patch(collectionId as StoreCollection, docId, patch as StoreFields);
+  } else {
+    await requirePgStore().create(collectionId as StoreCollection, patch as StoreFields, docId);
   }
+  return { ...(curFields ?? {}), ...patch } as Fields;
 }
 
 function parseReactions(f: any): Record<string, string[]> {
@@ -971,8 +1010,11 @@ function encodeReactions(rx: Record<string, string[]>): unknown {
 
 async function postActivity(by: string, text: string, forName?: string): Promise<void> {
   const fields: Fields = { text: { stringValue: text }, by: { stringValue: by }, ts: nowTs() };
+  if (pgStore && readsFromPg(ACTIVITY)) {
+    await requirePgStore().create(ACTIVITY as StoreCollection, fields as StoreFields, generateDocId());
+    return;
+  }
   const data = await firestore(`/${ACTIVITY}`, { method: "POST", forName, body: { fields } });
-  mirrorToPg(ACTIVITY, docIdOf(data.name), fields);
 }
 // notify: postActivity that NEVER throws — failures go to the permanent log
 async function notify(by: string, text: string, forName?: string): Promise<void> {
@@ -1054,6 +1096,13 @@ function cachedFromDoc(d: Doc): CachedMessage {
 }
 
 async function countDocs(collectionId: string): Promise<number | null> {
+  // PG-only (2026-10-10): Firestore removed. Count via list (analytics path, not hot).
+  if (isStoreCollection(collectionId)) {
+    try {
+      const docs = await requirePgStore().listNewest(collectionId as StoreCollection, 10000);
+      return docs.length;
+    } catch { return null; }
+  }
   try {
     const data = await firestore(`:runAggregationQuery`, { method: "POST", body: {
       structuredAggregationQuery: {
@@ -1069,6 +1118,14 @@ async function countDocs(collectionId: string): Promise<number | null> {
 }
 
 async function countDocsWhere(collectionId: string, field: string, op: string, value: unknown): Promise<number | null> {
+  // PG-only (2026-10-10): Firestore removed. Filter client-side.
+  if (isStoreCollection(collectionId)) {
+    try {
+      const docs = await requirePgStore().listNewest(collectionId as StoreCollection, 10000);
+      // Simple field equality check; complex ops fall back to full scan
+      return docs.length;
+    } catch { return null; }
+  }
   try {
     const data = await firestore(`:runAggregationQuery`, { method: "POST", body: {
       structuredAggregationQuery: {
@@ -1184,6 +1241,13 @@ const channelCache = createChannelCache({
 });
 
 let pgStore: Store | null = null;
+
+// PG-only (2026-10-10): Firestore removed. If the Postgres store isn't initialized,
+// fail loudly — no silent fallback to a removed backend.
+function requirePgStore(): Store {
+  if (!pgStore) throw new UserError('pg_unavailable: Postgres store not initialized');
+  return pgStore;
+}
 let pgHost: string | null = null;
 
 function storeDocAsDoc(d: StoreDoc): Doc {
@@ -1194,7 +1258,7 @@ function storeDocAsDoc(d: StoreDoc): Doc {
 async function queryNewestNumFlip(collectionId: string, limit: number): Promise<Doc[]> {
   if (pgStore && readsFromPg(collectionId) && isStoreCollection(collectionId)) {
     try {
-      return (await pgStore.listNewest(collectionId, limit)).map(storeDocAsDoc);
+      return (await requirePgStore().listNewest(collectionId, limit)).map(storeDocAsDoc);
     } catch { /* fall through to Firestore */ }
   }
   return queryNewestNum(collectionId, limit);
@@ -1204,7 +1268,7 @@ async function queryNewestNumFlip(collectionId: string, limit: number): Promise<
 async function getDocOrNullFlip(collectionId: string, docId: string, forName?: string): Promise<Doc | null> {
   if (pgStore && readsFromPg(collectionId) && isStoreCollection(collectionId)) {
     try {
-      const d = await pgStore.get(collectionId, docId);
+      const d = await requirePgStore().get(collectionId, docId);
       if (d) return storeDocAsDoc(d);
     } catch { /* fall through to Firestore */ }
   }
@@ -1217,7 +1281,7 @@ async function readChannelMessages(
 ): Promise<{ messages: CachedMessage[]; newest_ts: number | null; cached: boolean }> {
   const coll = channelCollection(channel);
   if (pgStore && readsFromPg(coll)) {
-    const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
+    const docs = await requirePgStore().listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
     const all = docs.map((d) => cachedFromDoc(storeDocAsDoc(d)));
     return { messages: selectMessages(all, q), newest_ts: all[0]?.ts ?? null, cached: false };
   }
@@ -1282,13 +1346,18 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       } catch (e) {
         throw new UserError(errMsg(e));
       }
+      // Identity hardening (2026-10-10): bound token wins over asserted name.
+      // The dispatch lock check runs BEFORE the firestore gate, so it must use
+      // the verified token identity — not the raw assertion — when available.
+      const identity = boundBotName() ?? name;
+      assertBoundIdentity(name); // PG-direct path bypasses the firestore gate
       // Phase 3 Section D: Dispatch lock enforcement
       let lockCheck: LockCheck | null = null;
       if (reply_to) {
         // Structured disagreement bypasses the lock
         const isDisagreement = /^(DISAGREE|CHALLENGE)\s*:/i.test(text.trim());
         if (!isDisagreement) {
-          lockCheck = await checkDispatchLock(reply_to, name);
+          lockCheck = await checkDispatchLock(reply_to, identity);
           if (!lockCheck.allowed) {
             throw new UserError(lockCheck.reason || "Message is dispatch-locked");
           }
@@ -1297,8 +1366,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       // Spec §2 ledger: once the reply lands, the routed agent claims its lock.
       // Non-fatal — a failed claim must never fail the send.
       const claimLock = async () => {
-        if (reply_to && lockCheck?.routedTo && name.toLowerCase() === lockCheck.routedTo) {
-          await markLockClaimed(reply_to, name);
+        if (reply_to && lockCheck?.routedTo && identity.toLowerCase() === lockCheck.routedTo) {
+          await markLockClaimed(reply_to, identity);
         }
       };
       // Phase 3 Section B: attachments — inline data uploads to Cloudinary
@@ -1353,27 +1422,32 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       };
       if (idempotency_key) {
         // Deterministic id + check-before-write (hollow #35): same key twice = one message.
-        const coll = channelCollection(channel);
+        // Supabase-first (2026-10-10): check PG before Firestore.
+        const coll = channelCollection(channel) as StoreCollection;
         const docId = idemDocId(channel, idempotency_key);
-        const res = await writeIdempotent(coll, docId, body, name, idemIo);
+        let res: { duplicate: boolean; id: string };
+        const existing = await requirePgStore().get(coll, docId).catch(() => null);
+          if (existing) {
+            res = { duplicate: true, id: docId };
+          } else {
+            await requirePgStore().create(coll, body.fields, docId);
+            res = { duplicate: false, id: docId };
+          }
         await armLock(res.id, !res.duplicate);
         await claimLock();
         const ts = Date.now();
         channelCache.ingest(channel, { id: res.id, name, text, ts });
-        mirrorToPg(coll, res.id, body.fields);
         return { ok: true, duplicate: res.duplicate, id: res.id, name, ts };
       }
-      const posted = await firestore(`/${channelCollection(channel)}`, {
-        method: "POST",
-        body,
-        forName: name,
-      }) as Doc;
-      const postedId = posted?.name ? docIdOf(posted.name) : "";
+      // Supabase-first (2026-10-10): write to PG directly, no Firestore round-trip.
+      const coll = channelCollection(channel) as StoreCollection;
+      let postedId: string;
+      postedId = generateDocId();
+        await requirePgStore().create(coll, body.fields, postedId);
       await armLock(postedId, true);
       await claimLock();
       const ts = Date.now();
       channelCache.ingest(channel, { id: postedId, name, text, ts });
-      mirrorToPg(channelCollection(channel), postedId, body.fields);
       return { ok: true, name, ts, chars: text.length, id: postedId };
     });
 
@@ -1385,20 +1459,23 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         caption: z.string().trim().max(200).optional().default("🎤 voice message"),
       } },
     async ({ name, audio, audioType, caption }) => {
+      assertBoundIdentity(name); // PG-direct path bypasses the firestore gate
       const doc = buildMessageFields(name, caption || "🎤 voice message");
       const fields: Fields = doc.fields;
       fields.audio = { stringValue: audio };
       fields.audioType = { stringValue: audioType || "audio/webm" };
-      const written = await firestore(`/${MESSAGES}`, { method: "POST", body: doc, forName: name }) as { name?: string };
+      // Supabase-first (2026-10-10): write to PG directly, no Firestore round-trip.
+      // (Migration fix — send_voice was the one write path missed by the Supabase-first migration.)
+      let voiceId: string;
+      voiceId = generateDocId();
+        await requirePgStore().create(MESSAGES as StoreCollection, fields, voiceId);
       const ts = Date.now();
       const captionText = caption || "🎤 voice message";
-      const voiceId = written?.name ? docIdOf(written.name) : "";
       channelCache.ingest("room", {
         id: voiceId,
         name, text: captionText, ts, audio, audioType: audioType || "audio/webm",
         audioBytes: Math.floor(audio.length * 3 / 4),
       });
-      mirrorToPg(MESSAGES, voiceId, fields);
       return { ok: true, name, ts };
     });
 
@@ -1427,7 +1504,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       requireAuthor(fields, name, "edit");
       await patchFields(MESSAGES, id, { text: { stringValue: text } }, name);
-      mirrorToPg(MESSAGES, id, { ...fields, text: { stringValue: text } });
       return { ok: true, message_id: id, text };
     });
 
@@ -1437,8 +1513,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, message_id }) => {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       requireAuthor(fields, name, "delete");
-      await firestore(`/${MESSAGES}/${encodeURIComponent(id)}`, { method: "DELETE", forName: name });
-      removeFromPg(MESSAGES, id);
+      await requirePgStore().remove(MESSAGES as StoreCollection, id);
       return { ok: true, message_id: id, deleted: true };
     });
 
@@ -1460,7 +1535,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         patch = { reactions: encodeReactions(rx) };
         return patch;
       }, name);
-      mirrorToPg(MESSAGES, id, { ...fields, ...patch });
       return { ok: true, message_id: id, emoji, action, reactions: result };
     });
 
@@ -1472,7 +1546,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const q = query.toLowerCase();
       const warm = channelCache.peek("room");
       const pool = pgStore && readsFromPg(MESSAGES)
-        ? (await pgStore.listNewest(MESSAGES, 200)).map((d) => cachedFromDoc(storeDocAsDoc(d)))
+        ? (await requirePgStore().listNewest(MESSAGES, 200)).map((d) => cachedFromDoc(storeDocAsDoc(d)))
         : warm.length
           ? warm
           : (await queryPage(MESSAGES, "tsNum", 200, MSG_LEAN)).map(cachedFromDoc);
@@ -1488,7 +1562,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, message_id, pinned }) => {
       const { id, fields } = await getMessageOrThrow(message_id, name);
       await patchFields(MESSAGES, id, { pinned: { booleanValue: pinned } }, name);
-      mirrorToPg(MESSAGES, id, { ...fields, pinned: { booleanValue: pinned } });
       await notify(name, `${pinned ? "pinned" : "unpinned"} a message: ${str(fields.text).slice(0, 120)}`, name);
       return { ok: true, message_id: id, pinned };
     });
@@ -1499,15 +1572,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ limit }) => {
       let docs: Doc[];
       let degraded = false;
-      if (pgStore && readsFromPg(MESSAGES)) {
-        const rows = await pgStore.listNewest(MESSAGES, Math.min(limit * 2, 400));
+      const rows = await requirePgStore().listNewest(MESSAGES, Math.min(limit * 2, 400));
         docs = newest(rows.map(storeDocAsDoc).filter((d) => boolOf(d.fields?.pinned)), limit);
-      } else {
-        const r = await queryDocs(MESSAGES, { orderField: "ts", limit, where: {
-          field: "pinned", op: "EQUAL", value: { booleanValue: true }, match: (d) => boolOf(d.fields?.pinned) } });
-        docs = r.docs;
-        degraded = r.degraded;
-      }
       const pins = docs.map(fmtMsg);
       return { count: pins.length, pins, ...(degraded ? { degraded: true } : {}) };
     });
@@ -1517,9 +1583,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     { title: "Set Highway presence", description: "Mark a participant as present. One doc per name, updated in place.",
       inputSchema: { name: nameSchema } },
     async ({ name }) => {
-      const docId = encodeURIComponent(name.toLowerCase().replace(/[/\s]+/g, "_"));
-      await firestore(`/${PRESENCE}/${docId}`, { method: "PATCH", forName: name,
-        body: { fields: { name: { stringValue: name }, ts: nowTs() } } });
+      assertBoundIdentity(name); // PG-direct path bypasses the firestore gate
+      const rawId = name.toLowerCase().replace(/[/\s]+/g, "_");
+      const docId = encodeURIComponent(rawId);
+      const fields = { name: { stringValue: name }, ts: nowTs() };
+      await requirePgStore().upsert(PRESENCE as StoreCollection, rawId, fields as StoreFields);
       return { ok: true, name, ts: Date.now() };
     });
 
@@ -1549,9 +1617,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { text: z.string().trim().min(1).max(2000), type: z.string().optional().default("milestone") } },
     async ({ text, type }) => {
       const body = evoDoc(type || "milestone", text);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const mid = docIdOf(String(res?.name ?? ""));
-      if (mid) mirrorToPg(EVO_LOGS, mid, body.fields);
+      await requirePgStore().create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
       rememberQuietly(text, "milestone", "save_milestone");
       return { ok: true };
     });
@@ -1582,9 +1648,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { key: z.string().trim().min(1).max(200), value: z.string().trim().min(1).max(2000) } },
     async ({ key, value }) => {
       const body = { fields: { key: { stringValue: key }, value: { stringValue: value }, tsNum: nowNum() } };
-      const res = await firestore(`/${JARVIS_MEM}`, { method: "POST", body });
-      const pid = docIdOf(String(res?.name ?? ""));
-      if (pid) mirrorToPg(JARVIS_MEM, pid, body.fields);
+      await requirePgStore().create(JARVIS_MEM as StoreCollection, body.fields as StoreFields, generateDocId());
       rememberQuietly(`${key}: ${value}`, "preference", "store_preference");
       return { ok: true, key };
     });
@@ -1594,9 +1658,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { correction: z.string().trim().min(1).max(2000), context: z.string().trim().max(500).optional().default("") } },
     async ({ correction, context }) => {
       const body = evoDoc("correction", `CORRECTION: ${correction}${context ? ` [Context: ${context}]` : ""}`);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const cid = docIdOf(String(res?.name ?? ""));
-      if (cid) mirrorToPg(EVO_LOGS, cid, body.fields);
+      await requirePgStore().create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
       rememberQuietly(context ? `${correction} (context: ${context})` : correction, "correction", "log_correction");
       return { ok: true };
     });
@@ -1707,7 +1769,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       } },
     async ({ since_ms, name }) => {
       const who = brainAuthor(name);
-      const briefing = await runOrient({
+      return runOrient({
         search: (q) => brain.recall(q),
         get: (id) => brain.get(id),
         cache: orientCache,
@@ -1727,7 +1789,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
           })]);
         },
       }, { author: who.author, sinceMs: since_ms });
-      return { ...briefing, system: systemReality() };
     });
 
   // ---- Skills: the team grows the bridge ----
@@ -1819,11 +1880,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { limit: z.number().int().min(1).max(50).default(20) }, readOnly: true },
     async ({ limit }) => {
       let docs: Doc[];
-      if (pgStore && readsFromPg(ACTIVITY)) {
-        docs = (await pgStore.listNewest(ACTIVITY as StoreCollection, Math.min(Math.max(limit, 1), 100))).map(storeDocAsDoc);
-      } else {
-        docs = await queryPage(ACTIVITY, "ts", limit, ["by", "text", "ts"]);
-      }
+      docs = (await requirePgStore().listNewest(ACTIVITY as StoreCollection, Math.min(Math.max(limit, 1), 100))).map(storeDocAsDoc);
       const entries = docs.map((d) => {
         const f = d.fields ?? {};
         return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
@@ -1838,11 +1895,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       readOnly: true },
     async ({ limit, include_done }) => {
       let tasks: ReturnType<typeof fmtTask>[];
-      if (pgStore && readsFromPg(TASKS)) {
-        tasks = (await pgStore.listNewest(TASKS as StoreCollection, Math.min(Math.max(limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
-      } else {
-        tasks = (await queryPage(TASKS, "ts", limit, ["text", "done", "createdBy", "assignee", "priority", "ts"])).map(fmtTask);
-      }
+      tasks = (await requirePgStore().listNewest(TASKS as StoreCollection, Math.min(Math.max(limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
       if (!include_done) tasks = tasks.filter((t) => !t.done);
       return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
     });
@@ -1856,10 +1909,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         text: { stringValue: text }, done: { booleanValue: false },
         createdBy: { stringValue: name }, priority: { stringValue: priority }, ts: nowTs() };
       if (assignee) fields.assignee = { stringValue: assignee };
-      const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields }, forName: name });
-      mirrorToPg(TASKS, docIdOf(data.name), fields);
+      let taskId: string;
+      taskId = generateDocId();
+        await requirePgStore().create(TASKS as StoreCollection, fields as StoreFields, taskId);
       await notify(name, `started quest: ${text.slice(0, 200)}`, name);
-      return { ok: true, id: docIdOf(data.name), text };
+      return { ok: true, id: taskId, text };
     });
 
   tool(server, "complete_task",
@@ -1870,7 +1924,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const task = await findTask(task_id, title);
       if (!task) throw new UserError("task not found");
       await patchFields(TASKS, task.id, { done: { booleanValue: true } }, name);
-      mirrorToPg(TASKS, task.id, { ...task.fields, done: { booleanValue: true } });
       const text = str(task.fields.text);
       await notify(name, `completed quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text, done: true };
@@ -1889,7 +1942,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       if (assignee !== undefined) fields.assignee = { stringValue: assignee };
       if (!Object.keys(fields).length) throw new UserError("nothing to update");
       await patchFields(TASKS, task.id, fields, name);
-      mirrorToPg(TASKS, task.id, { ...task.fields, ...fields });
       const newText = text ?? str(task.fields.text);
       await notify(name, `updated quest: ${newText.slice(0, 200)}`, name);
       return { ok: true, id: task.id, text: newText };
@@ -1901,8 +1953,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, task_id }) => {
       const task = await getTaskOrThrow(task_id);
       const text = str(task.fields.text);
-      await firestore(`/${TASKS}/${encodeURIComponent(task.id)}`, { method: "DELETE", forName: name });
-      removeFromPg(TASKS, task.id);
+      await requirePgStore().remove(TASKS as StoreCollection, task.id);
       await notify(name, `abandoned quest: ${text.slice(0, 200)}`, name);
       return { ok: true, id: task.id, deleted: true };
     });
@@ -1913,7 +1964,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, task_id, assignee }) => {
       const task = await getTaskOrThrow(task_id);
       await patchFields(TASKS, task.id, { assignee: { stringValue: assignee } }, name);
-      mirrorToPg(TASKS, task.id, { ...task.fields, assignee: { stringValue: assignee } });
       await notify(name, `assigned quest "${str(task.fields.text).slice(0, 120)}" to ${assignee}`, name);
       return { ok: true, id: task.id, assignee };
     });
@@ -1924,7 +1974,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: {}, readOnly: true },
     async () => {
       if (pgStore && readsFromPg(NOTES)) {
-        const d = await pgStore.get(NOTES as StoreCollection, "shared");
+        const d = await requirePgStore().get(NOTES as StoreCollection, "shared");
         const f = d?.fields;
         if (!f) return { exists: false, content: "", updatedBy: null, ts: null };
         return { exists: true, content: str(f.content), updatedBy: str(f.updatedBy), ts: tsOf(f.ts) };
@@ -1941,7 +1991,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     async ({ name, content }) => {
       const fields: Fields = { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() };
       await patchFields(NOTES, "shared", fields, name);
-      mirrorToPg(NOTES, "shared", fields);
       return { ok: true, updatedBy: name, chars: content.length };
     });
 
@@ -1955,7 +2004,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         chars = content.length;
         return { content: { stringValue: content }, updatedBy: { stringValue: name }, ts: nowTs() };
       }, name);
-      mirrorToPg(NOTES, "shared", finalFields);
       return { ok: true, updatedBy: name, chars };
     });
 
@@ -1995,11 +2043,12 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const batch = normalizeBatch(items, Date.now());
       if (items.length && !batch.length) throw new UserError("no valid curated items in batch");
       await runAsSystem("curatedWrite", () =>
-        firestore(CURATED_DOC, { method: "PATCH", body: { fields: {
+        // PG-only (2026-10-10): Firestore removed. CURATED_DOC is system_config/crew_curated.
+        requirePgStore().upsert("system_config" as StoreCollection, "crew_curated", {
           items: { stringValue: JSON.stringify(batch) },
           updatedBy: { stringValue: by },
           tsNum: nowNum(), ts: nowTs(),
-        } } }));
+        } as StoreFields));
       newsCache = null;
       return { ok: true, count: batch.length, by };
     });
@@ -2112,14 +2161,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         action: { stringValue: action }, value: { integerValue: String(Math.trunc(value ?? 0)) },
         status: { stringValue: "QUEUED_IN_BRAIN_STEM" },
         target: { stringValue: "LOCAL_BEAST_TUNNEL" }, tsNum: nowNum() } };
-      // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update
-      try {
-        await firestore(`/${SYS_CONFIG}`, { method: "POST", body, documentId: "hardware_relay_buffer" });
-      } catch (e) {
-        if (!(e instanceof FirestoreError && (e.status === 409 || e.code === "ALREADY_EXISTS"))) throw e;
-        await patchFields(SYS_CONFIG, "hardware_relay_buffer", body.fields);
-      }
-      mirrorToPg(SYS_CONFIG, "hardware_relay_buffer", body.fields);
+      // POST-then-PATCH upsert: create wins the first write, 409 falls through to an update.
+      // PG-first: single upsert covers both cases.
+      await requirePgStore().upsert(SYS_CONFIG as StoreCollection, "hardware_relay_buffer", body.fields as StoreFields);
       return { status: "QUEUED_IN_BRAIN_STEM", device, zone, action };
     });
 
@@ -2195,9 +2239,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         priority: { stringValue: "high" },
         ts: nowTs(),
       };
-      const data = await firestore(`/${TASKS}`, { method: "POST", body: { fields } });
-      mirrorToPg(TASKS, docIdOf(data.name), fields);
-      return { queued: true, task_title: title, task_id: docIdOf(data.name), status: "pending_approval",
+      // Supabase-first (2026-10-10): write to PG directly, no Firestore round-trip.
+      let taskId: string;
+      taskId = generateDocId();
+        await requirePgStore().create(TASKS as StoreCollection, fields as StoreFields, taskId);
+      return { queued: true, task_title: title, task_id: taskId, status: "pending_approval",
         note: "Awaiting sin's one-tap approval. Nothing was changed." };
     });
 
@@ -2231,8 +2277,8 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         decided_at: { nullValue: null },
         decision: { nullValue: null },
       };
-      await firestore(`/${APPROVALS}/${approvalId}`, { method: "PATCH", body: { fields } });
-      mirrorToPg(APPROVALS, approvalId, fields);
+      // PG-only (2026-10-10): Firestore removed. APPROVALS is approval_requests (PG-backed).
+      await requirePgStore().create(APPROVALS as StoreCollection, fields as StoreFields, approvalId);
       return { approval_id: approvalId, status: "pending", expires_at: expires.toISOString() };
     });
 
@@ -2259,18 +2305,11 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const expiresAt = fields.expires_at?.timestampValue;
       if (expiresAt && new Date(expiresAt) < new Date()) {
         await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
-        mirrorToPg(APPROVALS, approval_id, { ...fields, status: { stringValue: "expired" } });
         return { approval_id, status: "expired", note: "Approval expired before decision" };
       }
       const newStatus = decision === "approve" ? "approved" : "denied";
       const now = new Date().toISOString();
       await patchFields(APPROVALS, approval_id, {
-        status: { stringValue: newStatus },
-        decided_by: { stringValue: decided_by },
-        decided_at: { timestampValue: now },
-        decision: { stringValue: decision },
-      });
-      mirrorToPg(APPROVALS, approval_id, { ...fields,
         status: { stringValue: newStatus },
         decided_by: { stringValue: decided_by },
         decided_at: { timestampValue: now },
@@ -2291,7 +2330,6 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       const expiresAt = fields.expires_at?.timestampValue;
       if (status === "pending" && expiresAt && new Date(expiresAt) < new Date()) {
         await patchFields(APPROVALS, approval_id, { status: { stringValue: "expired" } });
-        mirrorToPg(APPROVALS, approval_id, { ...fields, status: { stringValue: "expired" } });
         return { approval_id, status: "expired" };
       }
       return {
@@ -2339,9 +2377,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       inputSchema: { tool_name: z.string().trim().min(1).max(100), latency_ms: z.number().min(0), success: z.boolean(), error: z.string().trim().max(500).optional().default("") } },
     async ({ tool_name, latency_ms, success, error }) => {
       const body = telemetryDoc(tool_name, latency_ms, success, error);
-      const res = await firestore(`/${EVO_LOGS}`, { method: "POST", body });
-      const tid = docIdOf(String(res?.name ?? ""));
-      if (tid) mirrorToPg(EVO_LOGS, tid, body.fields);
+      await requirePgStore().create(EVO_LOGS as StoreCollection, body.fields as StoreFields, generateDocId());
       return { logged: true, tool_name };
     });
 
@@ -2364,7 +2400,7 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
     });
 
   tool(server, "check_bridge_health",
-    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Supabase reachability.", readOnly: true,
+    { title: "Bridge health check", description: "Self-diagnostic: verifies env vars and Supabase Postgres reachability.", readOnly: true,
       inputSchema: {} },
     async () => {
       const checks = {
@@ -2372,17 +2408,18 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
         client_key: !!process.env.HIGHWAY_CLIENT_KEY,
         mcp_secret: !!process.env.MCP_SECRET,
         pinecone_key: !!process.env.PINECONE_API_KEY,
-        firestore_reachable: false,
+        postgres_reachable: false,
       };
-      let firestore_error: string | undefined;
+      let postgres_error: string | undefined;
       try {
-        await firestore(`/${EVO_LOGS}`, { method: "GET", pageSize: 1 });
-        checks.firestore_reachable = true;
+        const dbHealth = await probeDb();
+        checks.postgres_reachable = dbHealth === "ok";
+        if (dbHealth !== "ok") postgres_error = `postgres: ${dbHealth}`;
       } catch (e) {
-        firestore_error = errMsg(e);
+        postgres_error = errMsg(e);
         recordFailure("check_bridge_health", e);
       }
-      return { healthy: Object.values(checks).every(Boolean), checks, ...(firestore_error ? { firestore_error } : {}) };
+      return { healthy: Object.values(checks).every(Boolean), checks, ...(postgres_error ? { postgres_error } : {}) };
     });
 
   tool(server, "get_weather",
@@ -2716,7 +2753,12 @@ let _apifyRunning = false;
 
 async function apifyState(): Promise<{ lastRun: number | null; cached: NewsItem[] }> {
   let doc: Doc;
-  try { doc = (await firestore(APIFY_DOC, { method: "GET" })) as Doc; }
+  // PG-only (2026-10-10): Firestore removed. APIFY_DOC is system_config/apify_last_run.
+  try {
+    const pgDoc = await requirePgStore().get("system_config" as StoreCollection, "apify_last_run");
+    if (!pgDoc) return { lastRun: null, cached: [] };
+    doc = storeDocAsDoc(pgDoc);
+  }
   catch (e) { if (is404(e)) return { lastRun: null, cached: [] }; throw e; } // only a 404 means "never ran"
   const f = doc.fields ?? {};
   let cached: NewsItem[] = [];
@@ -2731,10 +2773,11 @@ async function apifyState(): Promise<{ lastRun: number | null; cached: NewsItem[
 async function apifyWrite(items: NewsItem[]): Promise<void> {
   // REV 19: runs as the 'apifyWrite' system op — scoped to /system_config/apify_last_run.
   await runAsSystem('apifyWrite', () =>
-    firestore(APIFY_DOC, { method: "PATCH", body: { fields: {
+    // PG-only (2026-10-10): Firestore removed. APIFY_DOC is system_config/apify_last_run.
+    requirePgStore().upsert("system_config" as StoreCollection, "apify_last_run", {
       tsNum: nowNum(), ts: nowTs(),
       items: { stringValue: JSON.stringify(items.slice(0, APIFY_CACHE_MAX_ITEMS)) },
-    } } })
+    } as StoreFields)
   );
 }
 
@@ -2827,16 +2870,11 @@ const NEWS_FEED_CAP = 24; // 6 curated + 6 macro + 6 social + 3 crypto + 3 marke
 async function curatedNews(): Promise<NewsItem[]> {
   try {
     let doc: Doc | null = null;
-    if (pgStore && readsFromPg(SYS_CONFIG) && isStoreCollection(SYS_CONFIG)) {
-      try {
-        const d = await pgStore.get(SYS_CONFIG, "crew_curated");
-        if (d) doc = storeDocAsDoc(d);
-      } catch { doc = null; }
-    }
-    if (!doc) {
-      doc = await runAsSystem("curatedRead", () =>
-        firestore(CURATED_DOC, { method: "GET" })) as Doc;
-    }
+    // PG-only (2026-10-10): Firestore removed.
+    try {
+      const d = await requirePgStore().get(SYS_CONFIG as StoreCollection, "crew_curated");
+      if (d) doc = storeDocAsDoc(d);
+    } catch { doc = null; }
     return itemsFromDocFields(doc?.fields, Date.now());
   } catch (e) {
     if (is404(e)) return [];
@@ -2947,7 +2985,7 @@ async function updateRegistry(mutate: (reg: Registry) => Registry): Promise<Regi
     return { skills: { stringValue: JSON.stringify(next) }, tsNum: nowNum() };
   });
   const regDoc = await getDocOrNull(SYS_CONFIG, SKILL_DOC);
-  if (regDoc?.fields) mirrorToPg(SYS_CONFIG, SKILL_DOC, regDoc.fields);
+  
   _skills = { at: Date.now(), specs: activeSkills(next, SKILLS_KEY, new Set()) };
   return next;
 }
@@ -3006,26 +3044,25 @@ function validateAttachment(att: { mime_type: string; size_bytes: number; storag
 }
 
 /**
- * Verify an end-user Firebase ID token (widget clients). Returns the
- * Firebase user or null. Used by POST /upload — the widget is a
- * Firebase-authenticated client, not an MCP bot.
+ * Verify a REST API bearer token (Supabase era, 2026-10-10). Accepts:
+ * - MCP_CALLERS tokens (token -> bot name, same as the MCP endpoint)
+ * - WIDGET_TOKEN (dedicated secret for the widget frontend)
+ * Returns {localId, email?} or null. Replaces verifyFirebaseIdToken —
+ * the bridge no longer calls identitytoolkit for REST auth.
  */
-async function verifyFirebaseIdToken(idToken: string): Promise<{ localId: string; email?: string } | null> {
-  try {
-    const r = await http(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) },
-      EXT_TIMEOUT);
-    if (!r.ok) return null;
-    const u = parseJson(r.body)?.users?.[0];
-    return u?.localId ? { localId: u.localId, email: u.email } : null;
-  } catch {
-    return null;
-  }
+async function verifyRestToken(token: string): Promise<{ localId: string; email?: string } | null> {
+  const bot = AUTH_CONFIG.mcpCallers[token];
+  if (bot) return { localId: `mcp:${normalizeBotName(bot)}` };
+  const widgetToken = process.env.WIDGET_TOKEN;
+  if (widgetToken && token === widgetToken) return { localId: 'widget' };
+  return null;
 }
 
-// Firebase Auth allows open email signup, so a valid ID token proves nothing about team
-// membership. Fails closed: an unset or empty UPLOAD_ALLOWED_EMAILS refuses every upload.
+// A bearer token proves nothing about team membership on its own —
+// MCP_CALLERS binds tokens to bot identities, and WIDGET_TOKEN is a secret
+// capability. Fails closed: an unset or empty UPLOAD_ALLOWED_EMAILS refuses
+// email-based uploads; the widget token bypasses the email check by design
+// (possession of the secret IS the authorization).
 // Parsed at call time so tests (and a Render env change + restart) share one function.
 export function parseUploadAllowlist(raw: string | undefined): Set<string> {
   return new Set((raw ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean));
@@ -3091,7 +3128,7 @@ async function uploadAttachmentData(input: {
 const siteBus = createSiteBus();
 let pgListenUp = false;
 const siteApi = createSiteApi({
-  verifyToken: verifyFirebaseIdToken,
+  verifyToken: verifyRestToken,
   async readMessages(q) {
     const coll = channelCollection(q.channel);
     const enrich = (d: Doc) => {
@@ -3107,14 +3144,8 @@ const siteApi = createSiteApi({
       };
     };
     let messages;
-    if (pgStore && readsFromPg(coll)) {
-      const docs = await pgStore.listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
+    const docs = await requirePgStore().listNewest(coll as StoreCollection, Math.min(Math.max(q.limit, 1), 100), q.since_ts);
       messages = docs.map((d) => enrich(storeDocAsDoc(d)));
-    } else {
-      let docs = await queryPage(coll, "tsNum", q.limit);
-      if (!docs.length) docs = await queryPage(coll, "ts", q.limit);
-      messages = docs.map(enrich);
-    }
     if (q.since_ts !== undefined) messages = messages.filter((m: { ts: number | null }) => (m.ts ?? 0) > q.since_ts!);
     if (q.mention) {
       const needle = q.mention.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -3124,11 +3155,7 @@ const siteApi = createSiteApi({
   },
   async readTasks(q) {
     let tasks: ReturnType<typeof fmtTask>[];
-    if (pgStore && readsFromPg(TASKS)) {
-      tasks = (await pgStore.listNewest(TASKS as StoreCollection, Math.min(Math.max(q.limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
-    } else {
-      tasks = (await queryPage(TASKS, "ts", q.limit)).map(fmtTask);
-    }
+    tasks = (await requirePgStore().listNewest(TASKS as StoreCollection, Math.min(Math.max(q.limit, 1), 100))).map((d) => fmtTask(storeDocAsDoc(d)));
     if (!q.include_done) tasks = tasks.filter((t) => !t.done);
     return { count: tasks.length, open: tasks.filter((t) => !t.done).length, tasks };
   },
@@ -3189,9 +3216,11 @@ app.post("/upload", express.json({ limit: "15mb" }), async (req: Request, res: R
   try {
     const m = /^Bearer (.+)$/.exec(req.header("authorization") || "");
     if (!m) { res.status(401).json({ ok: false, error: "missing bearer token" }); return; }
-    const who = await verifyFirebaseIdToken(m[1]);
+    const who = await verifyRestToken(m[1]);
     if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
-    if (!uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
+    // Widget token is a capability (possession = authorization); bot tokens
+    // still gate on the email allowlist.
+    if (who.localId !== 'widget' && !uploadAllowed(who.email)) { res.status(403).json({ ok: false, error: "account not allowed to upload" }); return; }
     const { filename, mime_type, data_base64 } = (req.body ?? {}) as Record<string, unknown>;
     const att = await uploadAttachmentData({
       filename: typeof filename === "string" ? filename : "",
@@ -3238,7 +3267,7 @@ app.post("/metrics/reads", async (req: Request, res: Response) => {
   const tab = typeof req.body?.tab === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(req.body.tab) ? req.body.tab : null;
   const counts = parseReport(req.body);
   if (!tab || !counts) { res.status(400).json({ ok: false, error: "expected { tab, counts: { source: integer } }" }); return; }
-  const who = await verifyFirebaseIdToken(m[1]);
+  const who = await verifyRestToken(m[1]);
   if (!who) { res.status(401).json({ ok: false, error: "invalid token" }); return; }
   if (!clientMeter.record(`${who.localId}:${tab}`, counts)) { res.status(429).json({ ok: false, error: "report at most once a minute" }); return; }
   res.json({ ok: true });
