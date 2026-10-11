@@ -13,6 +13,8 @@ export type SiteEvent = { type: string; channel?: string; items?: unknown[] };
 export interface SiteReq {
   header(name: string): string | undefined;
   query: Record<string, unknown>;
+  body?: unknown;
+  params?: Record<string, string>;
   on(event: "close", fn: () => void): void;
 }
 
@@ -74,6 +76,31 @@ export function parseTasksQuery(query: Record<string, unknown>):
   if (raw !== "true" && raw !== "false" && raw !== "1" && raw !== "0")
     return { ok: false, error: "include_done must be true or false" };
   return { ok: true, limit, include_done: raw === "true" || raw === "1" };
+}
+
+// ---- POST body parsing helpers ----
+
+export function bodyObj(req: SiteReq): Record<string, unknown> | null {
+  const b = req.body;
+  if (!b || typeof b !== "object" || Array.isArray(b)) return null;
+  return b as Record<string, unknown>;
+}
+
+export function bstr(v: unknown, maxLen = 5000): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim();
+  if (!t || t.length > maxLen) return undefined;
+  return t;
+}
+
+export function bbool(v: unknown): boolean | undefined {
+  if (typeof v === "boolean") return v;
+  return undefined;
+}
+
+export function bstrOpt(v: unknown, maxLen = 5000): string | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  return bstr(v, maxLen);
 }
 
 export function parseNotifyPayload(raw: string): SiteEvent | null {
@@ -147,6 +174,17 @@ export interface SiteApiDeps {
   readTyping: () => Promise<unknown[]>;
   readNotes: () => Promise<unknown | null>;
   readActivity: (limit: number) => Promise<unknown[]>;
+  writeMessage: (input: {
+    name: string; text?: string; image?: string; channel?: string;
+    deviceId?: string; reply_to?: string; attachments?: unknown[];
+  }) => Promise<{ id: string }>;
+  writePresence: (input: { id: string; name: string; platform?: string; session?: string }) => Promise<void>;
+  writeTyping: (input: { id: string; name: string; typing: boolean }) => Promise<void>;
+  writeTask: (input: { text: string; done?: boolean; createdBy?: string }) => Promise<{ id: string }>;
+  patchTask: (id: string, patch: { done?: boolean; text?: string }) => Promise<void>;
+  deleteTask: (id: string) => Promise<void>;
+  writeActivity: (input: { by: string; text: string }) => Promise<{ id: string }>;
+  writeNotes: (input: { content: string; updatedBy?: string }) => Promise<void>;
   bus: SiteBus;
 }
 
@@ -203,6 +241,148 @@ export function createSiteApi(deps: SiteApiDeps) {
       if (limit === null) { res.status(400).json({ ok: false, error: "limit must be an integer 1-100" }); return; }
       try { res.status(200).json({ ok: true, items: await deps.readActivity(limit) }); }
       catch (e) { res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) }); }
+    },
+    async postMessage(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const name = bstr(b.name, 40);
+      if (!name) { res.status(400).json({ ok: false, error: "name is required (1-40 chars)" }); return; }
+      const text = bstrOpt(b.text);
+      const image = bstrOpt(b.image, 2000000);
+      if (!text && !image) { res.status(400).json({ ok: false, error: "text or image is required" }); return; }
+      const channel = bstrOpt(b.channel, 10);
+      if (channel && !(SITE_CHANNELS as readonly string[]).includes(channel)) {
+        res.status(400).json({ ok: false, error: "channel must be room, code, or dm" }); return;
+      }
+      try {
+        const result = await deps.writeMessage({
+          name,
+          ...(text ? { text } : {}),
+          ...(image ? { image } : {}),
+          ...(channel ? { channel } : {}),
+          ...(bstrOpt(b.deviceId, 80) ? { deviceId: bstr(b.deviceId, 80)! } : {}),
+          ...(bstrOpt(b.reply_to, 80) ? { reply_to: bstr(b.reply_to, 80)! } : {}),
+          ...(Array.isArray(b.attachments) ? { attachments: b.attachments } : {}),
+        });
+        res.status(200).json({ ok: true, id: result.id });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async postPresence(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const id = bstr(b.id, 80);
+      const name = bstr(b.name, 40);
+      if (!id || !name) { res.status(400).json({ ok: false, error: "id and name are required" }); return; }
+      try {
+        await deps.writePresence({
+          id, name,
+          ...(bstrOpt(b.platform, 40) ? { platform: bstr(b.platform, 40)! } : {}),
+          ...(bstrOpt(b.session, 80) ? { session: bstr(b.session, 80)! } : {}),
+        });
+        res.status(200).json({ ok: true });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async postTyping(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const id = bstr(b.id, 80);
+      const name = bstr(b.name, 40);
+      const typing = bbool(b.typing);
+      if (!id || !name || typing === undefined) {
+        res.status(400).json({ ok: false, error: "id, name, and typing (boolean) are required" }); return;
+      }
+      try {
+        await deps.writeTyping({ id, name, typing });
+        res.status(200).json({ ok: true });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async postTask(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const text = bstr(b.text, 500);
+      if (!text) { res.status(400).json({ ok: false, error: "text is required (1-500 chars)" }); return; }
+      try {
+        const result = await deps.writeTask({
+          text,
+          ...(bbool(b.done) !== undefined ? { done: bbool(b.done)! } : {}),
+          ...(bstrOpt(b.createdBy, 40) ? { createdBy: bstr(b.createdBy, 40)! } : {}),
+        });
+        res.status(200).json({ ok: true, id: result.id });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async patchTask(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const id = req.params?.id?.trim();
+      if (!id) { res.status(400).json({ ok: false, error: "task id is required" }); return; }
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const patch: { done?: boolean; text?: string } = {};
+      if (bbool(b.done) !== undefined) patch.done = bbool(b.done)!;
+      const text = bstrOpt(b.text, 500);
+      if (text) patch.text = text;
+      if (Object.keys(patch).length === 0) {
+        res.status(400).json({ ok: false, error: "nothing to update (done and/or text)" }); return;
+      }
+      try {
+        await deps.patchTask(id, patch);
+        res.status(200).json({ ok: true, id });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async deleteTask(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const id = req.params?.id?.trim();
+      if (!id) { res.status(400).json({ ok: false, error: "task id is required" }); return; }
+      try {
+        await deps.deleteTask(id);
+        res.status(200).json({ ok: true, id });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async postActivity(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      const by = bstr(b.by, 40);
+      const text = bstr(b.text, 500);
+      if (!by || !text) { res.status(400).json({ ok: false, error: "by and text are required" }); return; }
+      try {
+        const result = await deps.writeActivity({ by, text });
+        res.status(200).json({ ok: true, id: result.id });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+    async postNotes(req: SiteReq, res: SiteRes): Promise<void> {
+      if (!(await requireUser(req, res, deps.verifyToken))) return;
+      const b = bodyObj(req);
+      if (!b) { res.status(400).json({ ok: false, error: "expected JSON body" }); return; }
+      if (typeof b.content !== "string" || b.content.length > 20000) {
+        res.status(400).json({ ok: false, error: "content is required (string, max 20000 chars)" }); return;
+      }
+      try {
+        await deps.writeNotes({
+          content: b.content,
+          ...(bstrOpt(b.updatedBy, 40) ? { updatedBy: bstr(b.updatedBy, 40)! } : {}),
+        });
+        res.status(200).json({ ok: true });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
     },
     async stream(req: SiteReq, res: SiteRes): Promise<void> {
       if (!(await requireUser(req, res, deps.verifyToken))) return;

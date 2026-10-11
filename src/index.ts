@@ -40,6 +40,7 @@ import {
 import { removeFromPg, setMirrorStore, setMirrorFailureHandler } from "./store/mirror.js";
 import {
   createSiteApi, createSiteBus, startPgListen, parseNotifyPayload, SITE_SSE_MAX,
+  SITE_CHANNELS,
 } from "./site-api.js";
 import {
   CURATED_DOC, curatedWriter, itemsFromDocFields, normalizeBatch,
@@ -54,7 +55,7 @@ import {
   SKILL_PREFIX, MAX_SKILLS, type SkillSpec, type SkillEntry, type Registry,
 } from "./skills.js";
 // ============ FAIL-CLOSED ENV ============
-const REQUIRED_ENV = ["FIREBASE_API_KEY", "MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
+const REQUIRED_ENV = ["MCP_SECRET", "HIGHWAY_CLIENT_KEY"] as const;
 for (const k of REQUIRED_ENV) {
   if (!process.env[k]) {
     console.error(`FATAL: ${k} environment variable is not set.`);
@@ -188,7 +189,6 @@ const sec = createSecurity(
     request: (method, url, opts) =>
       http(url, { method, headers: opts.headers, body: opts.body }, opts.timeoutMs)
         .then((r) => ({ status: r.status, body: r.body ? parseJson(r.body) : null })),
-    getIdToken,
     now: () => new Date().toISOString(),
   },
   {
@@ -317,41 +317,8 @@ const _authBackoff = new Map<string, { until: number; message: string }>();
 const AUTH_BACKOFF_MS = 15000;
 const tokenKey = (forName?: string): string => normalizeBotName(forName || READ_BOT);
 
-async function getIdToken(forName?: string, forceRefresh?: boolean): Promise<string> {
-  const key = tokenKey(forName);
-  if (forceRefresh) { _tokens.delete(key); _inflight.delete(key); }
-  const cached = _tokens.get(key);
-  if (cached && Date.now() < cached.exp - 60000) return cached.token;
-  const pending = _inflight.get(key);
-  if (pending) return pending;
-  const creds = BOT_CREDS[key];
-  if (!creds?.email || !creds?.password) throw new UserError(`No credentials configured for bot "${key}"`);
-  const backoff = _authBackoff.get(key);
-  if (backoff && Date.now() < backoff.until) throw new Error(backoff.message);
+// getIdToken removed 2026-10-10: Firebase Auth retired. Firestore() now throws.
 
-  const p = (async (): Promise<string> => {
-    try {
-      const r = await http(
-        `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${API_KEY}`,
-        { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: creds.email, password: creds.password, returnSecureToken: true }) },
-        EXT_TIMEOUT);
-      const data = parseJson(r.body);
-      if (!r.ok) throw new Error(`Auth ${r.status}: ${data?.error?.message ?? r.statusText}`);
-      if (!data.idToken) throw new Error("Auth succeeded but returned no idToken");
-      _tokens.set(key, { token: data.idToken, exp: Date.now() + parseInt(data.expiresIn || "3600", 10) * 1000 });
-      _authBackoff.delete(key);
-      return data.idToken as string;
-    } catch (e) {
-      _authBackoff.set(key, { until: Date.now() + AUTH_BACKOFF_MS, message: `auth backoff: ${errMsg(e)}` });
-      throw e;
-    }
-  })();
-
-  _inflight.set(key, p);
-  try { return await p; }
-  finally { _inflight.delete(key); }
-}
 
 // ============ FIRESTORE PRIMITIVES ============
 // REV 19 choke point: global precondition validation → gate → system allowlist →
@@ -3183,6 +3150,96 @@ const siteApi = createSiteApi({
       return { id: docIdOf(d.name), by: str(f.by), text: str(f.text), ts: tsOf(f.ts) };
     });
   },
+  async writeMessage(input: {
+    name: string; text?: string; image?: string; channel?: string;
+    deviceId?: string; reply_to?: string; attachments?: unknown[];
+  }) {
+    const channel = input.channel && (SITE_CHANNELS as readonly string[]).includes(input.channel)
+      ? input.channel : "room";
+    const coll = channelCollection(channel) as StoreCollection;
+    const id = generateDocId();
+    const fields: Record<string, unknown> = {
+      name: { stringValue: input.name },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    if (input.text) fields.text = { stringValue: input.text };
+    if (input.image) fields.image = { stringValue: input.image };
+    if (input.deviceId) fields.deviceId = { stringValue: input.deviceId };
+    if (input.reply_to) fields.reply_to = { stringValue: input.reply_to };
+    if (input.attachments) fields.attachments = { stringValue: JSON.stringify(input.attachments) };
+    await requirePgStore().create(coll, fields as StoreFields, id);
+    siteBus.publish({ type: "message", channel });
+    return { id };
+  },
+  async writePresence(input: { id: string; name: string; platform?: string; session?: string }) {
+    const fields: Record<string, unknown> = {
+      name: { stringValue: input.name },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    if (input.platform) fields.platform = { stringValue: input.platform };
+    if (input.session) fields.session = { stringValue: input.session };
+    await requirePgStore().upsert(PRESENCE as StoreCollection, input.id, fields as StoreFields);
+    siteBus.publish({ type: "presence" });
+  },
+  async writeTyping(input: { id: string; name: string; typing: boolean }) {
+    const fields: Record<string, unknown> = {
+      name: { stringValue: input.name },
+      typing: { booleanValue: input.typing },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    await requirePgStore().upsert(TYPING as StoreCollection, input.id, fields as StoreFields);
+    siteBus.publish({ type: "typing" });
+  },
+  async writeTask(input: { text: string; done?: boolean; createdBy?: string }) {
+    const id = generateDocId();
+    const fields: Record<string, unknown> = {
+      text: { stringValue: input.text },
+      done: { booleanValue: !!input.done },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    if (input.createdBy) fields.createdBy = { stringValue: input.createdBy };
+    await requirePgStore().create(TASKS as StoreCollection, fields as StoreFields, id);
+    siteBus.publish({ type: "tasks" });
+    return { id };
+  },
+  async patchTask(id: string, patch: { done?: boolean; text?: string }) {
+    const fields: Record<string, unknown> = {};
+    if (patch.done !== undefined) fields.done = { booleanValue: !!patch.done };
+    if (patch.text !== undefined) fields.text = { stringValue: patch.text };
+    if (Object.keys(fields).length === 0) return;
+    await requirePgStore().patch(TASKS as StoreCollection, id, fields as StoreFields);
+    siteBus.publish({ type: "tasks" });
+  },
+  async deleteTask(id: string) {
+    await requirePgStore().remove(TASKS as StoreCollection, id);
+    siteBus.publish({ type: "tasks" });
+  },
+  async writeActivity(input: { by: string; text: string }) {
+    const id = generateDocId();
+    const fields: Record<string, unknown> = {
+      by: { stringValue: input.by },
+      text: { stringValue: input.text },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    await requirePgStore().create(ACTIVITY as StoreCollection, fields as StoreFields, id);
+    siteBus.publish({ type: "activity" });
+    return { id };
+  },
+  async writeNotes(input: { content: string; updatedBy?: string }) {
+    const fields: Record<string, unknown> = {
+      content: { stringValue: input.content },
+      ts: nowTs(),
+      tsNum: nowNum(),
+    };
+    if (input.updatedBy) fields.updatedBy = { stringValue: input.updatedBy };
+    await requirePgStore().upsert(NOTES as StoreCollection, "shared", fields as StoreFields);
+    siteBus.publish({ type: "notes" });
+  },
   bus: siteBus,
 });
 
@@ -3290,6 +3347,16 @@ app.get("/api/typing", (req, res) => { void siteApi.typing(req, res); });
 app.get("/api/notes", (req, res) => { void siteApi.notes(req, res); });
 app.get("/api/activity", (req, res) => { void siteApi.activity(req, res); });
 app.get("/api/stream", (req, res) => { void siteApi.stream(req, res); });
+// POST writes (Supabase-backed; same Bearer <redacted> as GET). express.json() is
+// applied globally above, so req.body is parsed.
+app.post("/api/messages", (req, res) => { void siteApi.postMessage(req, res); });
+app.post("/api/presence", (req, res) => { void siteApi.postPresence(req, res); });
+app.post("/api/typing", (req, res) => { void siteApi.postTyping(req, res); });
+app.post("/api/tasks", (req, res) => { void siteApi.postTask(req, res); });
+app.post("/api/tasks/:id", (req, res) => { void siteApi.patchTask(req, res); });
+app.post("/api/tasks/:id/delete", (req, res) => { void siteApi.deleteTask(req, res); });
+app.post("/api/activity", (req, res) => { void siteApi.postActivity(req, res); });
+app.post("/api/notes", (req, res) => { void siteApi.postNotes(req, res); });
 
 // REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with
 // duplicate-safe Bearer parsing and no-oracle decoys). The inline check is retired.
