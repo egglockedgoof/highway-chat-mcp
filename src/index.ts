@@ -1420,7 +1420,9 @@ function buildServer(skills: readonly SkillSpec[] = []): McpServer {
       }
       const armLock = async (messageId: string, isNew: boolean) => {
         if (!isNew || !messageId) return;
-        await armOutgoingDispatchLock(messageId, text, name, routed_to, liveDispatchRoster());
+        // Identity hardening: the dispatch lock's dispatcher must be the
+        // token-bound identity, not the caller-asserted name.
+        await armOutgoingDispatchLock(messageId, text, identity, routed_to, liveDispatchRoster());
       };
       if (idempotency_key) {
         // Deterministic id + check-before-write (hollow #35): same key twice = one message.
