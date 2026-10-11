@@ -14,7 +14,7 @@
 
 import express, { type NextFunction, type Request, type Response } from "express";
 import { lookup } from "node:dns/promises";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -1208,12 +1208,47 @@ const channelCache = createChannelCache({
 });
 
 let pgStore: Store | null = null;
+// Raw pg pool for tables outside the Store abstraction (e.g. highway_users).
+let pgPool: Awaited<ReturnType<typeof connectPostgres>>["pool"] | null = null;
 
 // PG-only (2026-10-10): Firestore removed. If the Postgres store isn't initialized,
 // fail loudly — no silent fallback to a removed backend.
 function requirePgStore(): Store {
   if (!pgStore) throw new UserError('pg_unavailable: Postgres store not initialized');
   return pgStore;
+}
+
+// Email/password auth for the Highway web UI (Supabase-backed, no Firebase).
+// password_hash format: <hex-salt>:<hex-sha256(salt + ":" + password)>.
+export function hashUserPassword(password: string): string {
+  const salt = randomBytes(16).toString("hex");
+  const hash = createHash("sha256").update(salt + ":" + password).digest("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyUserPassword(password: string, stored: string): boolean {
+  const i = stored.indexOf(":");
+  if (i < 0) return false;
+  const salt = stored.slice(0, i);
+  const expectedHex = stored.slice(i + 1);
+  const actualHex = createHash("sha256").update(salt + ":" + password).digest("hex");
+  const a = Buffer.from(actualHex, "hex");
+  const b = Buffer.from(expectedHex, "hex");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** Check email/password against highway_users. False = unknown email or bad password. */
+async function verifyUserCredentials(email: string, password: string): Promise<boolean> {
+  if (!pgPool) throw new UserError("pg_unavailable: Postgres not initialized");
+  const schema = dbSchema();
+  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(schema)) throw new UserError("invalid DB_SCHEMA");
+  const { rows } = await pgPool.query(
+    `SELECT password_hash FROM ${schema}.highway_users WHERE email = $1 LIMIT 1`,
+    [email]
+  );
+  const row = (rows as Array<{ password_hash?: unknown }>)[0];
+  if (typeof row?.password_hash !== "string" || !row.password_hash) return false;
+  return verifyUserPassword(password, row.password_hash);
 }
 let pgHost: string | null = null;
 
@@ -3096,6 +3131,8 @@ const siteBus = createSiteBus();
 let pgListenUp = false;
 const siteApi = createSiteApi({
   verifyToken: verifyRestToken,
+  verifyCredentials: verifyUserCredentials,
+  widgetToken: process.env.WIDGET_TOKEN || "",
   async readMessages(q) {
     const coll = channelCollection(q.channel);
     const enrich = (d: Doc) => {
@@ -3357,6 +3394,8 @@ app.post("/api/tasks/:id", (req, res) => { void siteApi.patchTask(req, res); });
 app.post("/api/tasks/:id/delete", (req, res) => { void siteApi.deleteTask(req, res); });
 app.post("/api/activity", (req, res) => { void siteApi.postActivity(req, res); });
 app.post("/api/notes", (req, res) => { void siteApi.postNotes(req, res); });
+// Email/password login for the web UI. No bearer token required — this IS the login.
+app.post("/api/auth/login", (req, res) => { void siteApi.login(req, res); });
 
 // REV 19: legacy path-secret auth is now handled inside sec.resolveAuth (with
 // duplicate-safe Bearer parsing and no-oracle decoys). The inline check is retired.
@@ -3423,6 +3462,7 @@ setMirrorFailureHandler((scope, err) => recordFailure(scope, err));
 if ((dualWriteEnabled() || readPgCollections().size) && pgTargets().length) {
   connectPostgres().then((conn) => {
     pgStore = createPostgresStore(conn.pool, dbSchema());
+    pgPool = conn.pool;
     pgHost = conn.host;
     setMirrorStore(pgStore);
   }).catch((e) => recordFailure("pg_store_start", e));
