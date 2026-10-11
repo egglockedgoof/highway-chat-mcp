@@ -406,7 +406,6 @@ export interface SecurityDeps {
   readBot: string;
   isSunset: () => boolean;
   request: (method: string, url: string, opts: HttpOpts) => Promise<HttpResponse>;
-  getIdToken: (bot: string, forceRefresh?: boolean) => Promise<string>;
   now: () => string; // ISO-8601 clock (injectable for tests)
 }
 
@@ -448,34 +447,12 @@ export function createFirestoreFn(
   gate: Gate,
   count: (n: string) => void,
 ): FirestoreFn {
+  // Firebase/Firestore retired 2026-10-10 (sin's directive: no Firebase dependencies).
+  // All 12 production collections use Supabase Postgres. This function always throws.
   return async function firestore(path: string, init: FirestoreInit): Promise<any> {
-    if (path.includes('?')) throw new UserError('query-in-path', 400, 'query strings not accepted in path');
-    // GLOBAL precondition validation — every caller, before any branch.
-    const pv = validatePreconditionGlobal(init.precondition);
-    if (!pv.ok) { count('bad_precondition'); throw new UserError(pv.reason!, 400, `malformed precondition: ${pv.reason}`); }
-    const ctx = reqCtx.getStore() ?? null;
-    const write = isWriteRequest(init.method, path);
-    const r = write ? gate.resolveWrite(ctx, init.forName) : gate.resolveRead(ctx);
-    if (!r.ok) throw new UserError(r.code!, r.status!, r.message!);
-    if (ctx?.method === 'system') {
-      // Same checkSystemScope the pure tests cover — no parallel implementation.
-      const scope = checkSystemScope(ctx.sysOp!, path, init.method, init.precondition);
-      if (!scope.ok) { count('system_scope_violation'); throw new UserError(scope.reason!, 403, `system op "${ctx.sysOp}" denied: ${init.method} ${path} (precondition ${scope.pc})`); }
-    }
-    // URL built from the VALIDATED result — never from raw input.
-    const url = `${deps.baseUrl}${path}${buildFirestoreQuery(init)}`;
-    for (let attempt = 0; ; attempt++) {
-      const idToken = await deps.getIdToken(r.bot!, attempt > 0);
-      const res = await deps.request(init.method, url, {
-        headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-        body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
-        timeoutMs: deps.fsTimeoutMs,
-      });
-      if (res.status === 401 && attempt === 0) continue; // refresh token, retry once
-      if (res.status >= 400) throw FirestoreError.fromResponse(res.status, res.body);
-      return res.body;
-    }
-  };
+    throw new Error(`Firestore retired: attempted ${init.method} ${path}. Use Supabase Postgres via requirePgStore().`);
+  }
+;
 }
 
 // --- §3e: Sunset telemetry — multi-instance continuity protocol ---
